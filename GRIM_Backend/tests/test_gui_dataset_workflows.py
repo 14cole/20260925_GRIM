@@ -1074,6 +1074,96 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
         np.testing.assert_allclose(wrapped.rcs_phase.ravel(), [np.pi / 4.0] * 2)
         self.assertNotIn("phase_wrap", wrapped.units)
 
+    def test_wrap_closed_sweep_keeps_first_seam_sample_when_endpoints_differ(self) -> None:
+        # Turntable export 0..360 inclusive whose closing 360 repeat is a hair
+        # different from the opening 0 sample.
+        field = np.asarray(
+            [1.0, 2.0, 3.0, 4.0, 1.001], dtype=np.complex128
+        ).reshape(5, 1, 1, 1)
+        grid = RcsGrid(
+            [0.0, 90.0, 180.0, 270.0, 360.0],
+            [0.0],
+            [10.0],
+            ["VV"],
+            rcs=field,
+            units={
+                "azimuth": "deg",
+                "elevation": "deg",
+                "frequency": "GHz",
+                "rcs_log_unit": "dBsm",
+                "rcs_linear_quantity": "sigma_3d",
+            },
+        )
+        self.window._add_dataset_row(grid, "Turntable", "Loaded", "")
+        self._select_rows_in_order(0)
+        with mock.patch("GRIM_Backend.ui.dataset_actions.WrapDialog") as dialog_type:
+            dialog = dialog_type.return_value
+            dialog.exec.return_value = QDialog.Accepted
+            dialog.get_params.return_value = {
+                "azimuth": True,
+                "phase": False,
+                "mode": "-180_180",
+            }
+            self.window._wrap_selected()
+            self._wait_for_background()
+
+        self.assertEqual(self.window.table.rowCount(), 2)
+        self.assertEqual(
+            self.window.table.item(1, 0).text(),
+            "Turntable [Wrap azimuth -180-180deg]",
+        )
+        wrapped = self.window.table.item(1, 0).data(Qt.UserRole)
+        np.testing.assert_allclose(wrapped.azimuths, [-180.0, -90.0, 0.0, 90.0])
+        np.testing.assert_allclose(wrapped.rcs_power.ravel(), [9.0, 16.0, 1.0, 4.0])
+        message = self.window.status.currentMessage()
+        self.assertIn("Wrap created 1 dataset(s).", message)
+        self.assertIn("first sample of the sweep was kept", message)
+        self.assertIn("kept the first sample", self.window.table.item(1, 2).text())
+
+    def test_medianize_closed_sweep_keeps_first_seam_sample_when_endpoints_differ(self) -> None:
+        field = np.asarray(
+            [1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.complex128
+        ).reshape(5, 1, 1, 1)
+        grid = RcsGrid(
+            [0.0, 90.0, 180.0, 270.0, 360.0],
+            [0.0],
+            [10.0],
+            ["VV"],
+            rcs=field,
+            units={
+                "azimuth": "deg",
+                "elevation": "deg",
+                "frequency": "GHz",
+                "rcs_log_unit": "dBsm",
+                "rcs_linear_quantity": "sigma_3d",
+            },
+        )
+        self.window._add_dataset_row(grid, "Turntable", "Loaded", "")
+        self._select_rows_in_order(0)
+        with mock.patch(
+            "GRIM_Backend.ui.dataset_actions.MedianizeDialog"
+        ) as dialog_type:
+            dialog = dialog_type.return_value
+            dialog.exec.return_value = QDialog.Accepted
+            dialog.get_params.return_value = {"window_deg": 180.0, "slide_deg": 90.0}
+            self.window._medianize_selected()
+            self._wait_for_background()
+
+        self.assertEqual(self.window.table.rowCount(), 2)
+        self.assertEqual(
+            self.window.table.item(1, 0).text(),
+            "Turntable [Median w=180deg s=90deg]",
+        )
+        result = self.window.table.item(1, 0).data(Qt.UserRole)
+        np.testing.assert_allclose(result.azimuths, [0.0, 90.0, 180.0, 270.0])
+        # Power at 0 deg is 1 (opening) vs 25 (closing repeat); keeping the
+        # repeat would give [16, 9, 9, 16].
+        np.testing.assert_allclose(result.rcs_power.ravel(), [4.0, 4.0, 9.0, 9.0])
+        message = self.window.status.currentMessage()
+        self.assertIn("Medianize created 1 dataset(s)", message)
+        self.assertIn("first sample of the sweep was kept", message)
+        self.assertIn("kept the opening sample", self.window.table.item(1, 2).text())
+
     def test_delta_db_requires_exactly_two_operands(self) -> None:
         for index, amplitude in enumerate((1.0, 2.0, 3.0), start=1):
             self.window._add_dataset_row(

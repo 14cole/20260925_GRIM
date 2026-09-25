@@ -364,16 +364,24 @@ class DatasetCorrectnessTests(unittest.TestCase):
             delta.rcs.item(), expected, rtol=1.0e-7, atol=1.0e-15
         )
 
-    def test_azimuth_wrap_rejects_raw_conflict_hidden_by_float32_display(self):
+    def test_azimuth_wrap_keeps_opening_raw_sample_hidden_by_float32_display(self):
         conflict = self._raw_solver_grid(
             [1.0, 1.0 + 1.0e-10],
             azimuths=[0.0, 360.0],
             frequencies=[1.0],
         )
+        wrapped, report = conflict.wrap_azimuth("0_360", return_report=True)
+        np.testing.assert_array_equal(wrapped.azimuths, [0.0])
+        # The float32 display pair agrees, so only the authoritative float64
+        # field reveals the conflict; the opening sample's field must survive.
+        self.assertEqual(wrapped.extra["rcs_amp_real"].item(), 1.0)
+        self.assertEqual(report["conflicting_coordinate_count"], 1)
+        self.assertEqual(report["discarded_conflict_cell_count"], 1)
+        self.assertIn("kept the first sample", wrapped.history)
         with self.assertRaisesRegex(
             ValueError, "conflicting authoritative raw seam samples"
         ):
-            conflict.wrap_azimuth("0_360")
+            conflict.wrap_azimuth("0_360", seam_conflict="error")
 
     def test_interpolation_uses_authoritative_raw_complex_field(self):
         source = self._raw_solver_grid(

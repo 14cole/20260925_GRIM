@@ -767,14 +767,24 @@ def medianize_azimuth(
     window_degrees: float,
     slide_degrees: float,
     periodic: bool | None = None,
-) -> RcsGrid:
+    seam_conflict: str = "first",
+    return_report: bool = False,
+):
     """Medianize linear power over sliding physical-azimuth windows.
 
     The public parameters are always degrees. The returned coordinate retains
     the source dataset's native angular unit. A nearly complete 360-degree cut
     is treated as periodic by default, allowing windows to cross its seam.
+    A closed cut (endpoints 360 degrees apart) counts that direction once; where
+    the closing repeat disagrees with the opening sample, ``seam_conflict``
+    ``"first"`` (default) keeps the opening sample and records the discarded
+    cells in history, while ``"error"`` rejects the cut instead.
+    ``return_report=True`` returns ``(grid, report)``.
     """
 
+    policy = str(seam_conflict).strip().lower()
+    if policy not in {"first", "error"}:
+        raise ValueError("seam_conflict must be 'first' or 'error'")
     window = float(window_degrees)
     slide = float(slide_degrees)
     if not math.isfinite(window) or not math.isfinite(slide) or window <= 0.0 or slide <= 0.0:
@@ -804,18 +814,23 @@ def medianize_azimuth(
     half = window * 0.5
     sample_azimuth = azimuth
     merged_seam_power = None
+    discarded_seam_cells = 0
     if periodic and np.isclose(span, 360.0, rtol=0.0, atol=1.0e-7):
 
 
         merged_seam_power = np.array(dataset.rcs_power[0], copy=True)
         merged_seam_phase = np.array(dataset.rcs_phase[0], copy=True)
-        RcsGrid._merge_equivalent_sample_blocks(
+        # The closing endpoint re-measures the opening direction; it only
+        # fills cells the opening sample left missing.
+        seam_conflict_mask = RcsGrid._merge_equivalent_sample_blocks(
             merged_seam_power,
             merged_seam_phase,
             dataset.rcs_power[-1],
             dataset.rcs_phase[-1],
             context="medianize periodic endpoint",
+            keep_existing_on_conflict=policy == "first",
         )
+        discarded_seam_cells = int(np.count_nonzero(seam_conflict_mask))
         sample_azimuth = azimuth[:-1]
     if periodic:
         count_float = np.ceil(360.0 / slide - 1.0e-12)
@@ -878,7 +893,19 @@ def medianize_azimuth(
     extra["amplitude_convention"] = (
         "sliding median of linear power; coherent phase is undefined"
     )
-    return RcsGrid(
+    history = dataset.history
+    if discarded_seam_cells:
+        history_entry = (
+            f"Medianize periodic seam: kept the opening sample at "
+            f"{azimuth[0]:.12g} deg where the closing repeat at "
+            f"{azimuth[-1]:.12g} deg disagreed; discarded "
+            f"{discarded_seam_cells} conflicting cell(s)"
+        )
+        prior_history = str(history or "").strip()
+        history = (
+            f"{prior_history}\n{history_entry}" if prior_history else history_entry
+        )
+    result = RcsGrid(
         output_centers,
         dataset.elevations,
         dataset.frequencies,
@@ -888,10 +915,20 @@ def medianize_azimuth(
         rcs_phase=np.full_like(power, np.nan),
         rcs_domain=dataset.rcs_domain,
         source_path=dataset.source_path,
-        history=dataset.history,
+        history=history,
         units=dict(dataset.units or {}),
         extra=extra,
     )
+    if not return_report:
+        return result
+    report = {
+        "schema": "grim.medianize-report.v1",
+        "periodic": periodic,
+        "seam_merged": merged_seam_power is not None,
+        "seam_conflict": policy,
+        "discarded_seam_cell_count": discarded_seam_cells,
+    }
+    return result, report
 
 
 def wedge_to_conic(

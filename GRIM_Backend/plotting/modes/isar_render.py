@@ -7,13 +7,12 @@ from . import isar_mode as computation
 from GRIM_Backend.isar.geometry import angular_bands, angular_sublooks, image_extent
 
 
-def render(self, *, plan_only=False) -> None:
+def render(self) -> None:
     """GUI-thread half: validate the selections, capture everything the worker
     needs into a params dict, and hand off to the mixin's async submit. The
     finished computation comes back through `display_results`."""
-    if not plan_only:
-        self.last_plot_mode = "isar_image"
-        self._start_plot_render()
+    self.last_plot_mode = "isar_image"
+    self._start_plot_render()
     if self.active_dataset is None:
         self.status.showMessage("Select a dataset before plotting.")
         return
@@ -240,8 +239,7 @@ def render(self, *, plan_only=False) -> None:
     l1_strength = float(l1_strength_spin.value()) if l1_strength_spin is not None else 0.05
     l1_iters = int(l1_iters_spin.value()) if l1_iters_spin is not None else 300
     # Byte-based worker preflight. Display-cell caps alone do not account for
-    # the complex source slice, FFT/FISTA temporaries, or full-resolution
-    # complex results retained for Export ISAR Result.
+    # the complex source slice or FFT/FISTA temporaries.
     estimated_resident = 0
     estimated_peak = 0
     for band in bands:
@@ -273,13 +271,12 @@ def render(self, *, plan_only=False) -> None:
                 az_count,
                 len(freq_indices_sorted),
                 reconstruction="accurate" if recon == "auto" else recon,
-                retain_complex=True,
+                retain_complex=False,
             )
             n_az_fft = computation._next_fast_len(max(az_count, 256))
             n_freq_fft = computation._next_fast_len(max(len(freq_indices_sorted), 256))
-            image_cells = n_az_fft * n_freq_fft
-            display_cells = common.bounded_image_cell_count(n_az_fft, n_freq_fft)
-            retained = 8 * image_cells + 4 * display_cells
+            # Only the display-decimated magnitude outlives formation.
+            retained = 4 * common.bounded_image_cell_count(n_az_fft, n_freq_fft)
         estimated_peak = max(estimated_peak, estimated_resident + working)
         estimated_resident += retained
     try:
@@ -316,30 +313,19 @@ def render(self, *, plan_only=False) -> None:
         "l1_iters": l1_iters,
         "flip_x": flip_x,
         "flip_y": flip_y,
-        # The ISAR tab exposes Export ISAR Result, so retain the coherent
-        # worker result. Wide max-look composites explicitly report that no
-        # physically meaningful complex image exists.
-        "retain_complex": True,
         "isar_contract_assumptions": contract_assumptions,
     }
+    # Reject an unformable aperture (e.g. a coherent sector of 90 degrees or
+    # more) before starting the worker.
     try:
-        plans = []
         for band in bands:
             az = computation._angle_values_to_degrees(self.active_dataset, "azimuth", self.active_dataset.azimuths[band])
             if az_center_deg is not None:
                 az = computation._unwrap_degrees(az, az_center_deg)
-            plans.append(computation.plan_isar(az, freq_hz, elevation_degrees=elevation_deg,
-                scene_half_extent_m=options.get("scene_half_extent_m"), reconstruction=recon, mode=image_mode))
+            computation.plan_isar(az, freq_hz, elevation_degrees=elevation_deg,
+                scene_half_extent_m=options.get("scene_half_extent_m"), reconstruction=recon, mode=image_mode)
     except ValueError as exc:
         self.status.showMessage(f"ISAR planning: {exc}")
-        return
-    tools = getattr(self, "isar_tools", None)
-    if tools is not None:
-        from GRIM_Backend.ui.isar_controls import quality_text
-        tools.show_quality(quality_text([{"accuracy_plan": p, "resolved_reconstruction": p["selected_reconstruction"]} for p in plans], unit_name)
-            + f"\nEstimated additional formation peak: {estimated_peak / 1024**2:.1f} MiB. Acquired samples are evaluated before interpolation.")
-    if plan_only:
-        self.status.showMessage("ISAR plan updated. No image was formed.")
         return
     self._isar_submit(params)
 
@@ -349,10 +335,6 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
     dataset = params["dataset"]
     unit_name = params["unit_name"]
     az_target_deg = params["az_target_deg"]
-    tools = getattr(self, "isar_tools", None)
-    if tools is not None:
-        from GRIM_Backend.ui.isar_controls import quality_text
-        tools.show_quality(quality_text(band_results, unit_name))
 
     # Convert coherent magnitude to generic image intensity. Image formation
     # does not guarantee an absolute square-metre normalization, so neither

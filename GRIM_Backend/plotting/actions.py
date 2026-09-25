@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
 
 from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.plotting.dataset_style import DatasetPlotStyleMixin
-from GRIM_Backend.isar.artifact import build_isar_manifest
 from GRIM_Backend.plotting.modes import (
     az_vs_range_mode,
     azimuth_polar_mode,
@@ -643,9 +642,8 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         self.plot_axes = None
         self._style_plot_axes()
         self._apply_plot_limits()
-        if getattr(self, "btn_export_isar_result", None) is not None:
-            # Clear is a view-only action: keep a valid numerical artifact, but
-            # never let Export Plot treat the newly blank canvas as the last
+        if getattr(self, "_active_plot_tab", None) == "isar":
+            # Never let Export Plot treat the newly blank canvas as the last
             # completed ISAR figure.
             self._invalidate_isar_figure()
         recorder = getattr(self, "python_recorder", None)
@@ -1468,14 +1466,6 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
     # thread, coalesce bursts of requests (spinbox keystrokes, scrubbing).
     # ------------------------------------------------------------------
 
-    def _isar_result_export_button(self):
-        button = getattr(self, "btn_export_isar_result", None)
-        if button is not None:
-            return button
-        contexts = getattr(self, "_plot_contexts", {}) or {}
-        context = contexts.get("isar")
-        return getattr(context, "btn_export_isar_result", None)
-
     def _invalidate_isar_figure(self) -> None:
         """Mark the visible ISAR canvas stale without discarding valid arrays."""
 
@@ -1499,19 +1489,6 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             getattr(self, "_isar_input_revision", 0)
         ) + 1
         self._invalidate_isar_figure()
-        self._last_isar_artifact = None
-        self._last_isar_recipe = None
-        self._last_isar_completed_input_revision = None
-        export_result = self._isar_result_export_button()
-        if export_result is not None:
-            export_result.setEnabled(False)
-
-    def _isar_numerical_result_is_current(self) -> bool:
-        return bool(
-            getattr(self, "_last_isar_artifact", None) is not None
-            and getattr(self, "_last_isar_completed_input_revision", None)
-            == getattr(self, "_isar_input_revision", 0)
-        )
 
     def _isar_figure_is_current(self) -> bool:
         return bool(
@@ -1582,30 +1559,11 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             signals.done.connect(self._on_isar_compute_done)
             signals.progress.connect(self._on_isar_progress)
         params["progress"] = lambda detail: signals.progress.emit(params, str(detail))
-        toolbar = self._isar_toolbar()
-        if toolbar is not None:
-            toolbar.cancel.setEnabled(True)
         self.status.showMessage("Computing ISAR image…")
 
         def work(params=params, signals=signals):
             try:
                 result = isar_mode.compute_bands(params)
-                if not isinstance(result, str):
-                    band_results, elapsed = result
-                    manifest = None
-                    manifest_error = None
-                    try:
-                        manifest = build_isar_manifest(
-                            params["dataset"], params, band_results, elapsed
-                        )
-                    except (KeyError, TypeError, ValueError) as exc:
-                        manifest_error = str(exc)
-                    result = (
-                        band_results,
-                        elapsed,
-                        manifest,
-                        manifest_error,
-                    )
             except Exception as exc:  # surface, don't kill the worker silently
                 result = f"ISAR computation failed: {exc}"
             signals.done.emit(params, result)
@@ -1614,9 +1572,6 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
 
     def _on_isar_compute_done(self, params: dict, result) -> None:
         self._isar_busy = False
-        toolbar = self._isar_toolbar()
-        if toolbar is not None:
-            toolbar.cancel.setEnabled(False)
         self._isar_cancel_event = None
         pending = getattr(self, "_isar_pending", None)
         self._isar_pending = None
@@ -1638,40 +1593,13 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             self.status.showMessage("ISAR result discarded (view changed while computing).")
             ok = False
         else:
-            if len(result) == 4:
-                band_results, elapsed, manifest, manifest_error = result
-            else:  # compatibility for direct unit harnesses
-                band_results, elapsed = result
-                manifest = None
-                manifest_error = None
+            band_results, elapsed = result
             isar_mode.display_results(self, params, band_results, elapsed)
             self._last_isar_figure_generation = params.get("render_generation")
-            self._last_isar_completed_input_revision = params.get(
-                "isar_input_revision"
-            )
             self._last_isar_completed_view_revision = params.get(
                 "isar_view_revision"
             )
             self._last_isar_figure_token = params.get("figure_token")
-            if manifest is None and manifest_error is None:
-                try:
-                    manifest = build_isar_manifest(
-                        params["dataset"], params, band_results, elapsed
-                    )
-                except (KeyError, TypeError, ValueError) as exc:
-                    manifest_error = str(exc)
-            if manifest is None:
-                self._last_isar_artifact = None
-                self._note_plot_render(
-                    f"ISAR result export unavailable: {manifest_error}."
-                )
-            else:
-                self._last_isar_artifact = (band_results, manifest)
-                from GRIM_Backend.isar.recipes import recipe_from_params
-                self._last_isar_recipe = recipe_from_params(params)
-                export_result = self._isar_result_export_button()
-                if export_result is not None:
-                    export_result.setEnabled(True)
             # Freeze the exact worker-captured recipe after every successful
             # async render, but emit it only for an explicit user request;
             # automatic refreshes stay out of the script.
@@ -2556,25 +2484,9 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         self.plot_figure.set_facecolor(self._current_plot_bg())
         return top_ax, res_ax
 
-    def _isar_toolbar(self):
-        context = (getattr(self, "_plot_contexts", {}) or {}).get("isar")
-        return getattr(context, "isar_tools", None) or getattr(self, "isar_tools", None)
-
     def _on_isar_progress(self, params, detail):
         if params.get("isar_input_revision") == getattr(self, "_isar_input_revision", 0):
             self.status.showMessage("ISAR: " + detail)
-
-    def _cancel_isar(self):
-        self._isar_pending = None
-        play = getattr(self, "btn_isar_ap_play", None)
-        if play is not None:
-            play.setChecked(False)
-        self._invalidate_isar_result()
-        self.status.showMessage("ISAR cancellation requested; stopping at the next bounded processing block.")
-
-    def _plan_isar_image(self):
-        from GRIM_Backend.plotting.modes.isar_render import render
-        render(self, plan_only=True)
 
     def _isar_control_changed(self, context, widget):
         if not widget.isEnabled():
@@ -2586,23 +2498,3 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         if widget in (context.spin_isar_ap_center, context.spin_isar_ap_width) and not context.chk_isar_aperture.isChecked():
             return
         self._invalidate_isar_result()
-
-    def _open_isar_result(self):
-        from GRIM_Backend.ui.isar_workflow import open_result
-        open_result(self)
-
-    def _compare_isar_result(self):
-        from GRIM_Backend.ui.isar_workflow import open_result
-        open_result(self, compare=True)
-
-    def _save_isar_recipe(self):
-        from GRIM_Backend.ui.isar_workflow import save_recipe
-        save_recipe(self)
-
-    def _load_isar_recipe(self):
-        from GRIM_Backend.ui.isar_workflow import load_recipe
-        load_recipe(self)
-
-    def _show_isar_workflow(self):
-        from GRIM_Backend.ui.isar_workflow import show_guide
-        show_guide(self)

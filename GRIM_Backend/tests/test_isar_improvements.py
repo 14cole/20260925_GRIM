@@ -288,36 +288,13 @@ class UiWorkflowTests(unittest.TestCase):
         self.assertTrue(self.context.spin_isar_l1_iters.isEnabled())
         self.assertFalse(self.context.combo_isar_window.isEnabled())
 
-    def test_recipe_exact_selection_center_and_atomic_validation(self):
-        from PySide6.QtCore import Qt
-        from GRIM_Backend.ui.isar_workflow import apply_recipe_controls
-        p = params(self.window.active_dataset)
-        p['bands'] = [list(range(0, 65, 2))]
-        p['az_center_deg'] = 0.
-        arguments = recipe_arguments(self.window.active_dataset, recipe_from_params(p))
-        apply_recipe_controls(self.window, arguments)
-        selected = [item.data(Qt.UserRole+1) for item in self.window.list_az.selectedItems()]
-        self.assertEqual(selected, p['bands'][0])
-        self.assertTrue(self.window.chk_isar_aperture.isChecked())
-        self.assertEqual(self.window.spin_isar_ap_width.value(), 10.)
-        self.assertFalse(self.window.list_az.signalsBlocked())
-        bad = dict(arguments, scene_half_extent_m=[1e-8, 1.])
-        with self.assertRaisesRegex(ValueError, 'GUI precision'):
-            apply_recipe_controls(self.window, bad)
-        self.assertEqual([item.data(Qt.UserRole+1) for item in self.window.list_az.selectedItems()], selected)
-
-    def test_reopened_artifact_dialog_and_locked_comparison_axes(self):
-        from GRIM_Backend.ui.isar_workflow import IsarResultDialog
-        _, bands, m = formed()
-        dialog = IsarResultDialog((m, bands), (m, bands))
-        self.assertIsNotNone(dialog.comparison)
-        self.assertTrue(dialog.axes[0].get_shared_x_axes().joined(*dialog.axes[:2]))
-        dialog.profiles.setChecked(True)
-        self.assertEqual(len(dialog.figure.axes), 9)  # six plots and three color bars
-        dialog.roi()
-        self.assertIn('ROI', dialog.details.toPlainText())
-        dialog.close()
-        dialog.deleteLater()
+    def test_isar_tab_has_no_result_toolbar(self):
+        from PySide6.QtWidgets import QToolButton
+        self.assertNotIn('isar_tools', self.context.__dataclass_fields__)
+        labels = {button.text() for button in self.window.findChildren(QToolButton)}
+        removed = {'Plan image', 'Cancel', 'Open result', 'Compare result',
+                   'Save recipe', 'Load recipe', 'Workflow', 'Quality'}
+        self.assertFalse(labels & removed, labels & removed)
 
 
 if __name__ == '__main__':

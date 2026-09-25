@@ -412,65 +412,54 @@ class UnifiedGuiShellTest(unittest.TestCase):
         )
         self.assertFalse(context.chk_compare_show_all_azimuths.isChecked())
 
-    def test_isar_exports_are_bound_to_isar_inputs_not_other_plot_renders(self) -> None:
+    def test_isar_plot_export_is_bound_to_isar_inputs_not_other_plot_renders(self) -> None:
         self.window._activate_plot_tab("isar")
         context = self.window._plot_contexts["isar"]
+        self.assertFalse(
+            any(
+                button.text() == "Export ISAR Result"
+                for button in self.window.findChildren(QToolButton)
+            )
+        )
         self.window._isar_input_revision = 10
         self.window._isar_view_revision = 20
-        self.window._last_isar_completed_input_revision = 10
         self.window._last_isar_completed_view_revision = 20
         self.window._last_isar_figure_token = self.window.plot_figure
-        self.window._last_isar_artifact = ([{"result": True}], {"schema": "test"})
-        context.btn_export_isar_result.setEnabled(True)
 
         # The ordinary plotting generation is global legacy state, but its
         # changes must not make a still-current ISAR canvas look stale.
         self.window._start_plot_render()
-        self.assertTrue(self.window._isar_numerical_result_is_current())
         self.assertTrue(self.window._isar_figure_is_current())
 
-        # A deferred numerical setting edit invalidates both exports before
+        # A deferred numerical setting edit invalidates Export Plot before
         # Apply, so the old image cannot be mistaken for the new recipe.
         next_index = (context.combo_isar_window.currentIndex() + 1) % max(
             context.combo_isar_window.count(), 1
         )
         context.combo_isar_window.setCurrentIndex(next_index)
-        self.assertFalse(self.window._isar_numerical_result_is_current())
         self.assertFalse(self.window._isar_figure_is_current())
-        self.assertIsNone(self.window._last_isar_artifact)
-        self.assertFalse(context.btn_export_isar_result.isEnabled())
 
-    def test_isar_view_only_edit_preserves_numerical_artifact(self) -> None:
+    def test_isar_view_only_edit_invalidates_the_plot_export(self) -> None:
         self.window._activate_plot_tab("isar")
         context = self.window._plot_contexts["isar"]
-        self.window._isar_input_revision = 3
         self.window._isar_view_revision = 4
-        self.window._last_isar_completed_input_revision = 3
         self.window._last_isar_completed_view_revision = 4
         self.window._last_isar_figure_token = self.window.plot_figure
-        artifact = ([{"result": True}], {"schema": "test"})
-        self.window._last_isar_artifact = artifact
 
         context.chk_isar_square.setChecked(not context.chk_isar_square.isChecked())
-        self.assertTrue(self.window._isar_numerical_result_is_current())
         self.assertFalse(self.window._isar_figure_is_current())
-        self.assertIs(self.window._last_isar_artifact, artifact)
 
-    def test_clear_isar_canvas_invalidates_only_the_figure_export(self) -> None:
+    def test_clear_isar_canvas_invalidates_the_plot_export(self) -> None:
         self.window._activate_plot_tab("isar")
         self.window._isar_input_revision = 3
         self.window._isar_view_revision = 4
-        self.window._last_isar_completed_input_revision = 3
         self.window._last_isar_completed_view_revision = 4
         self.window._last_isar_figure_token = self.window.plot_figure
-        artifact = ([{"result": True}], {"schema": "test"})
-        self.window._last_isar_artifact = artifact
 
         self.window._clear_plot()
 
-        self.assertTrue(self.window._isar_numerical_result_is_current())
         self.assertFalse(self.window._isar_figure_is_current())
-        self.assertIs(self.window._last_isar_artifact, artifact)
+        self.assertEqual(self.window._isar_input_revision, 3)
         self.assertFalse(self.window.plot_ax.images)
 
     def test_plot_recorder_specs_are_owned_by_each_canvas(self) -> None:
@@ -1011,7 +1000,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
         self.assertEqual(self.window.table.rowCount(), 2)
         self.assertEqual(
             self.window.table.item(1, 0).text(),
-            "Native SENTRi [SENTRi El→GRIM]",
+            "Native SENTRi [SENTRi El-to-GRIM]",
         )
         converted = self.window.table.item(1, 0).data(Qt.UserRole)
         np.testing.assert_allclose(converted.elevations, [-90.0, 0.0, 90.0])
@@ -1083,7 +1072,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
         result_item = self.window.table.item(3, 0)
         self.assertEqual(
             result_item.text(),
-            "DUT [Range Cal: Exact cylinder; ΔR +0 m]",
+            "DUT [Range Cal: Exact cylinder; DeltaR +0 m]",
         )
         result = result_item.data(Qt.UserRole)
         np.testing.assert_allclose(result.rcs, truth.rcs)
@@ -1511,6 +1500,30 @@ class UnifiedGuiShellTest(unittest.TestCase):
             self.assertFalse(result)
             self.assertEqual(os.listdir(tmp), [])
         critical.assert_called_once()
+
+    def test_batch_save_writes_portable_ascii_filenames(self) -> None:
+        for name in ("DUT [Wedge→Conic normal conic]", "Cal ÷ Ref [Mirror 90°]", "aux"):
+            self.window._add_dataset_row(_grid(), name, "Loaded")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(
+                self.window._save_rows_to_directory(
+                    [0, 1, 2], tmp, dialog_title="Test Save"
+                )
+            )
+            self._wait_for_background()
+            for filename in (
+                "DUT [Wedge-to-Conic normal conic].grim",
+                "Cal div Ref [Mirror 90deg].grim",
+                "aux_.grim",
+            ):
+                self.assertTrue(
+                    os.path.isfile(os.path.join(tmp, filename)), filename
+                )
+            self.assertTrue(all(entry.isascii() for entry in os.listdir(tmp)))
+        # The table keeps the display name; only the filename is portable.
+        self.assertEqual(
+            self.window.table.item(0, 0).text(), "DUT [Wedge→Conic normal conic]"
+        )
 
     def test_delete_requires_confirmation_for_unsaved_derived_rows(self) -> None:
         start_count = self.window.table.rowCount()

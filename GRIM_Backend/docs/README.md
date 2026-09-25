@@ -263,14 +263,14 @@ weak wanted scatterer is suppressed. Wide selections use a labeled nonlinear
 max-look composite of narrow subapertures and are qualitative rather than a
 single coherent 360-degree reconstruction.
 
-**Plan image** evaluates the selected acquired frequencies and angles without
-forming an image. In **ISAR Settings**, enter the occupied cross-range and range
-half extents in metres, then choose **Recommended PFA** for a scene-dependent
-Fast/Accurate choice. The planner distinguishes native phase increments from
-Fast PFA range-curvature error. Passing a sampling check is not a guarantee of
-interpolation accuracy; upsampling cannot recover missing measurements. Without
-entered bounds, advice uses nominal periodic scene limits and labels that
-assumption. Coherent bounds use the mean-look frame; composite bounds use the
+In **ISAR Settings**, enter the occupied cross-range and range half extents in
+metres, then choose **Recommended PFA** for a scene-dependent Fast/Accurate
+choice. Formation plans each image from the acquired samples before
+interpolation, distinguishing native phase increments from Fast PFA
+range-curvature error, and records that plan with the result. Passing a
+sampling check is not a guarantee of interpolation accuracy; upsampling cannot
+recover missing measurements. Without entered bounds, the plan uses nominal
+periodic scene limits and labels that assumption. Coherent bounds use the mean-look frame; composite bounds use the
 fixed body frame. Elevation projects the horizontal image plane and cannot
 independently resolve height from one angular cut.
 
@@ -284,9 +284,10 @@ Composite grid size is configurable from 32 to 4096 pixels per side. Scene bound
 crop the retained result but do not reduce the full coherent FFT or add resolution.
 Frequency-band controls display the dataset's own units and acquired bounds.
 
-The persistent **Quality** panel shows physical ranges, sampling/curvature
-warnings, coverage/gaps, nominal resolution, and windowed origin PSF cuts. Power
-FWHM, peak sidelobe ratio and integrated sidelobe ratio describe **one-dimensional
+Headless formation (`form_isar` in the scripting API) reports physical ranges,
+sampling/curvature warnings, coverage/gaps, nominal resolution, and windowed
+origin PSF cuts for each image. Power FWHM, peak sidelobe
+ratio and integrated sidelobe ratio describe **one-dimensional
 cuts** through the origin response on the actual gridded support, not a full 2D
 ISLR or an off-center focusing guarantee. Sparse and composite formation are
 nonlinear and have no single fixed PSF; composite artifacts retain individual
@@ -295,8 +296,9 @@ distinct from its gridded optimization residual. The bounded diagnostic uses up
 to 4096 source positions and 512 retained image points, records sampling and
 omitted-energy fractions, and explains when it cannot be computed. It evaluates
 the full formed image before optional scene cropping and display flips.
-**Cancel** stops at a processing block, with worker-stage progress in the status
-bar. Sparse-only controls and the ignored Sparse taper are disabled appropriately.
+Worker-stage progress appears in the status bar. Changing an ISAR setting or
+applying new ones stops a running formation at its next processing block.
+Sparse-only controls and the ignored Sparse taper are disabled appropriately.
 
 Nonuniform samples are interpolated only within acquired support. Missing
 frequency or azimuth sectors are placed on the uniform working grid with zero
@@ -309,7 +311,7 @@ coverage. Fully observed cubic stencils retain cubic interpolation; stencils
 touching missing data use the same positive linear weights for both arrays.
 This preserves the coherent gain of an origin point under missing support.
 
-**Export ISAR Result** saves the latest completed full-resolution image as a
+`save_isar_artifact` in the scripting API saves a formed result as a
 transactional `.isar.npz` artifact. Coherent looks include the complex image and
 distance axes, with magnitude derived losslessly on load instead of stored as a
 redundant second image. Magnitude-only wide composites retain their magnitude
@@ -334,26 +336,19 @@ point-coefficient phases. It does not make a general FFT image an exact sparse
 point model. Image intensity remains generic dB, not calibrated per-pixel dBsm
 or dBke. Pixel-center axes are displayed using their outer half-cell boundaries.
 
-**Open result** loads a numerical artifact without its original acquisition.
-**Compare result** compares the current completed image against a saved artifact,
-or loads two files when no current image exists. It checks image/frame,
-normalization, acquisition and declared phase/calibration compatibility. Older
-artifacts without the required contracts can be viewed but must be re-formed
-for quantitative comparison. Comparisons provide shared intensity scales,
-linked physical axes, A-minus-B intensity differences, peak profiles and
-statistics for the current zoomed ROI. Different grids require explicit
-resampling of **linear intensity** onto their physical overlap; dB is never
-interpolated. The GUI limits comparisons to one million overlap cells and
-preflights additional artifact arrays against a 512 MiB viewer allocation
-allowance with space reserved for plotting. Coverage and PSF differences still
-need interpretation; compatible metadata alone does not certify calibration.
+Scripts can reload an artifact without its original acquisition using
+`load_isar_artifact`, and compare two with `compare_images` (after
+`hydrate_band`), all from `GRIM_Backend.scripting.api`. Comparison refuses
+mismatched image frames, normalization, acquisition, or declared
+phase/calibration conventions, reports
+A-minus-B image intensity in dB, and resamples only **linear intensity** onto
+the physical overlap when explicitly allowed.
 
-**Save recipe** freezes the accepted formation recipe as non-executable
-`.isar.json`, including physical azimuth, frequency, elevation and polarization
-selectors. **Load recipe** validates those samples against the active dataset
-and restores controls; it does not automatically form an image. Equivalent
-Hz/GHz axes match. Settings outside GUI precision or limits are explained before
-any control is changed. Headless replay uses the same validated selectors:
+The scripting API also keeps the ISAR recipe functions (`recipe_from_params`,
+`save_recipe`, `load_recipe`, `recipe_arguments`). A non-executable
+`.isar.json` recipe stores physical azimuth, frequency, elevation and
+polarization selectors; replay validates them against the target dataset, and
+equivalent Hz/GHz axes match:
 
 ```python
 from GRIM_Backend.scripting.api import load_recipe, recipe_arguments, form_isar
@@ -367,11 +362,10 @@ bands, elapsed = form_isar(dataset, retain_complex=True, **options)
 The adjoint is not an inverse; Sparse L1 still uses its existing gridded LASSO
 objective. A production accelerated native reconstruction remains future work.
 
-Export Plot and numerical-result export are disabled while a newer formation is
-pending, so a previous canvas cannot be mistaken for current settings. Clearing
-the canvas invalidates only the picture export, not a still-valid numerical
-artifact. Plotting-tab renders use an independent freshness counter and cannot
-invalidate a still-current ISAR result. The Python recorder captures the exact
+Export Plot is refused while a newer formation is pending or after the canvas is
+cleared, so a previous canvas cannot be mistaken for current settings.
+Plotting-tab renders use an independent freshness counter and cannot
+invalidate a still-current ISAR image. The Python recorder captures the exact
 accepted worker-start recipe and current display style for headless replay,
 rather than rereading controls that changed while the worker ran. Headless ISAR
 uses the GUI's peak-preserving display bound, -120 dB intensity floor, physical
@@ -491,9 +485,16 @@ geometry assumption; dimensionless power ratios are rejected.
 linear power, missing-phase cells, and the physical complex field are
 unchanged. The resulting dataset records the choice as `units["phase_wrap"]`;
 native `.grim` and versioned flat CSV preserve it. Azimuth wrapping is a
-coordinate operation instead: it reorders the grid and may merge physically
-equivalent seam aliases, but rejects conflicting finite samples that would
-collapse onto the same wrapped coordinate.
+coordinate operation instead: it reorders the grid and merges samples that
+collapse onto the same wrapped coordinate, such as the 0° and 360° endpoints of
+a closed sweep. Missing cells are filled from the alias. Where both hold finite
+values that differ, the sample that comes first on the source azimuth axis (the
+opening sample of the sweep) is kept and the later repeat is discarded; the
+status bar and dataset history report how many seam coordinates were resolved
+that way. **Medianize** treats a closed sweep the same way: the seam direction
+is counted once, using the opening sample where the closing repeat differs.
+Scripts that need the strict behavior can pass `seam_conflict="error"` to
+`wrap_azimuth()` or `medianize_azimuth()`.
 
 ## Assembly
 
@@ -859,6 +860,13 @@ shared loader accepts `.grim`, native flat `.csv`, SENTRi `.csv`/`.txt`, CST
 `.csv`/`.cst_data`, theta/phi `.txt`, `.out`, Pioneer `.pio`/`.cmplx_di`,
 legacy `.ptm`, and Xpatch `.ss` files. Folder and headless loads use the same
 extension registry.
+
+Saved and exported filenames (`.grim`, CSV, `.pio`, `.ptm`) are derived from
+the dataset name but always use plain printable ASCII, so external programs
+can open them. Symbols are spelled out (`→` becomes `-to-`, `°` becomes `deg`,
+`÷` becomes `div`, `Δ` becomes `Delta`), accents are dropped, characters that
+Windows forbids become `_`, and reserved device names such as `aux` get a
+trailing `_`. The name shown in the dataset table is unchanged.
 
 Xpatch `.ss` imports retain the documented GHz frequency values and interpret
 each binary signal record as one angular look with frequency-varying

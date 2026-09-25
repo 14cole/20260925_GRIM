@@ -842,8 +842,14 @@ class GridAxesMixin:
         incoming_phase,
         *,
         context,
+        keep_existing_on_conflict=False,
     ):
-        """Merge complementary/equivalent samples or reject a seam conflict."""
+        """Merge complementary/equivalent samples or reject a seam conflict.
+
+        With ``keep_existing_on_conflict`` a conflicting incoming sample is
+        discarded and the existing sample kept instead of raising.  Returns
+        the boolean mask of conflicting cells.
+        """
 
         existing_power = np.asarray(existing_power)
         existing_phase = np.asarray(existing_phase)
@@ -867,7 +873,8 @@ class GridAxesMixin:
             np.angle(np.exp(1j * (existing_phase - incoming_phase)))
         )
         phase_conflict = both_phase & ~both_zero & (phase_delta > 1.0e-5)
-        if np.any(power_conflict) or np.any(phase_conflict):
+        conflict = power_conflict | phase_conflict
+        if np.any(conflict) and not keep_existing_on_conflict:
             raise ValueError(
                 f"{context}: conflicting finite seam samples would overlap"
             )
@@ -886,6 +893,7 @@ class GridAxesMixin:
             & np.isfinite(incoming_phase)
         )
         existing_phase[fill_phase] = incoming_phase[fill_phase]
+        return conflict
 
     @staticmethod
     def _merge_equivalent_raw_blocks(
@@ -895,8 +903,13 @@ class GridAxesMixin:
         incoming_imag,
         *,
         context,
+        keep_existing_on_conflict=False,
     ):
-        """Merge authoritative float64 seam fields or reject hidden conflicts."""
+        """Merge authoritative float64 seam fields or reject hidden conflicts.
+
+        ``keep_existing_on_conflict`` and the returned conflict mask behave as
+        in :meth:`_merge_equivalent_sample_blocks`.
+        """
 
         existing_real = np.asarray(existing_real)
         existing_imag = np.asarray(existing_imag)
@@ -919,13 +932,15 @@ class GridAxesMixin:
                 atol=1.0e-15,
             )
         )
-        if np.any(both & ~equivalent):
+        conflict = both & ~equivalent
+        if np.any(conflict) and not keep_existing_on_conflict:
             raise ValueError(
                 f"{context}: conflicting authoritative raw seam samples would overlap"
             )
         take = ~existing_finite & incoming_finite
         existing_real[take] = incoming_real[take]
         existing_imag[take] = incoming_imag[take]
+        return conflict
 
     def mirror_about_azimuth(self, azimuth_deg: float):
         """Mirror azimuth axis about a reference angle and return a new grid.
@@ -1060,16 +1075,27 @@ class GridAxesMixin:
             ),
         )
 
-    def wrap_azimuth(self, mode: str):
+    def wrap_azimuth(
+        self, mode: str, *, seam_conflict: str = "first", return_report=False
+    ):
         """Wrap azimuth axis into the given range and return a new grid.
 
         ``mode`` is ``"0_360"`` for [0, 360) or ``"-180_180"`` for [-180, 180).
         Output azimuths are sorted ascending; samples are reordered to match.
         Degree axes use 360/180 and radian axes use 2*pi/pi.  If wrapping
-        collapses distinct inputs onto one seam coordinate, complementary or
-        equivalent samples are merged; conflicting finite samples are rejected
-        instead of silently discarding one.
+        collapses distinct inputs onto one seam coordinate (for example the 0
+        and 360 endpoints of a closed sweep), complementary or equivalent
+        samples are merged.  Where finite samples disagree, ``seam_conflict``
+        decides: ``"first"`` (default) keeps the sample that comes first on
+        the source azimuth axis, i.e. the opening sample of the sweep, and
+        discards the later repeat, recording the count in history;
+        ``"error"`` rejects the wrap instead.  ``return_report=True`` returns
+        ``(grid, report)`` with merge and conflict counts.
         """
+        policy = str(seam_conflict).strip().lower()
+        if policy not in {"first", "error"}:
+            raise ValueError("seam_conflict must be 'first' or 'error'")
+        keep_first = policy == "first"
         az = np.asarray(self.azimuths, dtype=float)
         unit = self._supported_unit("azimuth", _ANGLE_UNITS, "deg")
         period = (2.0 * np.pi) if unit == "rad" else 360.0
@@ -1110,26 +1136,35 @@ class GridAxesMixin:
             raw_imag = np.asarray(raw_pair[1], dtype=np.float64)
             output_raw_real = np.full(output_shape, np.nan, dtype=np.float64)
             output_raw_imag = np.full(output_shape, np.nan, dtype=np.float64)
+        conflicting_coordinates = 0
+        discarded_cells = 0
         for output_index, group in enumerate(groups):
-            for source_index in group:
-                context = (
-                    f"azimuth wrap at {unique_vals[output_index]:.12g} {unit}"
-                )
-                self._merge_equivalent_sample_blocks(
+            context = f"azimuth wrap at {unique_vals[output_index]:.12g} {unit}"
+            group_conflict = np.zeros(output_shape[1:], dtype=bool)
+            # Source-axis order sets precedence: a later alias only fills
+            # cells the earlier sample left missing.
+            for source_index in sorted(group):
+                group_conflict |= self._merge_equivalent_sample_blocks(
                     output_power[output_index],
                     output_phase[output_index],
                     self.rcs_power[source_index],
                     self.rcs_phase[source_index],
                     context=context,
+                    keep_existing_on_conflict=keep_first,
                 )
                 if preserve_raw:
-                    self._merge_equivalent_raw_blocks(
+                    group_conflict |= self._merge_equivalent_raw_blocks(
                         output_raw_real[output_index],
                         output_raw_imag[output_index],
                         raw_real[source_index],
                         raw_imag[source_index],
                         context=context,
+                        keep_existing_on_conflict=keep_first,
                     )
+            conflict_count = int(np.count_nonzero(group_conflict))
+            if conflict_count:
+                conflicting_coordinates += 1
+                discarded_cells += conflict_count
         if preserve_raw:
             unmodeled = ~np.isfinite(output_power)
             output_raw_real[unmodeled] = np.nan
@@ -1141,7 +1176,22 @@ class GridAxesMixin:
             wrapped_extra["rcs_amp_real"] = output_raw_real
             wrapped_extra["rcs_amp_imag"] = output_raw_imag
             wrapped_extra["raw_complex_amplitude_preserved"] = True
-        return self._new_grid(
+        history = None
+        if conflicting_coordinates:
+            range_label = "[0, 360)" if mode == "0_360" else "[-180, 180)"
+            history_entry = (
+                f"Wrap azimuth to {range_label} {unit}: kept the first sample "
+                f"on the source azimuth axis at {conflicting_coordinates} seam "
+                f"coordinate(s) where wrapped duplicates disagreed; discarded "
+                f"{discarded_cells} conflicting cell(s)"
+            )
+            prior_history = str(self.history or "").strip()
+            history = (
+                f"{prior_history}\n{history_entry}"
+                if prior_history
+                else history_entry
+            )
+        result = self._new_grid(
             unique_vals,
             np.array(self.elevations, copy=True),
             np.array(self.frequencies, copy=True),
@@ -1149,8 +1199,20 @@ class GridAxesMixin:
             rcs_power=output_power,
             rcs_phase=output_phase,
             rcs_domain="power_phase",
+            history=history,
             extra=wrapped_extra,
         )
+        if not return_report:
+            return result
+        report = {
+            "schema": "grim.azimuth-wrap-report.v1",
+            "mode": mode,
+            "seam_conflict": policy,
+            "merged_coordinate_count": int(az.size - len(groups)),
+            "conflicting_coordinate_count": int(conflicting_coordinates),
+            "discarded_conflict_cell_count": int(discarded_cells),
+        }
+        return result, report
 
     def wrap_phase(self, mode: str):
         """Wrap stored phase while preserving power and the complex field.

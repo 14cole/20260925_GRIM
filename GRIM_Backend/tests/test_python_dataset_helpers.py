@@ -210,17 +210,42 @@ class PythonDatasetHelperTest(unittest.TestCase):
         self.assertEqual(result.source_path, "closed.grim")
         self.assertEqual(result.history, "loaded closed sweep")
 
-    def test_periodic_median_rejects_conflicting_closed_sweep_seam(self):
+    def test_periodic_median_keeps_opening_sample_of_conflicting_closed_seam(self):
         conflict = _grid(
             (-180.0, -90.0, 0.0, 90.0, 180.0),
             values=(1.0, 2.0, 3.0, 4.0, 9.0),
         )
 
+        result, report = medianize_azimuth(
+            conflict,
+            window_degrees=180.0,
+            slide_degrees=90.0,
+            return_report=True,
+        )
+
+        # The opening -180 sample (1.0) stands for the seam direction; using
+        # the closing repeat (9.0) instead would give [4, 3, 3, 4].
+        np.testing.assert_allclose(result.rcs_power.ravel(), [2.0, 2.0, 3.0, 3.0])
+        self.assertEqual(report["discarded_seam_cell_count"], 1)
+        self.assertTrue(report["seam_merged"])
+        self.assertIn(
+            "kept the opening sample at -180 deg where the closing repeat at "
+            "180 deg disagreed",
+            result.history,
+        )
         with self.assertRaisesRegex(ValueError, "conflicting finite seam"):
             medianize_azimuth(
                 conflict,
                 window_degrees=180.0,
                 slide_degrees=90.0,
+                seam_conflict="error",
+            )
+        with self.assertRaisesRegex(ValueError, "seam_conflict"):
+            medianize_azimuth(
+                conflict,
+                window_degrees=180.0,
+                slide_degrees=90.0,
+                seam_conflict="last",
             )
 
     def test_extrusion_conversion_round_trips_and_rejects_ratios(self):

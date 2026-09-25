@@ -967,16 +967,13 @@ class PlotRendererIntegrationTests(unittest.TestCase):
                 "frequency": dataset.frequencies,
             },
         )
-        artifact = object()
         harness._isar_busy = False
         harness._isar_input_revision = 8
         harness._isar_view_revision = 9
-        harness._last_isar_artifact = artifact
         harness._background_job_active = lambda: True
 
         harness._isar_submit({})
 
-        self.assertIs(harness._last_isar_artifact, artifact)
         self.assertEqual(harness._isar_input_revision, 8)
         self.assertEqual(harness._isar_view_revision, 9)
         self.assertIn("dataset import", harness.status.message.lower())

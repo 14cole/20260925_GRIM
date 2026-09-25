@@ -125,7 +125,6 @@ GRIM_STARTUP_FILES = (
     "ui/dataset_sidebar.py",
     "ui/delta_map_controls.py",
     "ui/isar_controls.py",
-    "ui/isar_workflow.py",
     "ui/palette.py",
     "ui/theme.py",
     "ui/table_import.py",

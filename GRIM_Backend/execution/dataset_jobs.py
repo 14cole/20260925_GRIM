@@ -482,7 +482,7 @@ class _RangeCalibrationWorker(QObject):
                     "source_dataset": target,
                     "name": (
                         f"{target_name} [Range Cal: {exact_display}; "
-                        f"ΔR {offset_m:+.6g} m]"
+                        f"DeltaR {offset_m:+.6g} m]"
                     ),
                     "history": (
                         f"Range Cal: {target_name}; measured={self._measured_name}; "

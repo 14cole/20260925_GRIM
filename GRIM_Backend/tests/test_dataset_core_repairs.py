@@ -525,7 +525,7 @@ class CoreOperationTests(unittest.TestCase):
         self.assertEqual(swapped.units["elevation"], "rad")
         self.assertEqual(swapped.rcs_power.shape, (3, 2, 1, 1))
 
-    def test_wrap_merges_equivalent_rad_seam_and_rejects_conflict(self):
+    def test_wrap_merges_equivalent_rad_seam_and_keeps_first_on_conflict(self):
         units = {"azimuth": "rad", "elevation": "deg", "frequency": "GHz"}
         equivalent = _grid(
             [1.0, 2.0, 1.0],
@@ -533,9 +533,12 @@ class CoreOperationTests(unittest.TestCase):
             azimuths=(-np.pi, 0.0, np.pi),
             units=units,
         )
-        wrapped = equivalent.wrap_azimuth("-180_180")
+        wrapped, report = equivalent.wrap_azimuth("-180_180", return_report=True)
         np.testing.assert_allclose(wrapped.azimuths, [-np.pi, 0.0])
         np.testing.assert_allclose(wrapped.rcs_power.ravel(), [1.0, 2.0])
+        self.assertEqual(report["merged_coordinate_count"], 1)
+        self.assertEqual(report["conflicting_coordinate_count"], 0)
+        self.assertEqual(wrapped.history, equivalent.history)
 
         conflicting = _grid(
             [1.0, 2.0],
@@ -543,8 +546,81 @@ class CoreOperationTests(unittest.TestCase):
             azimuths=(0.0, 2.0 * np.pi),
             units=units,
         )
+        wrapped = conflicting.wrap_azimuth("0_360")
+        np.testing.assert_allclose(wrapped.azimuths, [0.0])
+        np.testing.assert_allclose(wrapped.rcs_power.ravel(), [1.0])
         with self.assertRaisesRegex(ValueError, "conflicting finite seam"):
-            conflicting.wrap_azimuth("0_360")
+            conflicting.wrap_azimuth("0_360", seam_conflict="error")
+        with self.assertRaisesRegex(ValueError, "seam_conflict"):
+            conflicting.wrap_azimuth("0_360", seam_conflict="last")
+
+    def test_wrap_closed_sweep_keeps_opening_sample_and_fills_its_gaps(self):
+        # A 0-360 turntable sweep re-measures the opening direction at 360;
+        # the repeat differs slightly and must not block a -180..180 wrap.
+        nan = np.nan
+        power = np.asarray(
+            [
+                [1.0, nan],
+                [2.0, 2.5],
+                [3.0, 3.5],
+                [4.0, 4.5],
+                [1.01, 9.0],
+            ]
+        ).reshape(5, 1, 2, 1)
+        phase = np.asarray(
+            [
+                [0.1, nan],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.2, 0.3],
+            ]
+        ).reshape(5, 1, 2, 1)
+        closed = _grid(
+            power,
+            phase=phase,
+            azimuths=(0.0, 90.0, 180.0, 270.0, 360.0),
+            frequencies=(1.0, 2.0),
+        )
+
+        wrapped, report = closed.wrap_azimuth("-180_180", return_report=True)
+
+        np.testing.assert_allclose(wrapped.azimuths, [-180.0, -90.0, 0.0, 90.0])
+        np.testing.assert_allclose(
+            wrapped.rcs_power[:, 0, :, 0],
+            [[3.0, 3.5], [4.0, 4.5], [1.0, 9.0], [2.0, 2.5]],
+        )
+        # The opening sample wins its conflicting cell; the repeat only fills
+        # the cell the opening sample left missing.
+        np.testing.assert_allclose(wrapped.rcs_phase[2, 0, :, 0], [0.1, 0.3])
+        self.assertEqual(
+            report,
+            {
+                "schema": "grim.azimuth-wrap-report.v1",
+                "mode": "-180_180",
+                "seam_conflict": "first",
+                "merged_coordinate_count": 1,
+                "conflicting_coordinate_count": 1,
+                "discarded_conflict_cell_count": 1,
+            },
+        )
+        self.assertIn(
+            "kept the first sample on the source azimuth axis at 1 seam "
+            "coordinate(s)",
+            wrapped.history,
+        )
+        np.testing.assert_allclose(
+            closed.wrap_azimuth("0_360").rcs_power[0, 0, :, 0], [1.0, 9.0]
+        )
+
+    def test_wrap_signed_sweep_to_0_360_keeps_opening_minus_180_sample(self):
+        signed = _grid(
+            [1.0, 2.0, 3.0, 4.0, 1.5],
+            azimuths=(-180.0, -90.0, 0.0, 90.0, 180.0),
+        )
+        wrapped = signed.wrap_azimuth("0_360")
+        np.testing.assert_allclose(wrapped.azimuths, [0.0, 90.0, 180.0, 270.0])
+        np.testing.assert_allclose(wrapped.rcs_power.ravel(), [3.0, 4.0, 1.0, 2.0])
 
     def test_el_to_az360_rejects_conflicting_overlap(self):
         power = np.asarray(

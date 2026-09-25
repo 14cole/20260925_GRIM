@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import tempfile
+import unicodedata
 import uuid
 import zipfile
 import zlib
@@ -133,9 +134,63 @@ from GRIM_Backend.execution.dataset_jobs import (
 )
 
 
-# Characters forbidden in filenames on Windows (and `/` on POSIX). Replaced
-# with `_` so dataset names with op symbols like `|`, `÷`, etc. still save.
-_BAD_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+# Saved/exported filenames are printable ASCII only: external solvers, C and
+# Fortran readers, and ANSI-codepage Windows tools cannot open names holding
+# symbols such as `→` or `°`.  Engineering symbols are spelled out, accents
+# are dropped, and anything else outside printable ASCII -- plus characters
+# Windows forbids (and `/` on POSIX) -- becomes `_`.
+_FILENAME_ARROW_BETWEEN_WORDS = re.compile(r"(?<=[^\W_])(?:→|->)(?=[^\W_])")
+_FILENAME_ARROW = re.compile(r"→|->")
+_FILENAME_ASCII_REPLACEMENTS = str.maketrans(
+    {
+        "°": "deg",
+        "º": "deg",
+        "℃": "degC",
+        "℉": "degF",
+        "Δ": "Delta",
+        "δ": "delta",
+        "Σ": "Sum",
+        "∑": "Sum",
+        "σ": "sigma",
+        "λ": "lambda",
+        "π": "pi",
+        "θ": "theta",
+        "φ": "phi",
+        "ϕ": "phi",
+        "µ": "u",  # micro sign
+        "μ": "u",  # Greek mu
+        "Ω": "Ohm",  # Greek capital omega
+        "Ω": "Ohm",  # ohm sign
+        "⊕": "+",
+        "±": "+-",
+        "×": "x",
+        "÷": "div",
+        "−": "-",
+        "–": "-",
+        "—": "-",
+        "‘": "'",
+        "’": "'",
+        "“": "'",
+        "”": "'",
+        "≈": "~",
+        "≤": "le",
+        "≥": "ge",
+        "ß": "ss",
+        "Æ": "AE",
+        "æ": "ae",
+        "Ø": "O",
+        "ø": "o",
+        "Ł": "L",
+        "ł": "l",
+        "Đ": "D",
+        "đ": "d",
+    }
+)
+_BAD_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]|[^\x20-\x7e]')
+_WINDOWS_RESERVED_FILENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"{device}{index}" for device in ("COM", "LPT") for index in range(10)}
+)
 
 # Stable identity used by consumers such as the PPT report workspace.  Row
 # numbers and display names can both change, while one dataset can also appear
@@ -225,9 +280,21 @@ def _append_provenance(existing: object, event: object) -> str:
 
 
 def _sanitize_filename(name: str | None) -> str:
-    """Return a filesystem-safe version of `name` (UI display name unchanged)."""
-    cleaned = _BAD_FILENAME_CHARS.sub("_", name or "").strip().strip(".")
-    return cleaned or "dataset"
+    """Return a portable ASCII version of `name` (UI display name unchanged)."""
+    text = _FILENAME_ARROW_BETWEEN_WORDS.sub("-to-", name or "")
+    text = _FILENAME_ARROW.sub("to", text)
+    text = unicodedata.normalize(
+        "NFKD", text.translate(_FILENAME_ASCII_REPLACEMENTS)
+    )
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    cleaned = _BAD_FILENAME_CHARS.sub("_", text).strip(" .")
+    if not cleaned:
+        return "dataset"
+    # Windows maps these stems to devices regardless of extension.
+    stem = cleaned.split(".", 1)[0].rstrip(" ")
+    if stem.upper() in _WINDOWS_RESERVED_FILENAMES:
+        cleaned = f"{stem}_{cleaned[len(stem):]}"
+    return cleaned
 
 
 POLARIZATION_DISPLAY_ORDER = ("VV", "TE", "HH", "TM", "VH", "HV")
@@ -1897,7 +1964,7 @@ class DatasetOpsMixin:
 
     def _dbdiff_selected(self) -> None:
         self._combine_datasets_sub(
-            "Δ dB", "Δ", "arithmetic_db_subtract", required_count=2
+            "Δ dB", "Delta", "arithmetic_db_subtract", required_count=2
         )
 
     def _audit_selected_datasets(self) -> None:
@@ -2196,7 +2263,7 @@ class DatasetOpsMixin:
             finite_output = int(report.get("output_finite_count", 0) or 0)
             missing_output = int(report.get("missing_count", 0) or 0)
             max_contributors = int(report.get("max_contributors", 0) or 0)
-            output_name = " ⊕ ".join(names) + f" [Merge {policy}]"
+            output_name = " + ".join(names) + f" [Merge {policy}]"
             history = (
                 f"Merge Overlaps ({policy}, tol={tolerance:g}, overlap={overlap}, "
                 f"conflicts={conflicting}): " + " -> ".join(names)
@@ -3153,50 +3220,6 @@ class DatasetOpsMixin:
             recorder.record_plot_save(path, dpi=200)
         self.status.showMessage(f"Plot exported: {os.path.basename(path)}")
 
-    def _export_isar_result(self) -> None:
-        """Save the latest source-bound numerical ISAR result off the GUI thread."""
-
-        if getattr(self, "_isar_busy", False):
-            self.status.showMessage(
-                "ISAR reconstruction is still running; wait before exporting its result."
-            )
-            return
-        payload = getattr(self, "_last_isar_artifact", None)
-        result_is_current = getattr(self, "_isar_numerical_result_is_current", None)
-        if (
-            payload is None
-            or not callable(result_is_current)
-            or not result_is_current()
-        ):
-            self.status.showMessage(
-                "No current completed ISAR result is available; render the image first."
-            )
-            return
-        path, _selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Export Numerical ISAR Result",
-            "isar-result.isar.npz",
-            "GRIM ISAR Result (*.isar.npz)",
-        )
-        if not path:
-            return
-        band_results, manifest = payload
-
-        def compute_export():
-            from GRIM_Backend.isar.artifact import save_isar_artifact
-
-            return save_isar_artifact(path, band_results, manifest)
-
-        def publish_export(saved_path):
-            self.status.showMessage(
-                f"ISAR result exported: {os.path.basename(str(saved_path))}"
-            )
-
-        if self._start_background_callable(
-            "ISAR result export", compute_export, publish_export
-        ):
-            self.status.showMessage("Saving numerical ISAR result in the background…")
-
     def _on_plot_context_menu(self, pos) -> None:
         line = self._dataset_line_at_canvas_position(pos)
         if line is not None:
@@ -3777,7 +3800,7 @@ class DatasetOpsMixin:
             recorder = getattr(self, "python_recorder", None)
             for source_index, name, mirrored in results:
                 history = f"Mirror about az={about:.6g} deg: {name}"
-                output_name = f"{name} [Mirror {about:.6g}°]"
+                output_name = f"{name} [Mirror {about:.6g}deg]"
                 output_id = self._add_dataset_row(
                     mirrored, output_name, history, file_name=""
                 )
@@ -3823,7 +3846,7 @@ class DatasetOpsMixin:
         if not (wrap_azimuth or wrap_phase_values):
             self.status.showMessage("Wrap: select azimuth, phase, or both.")
             return
-        suffix = "0–360°" if mode == "0_360" else "-180–180°"
+        suffix = "0-360deg" if mode == "0_360" else "-180-180deg"
         target_label = (
             "azimuth and phase" if wrap_azimuth and wrap_phase_values
             else "azimuth" if wrap_azimuth else "phase"
@@ -3852,27 +3875,37 @@ class DatasetOpsMixin:
             for dataset_index, (name, dataset) in enumerate(datasets):
                 try:
                     wrapped = dataset
+                    seam_report = {}
                     if wrap_azimuth:
-                        wrapped = wrapped.wrap_azimuth(mode)
+                        wrapped, seam_report = wrapped.wrap_azimuth(
+                            mode, return_report=True
+                        )
                     if wrap_phase_values:
                         wrapped = wrapped.wrap_phase(mode)
                 except (TypeError, ValueError) as exc:
                     skipped.append(f"{name} ({exc})")
                     continue
                 dropped = len(dataset.azimuths) - len(wrapped.azimuths)
-                results.append((dataset_index, name, wrapped, dropped))
+                conflicts = int(seam_report.get("conflicting_coordinate_count", 0))
+                results.append((dataset_index, name, wrapped, dropped, conflicts))
             return results, skipped
 
         def publish(payload) -> None:
             results, skipped = payload
             dropped_total = 0
+            conflict_total = 0
             recorder = getattr(self, "python_recorder", None)
-            for dataset_index, name, wrapped, dropped in results:
+            for dataset_index, name, wrapped, dropped, conflicts in results:
                 dropped_total += int(dropped)
-                drop_note = (
-                    f" (merged {dropped} seam-alias azimuth coordinate(s))"
-                    if dropped else ""
-                )
+                conflict_total += int(conflicts)
+                drop_note = ""
+                if dropped:
+                    drop_note = f" (merged {dropped} seam-alias azimuth coordinate(s)"
+                    if conflicts:
+                        drop_note += (
+                            f"; kept the first sample at {conflicts} that differed"
+                        )
+                    drop_note += ")"
                 history = f"Wrap {target_label} to {suffix}{drop_note}: {name}"
                 output_name = f"{name} [Wrap {target_label} {suffix}]"
                 output_id = self._add_dataset_row(
@@ -3899,9 +3932,13 @@ class DatasetOpsMixin:
                 return
             message = f"Wrap created {produced} dataset(s)."
             if dropped_total:
-                message += (
-                    f" Merged {dropped_total} equivalent duplicate azimuth sample(s)."
-                )
+                message += f" Merged {dropped_total} duplicate seam azimuth(s)"
+                if conflict_total:
+                    message += (
+                        f"; {conflict_total} had differing values, so the first "
+                        "sample of the sweep was kept"
+                    )
+                message += "."
             if skipped:
                 message += f" Skipped: {_compact_item_summary(skipped)}"
             self.status.showMessage(message)
@@ -3933,13 +3970,13 @@ class DatasetOpsMixin:
         suffix_parts = []
         history_parts = []
         if az_on:
-            suffix_parts.append(f"Az{az_delta:+.6g}°")
+            suffix_parts.append(f"Az{az_delta:+.6g}deg")
             history_parts.append(f"Az {az_delta:+.6g} deg")
         if el_on:
-            suffix_parts.append(f"El{el_delta:+.6g}°")
+            suffix_parts.append(f"El{el_delta:+.6g}deg")
             history_parts.append(f"El {el_delta:+.6g} deg")
         if ph_on:
-            suffix_parts.append(f"Ph{ph_delta:+.6g}°")
+            suffix_parts.append(f"Ph{ph_delta:+.6g}deg")
             history_parts.append(f"Phase {ph_delta:+.6g} deg")
         suffix = " ".join(suffix_parts)
         history_axes = ", ".join(history_parts)
@@ -4135,7 +4172,7 @@ class DatasetOpsMixin:
                     "SENTRi elevation to GRIM: elevation=90-theta; "
                     f"no interpolation or phase change: {name}"
                 )
-                output_name = f"{name} [SENTRi El→GRIM]"
+                output_name = f"{name} [SENTRi El-to-GRIM]"
                 output_id = self._add_dataset_row(
                     converted, output_name, history, file_name=""
                 )
@@ -4459,7 +4496,7 @@ class DatasetOpsMixin:
                     f"Extrusion estimate {source_label} → {label} "
                     f"(broadside uniform body, L={length_label}, {length_m:.6g} m): {name}"
                 )
-                output_name = f"{name} [→ {label} L={length_label}]"
+                output_name = f"{name} [to {label} L={length_label}]"
                 output_id = self._add_dataset_row(
                     result, output_name, history, file_name=""
                 )
@@ -4623,7 +4660,7 @@ class DatasetOpsMixin:
             recorder = getattr(self, "python_recorder", None)
             for source_index, name, result, suffix, hist_extra in results:
                 history = f"Wedge→Conic {mode}: {name}{hist_extra}"
-                output_name = f"{name} [Wedge→Conic {suffix}]"
+                output_name = f"{name} [Wedge-to-Conic {suffix}]"
                 output_id = self._add_dataset_row(
                     result, output_name, history, file_name=""
                 )
@@ -4763,26 +4800,28 @@ class DatasetOpsMixin:
             skipped = []
             for dataset_index, (name, dataset) in enumerate(datasets):
                 try:
-                    result = medianize_azimuth(
+                    result, report = medianize_azimuth(
                         dataset,
                         window_degrees=float(window_deg),
                         slide_degrees=float(slide_deg),
+                        return_report=True,
                     )
                 except Exception as exc:
                     skipped.append(f"{name} ({exc})")
                     continue
-                results.append((dataset_index, name, result))
+                seam_kept_first = bool(report["discarded_seam_cell_count"])
+                results.append((dataset_index, name, result, seam_kept_first))
             return results, skipped
 
         def publish(payload) -> None:
             results, skipped = payload
-            for dataset_index, name, result in results:
+            for dataset_index, name, result, _seam_kept_first in results:
                 history = (
                     f"Medianize (window={window_deg:g}°, "
                     f"slide={slide_deg:g}°): {name}"
                 )
                 output_name = (
-                    f"{name} [Median w={window_deg:g}° s={slide_deg:g}°]"
+                    f"{name} [Median w={window_deg:g}deg s={slide_deg:g}deg]"
                 )
                 output_id = self._add_dataset_row(
                     result, output_name, history, file_name=""
@@ -4802,12 +4841,21 @@ class DatasetOpsMixin:
                     )
             produced = len(results)
             if produced == 0:
-                self.status.showMessage("Medianize created 0 datasets.")
+                self.status.showMessage(
+                    "Medianize created 0 datasets."
+                    + (f" Skipped: {_compact_item_summary(skipped)}" if skipped else "")
+                )
                 return
             message = (
                 f"Medianize created {produced} dataset(s) "
                 f"(window={window_deg:g}°, slide={slide_deg:g}°)."
             )
+            seam_kept_first = sum(1 for *_rest, kept in results if kept)
+            if seam_kept_first:
+                message += (
+                    f" The closing seam sample differed in {seam_kept_first} "
+                    "dataset(s), so the first sample of the sweep was kept."
+                )
             if skipped:
                 message += f" Skipped: {', '.join(skipped)}"
             self.status.showMessage(message)
@@ -5457,7 +5505,7 @@ class DatasetOpsMixin:
         if attestation is None:
             return
         input_refs = self._python_input_references(datasets)
-        out_name = f"{name_a} ÷ {name_b}"
+        out_name = f"{name_a} div {name_b}"
 
         def compute():
             return coherent_divide(

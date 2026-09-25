@@ -586,8 +586,9 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             "btn_mirror": "Mirror azimuth about a user-entered angle in degrees.",
             "btn_wrap": (
                 "Wrap azimuth coordinates, stored phase values, or both into [0°, 360°) "
-                "or [−180°, 180°). Missing phase remains missing, and azimuth seam "
-                "conflicts are never silently discarded."
+                "or [−180°, 180°). Missing phase remains missing. When two azimuths "
+                "land on the same wrapped angle (such as 0° and 360°), the first "
+                "sample of the sweep is kept and the status bar reports it."
             ),
             "btn_shift": (
                 "Shift azimuth and/or elevation coordinates in degrees and/or "
@@ -992,10 +993,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             context.btn_dataset_ops.toggled.connect(self._toggle_dataset_ops)
             context.btn_settings.toggled.connect(context.settings_frame.setVisible)
             context.btn_export_plot.clicked.connect(self._export_plot)
-            if context.btn_export_isar_result is not None:
-                context.btn_export_isar_result.clicked.connect(
-                    self._export_isar_result
-                )
             context.chk_plot_legend.toggled.connect(self._update_legend_visibility)
             context.btn_plot_bg.clicked.connect(lambda _=False, which="bg": self._choose_plot_color(which))
             context.btn_plot_grid.clicked.connect(
@@ -1020,13 +1017,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 context.combo_isar_recon.currentTextChanged.connect(
                     lambda _=None, c=context: sync_reconstruction_controls(c))
                 context.isar_advanced.changed.connect(self._invalidate_isar_result)
-                for name, method in (
-                    ("plan", self._plan_isar_image), ("cancel", self._cancel_isar),
-                    ("open", self._open_isar_result), ("compare", self._compare_isar_result),
-                    ("save_recipe", self._save_isar_recipe), ("load_recipe", self._load_isar_recipe),
-                    ("guide", self._show_isar_workflow),
-                ):
-                    getattr(context.isar_tools, name).clicked.connect(method)
                 # Numerical exports and the visible canvas are bound to the
                 # exact controls that produced them. Deferred settings edits
                 # therefore invalidate immediately even before Apply; live
@@ -1253,29 +1243,13 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         btn_dataset_ops = QToolButton(text="Dataset Operations")
         btn_dataset_ops.setCheckable(True)
         btn_export_plot = QToolButton(text="Export Plot")
-        btn_export_isar_result = None
-        if tab_key == "isar":
-            btn_export_isar_result = QToolButton(text="Export ISAR Result")
-            btn_export_isar_result.setEnabled(False)
-            btn_export_isar_result.setToolTip(
-                "Save the latest completed full-resolution ISAR arrays and a "
-                "source-bound formation manifest. Disabled while a render is "
-                "running or when the current settings have not completed."
-            )
         settings_title = "ISAR Settings" if tab_key == "isar" else "Plot Settings"
         btn_settings = QToolButton(text=settings_title)
         btn_settings.setCheckable(True)
         topbar.addWidget(btn_dataset_ops)
-        if btn_export_isar_result is not None:
-            topbar.addWidget(btn_export_isar_result)
         topbar.addWidget(btn_export_plot)
         topbar.addWidget(btn_settings)
         left_layout.addLayout(topbar)
-        isar_tools = None
-        if tab_key == "isar":
-            from GRIM_Backend.ui.isar_controls import IsarTools
-            isar_tools = IsarTools(panel)
-            left_layout.addWidget(isar_tools)
 
         settings_frame = PlotSettingsPopup(panel, title=settings_title)
         settings_frame.setObjectName(f"{tab_key}SettingsPopup")
@@ -1694,9 +1668,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         palette = getattr(self, "application_palette", BLUE_PALETTE)
         plot_figure = Figure(facecolor=palette["panel_bg"])
         plot_canvas = FigureCanvas(plot_figure)
-        # Reserve a few readable quality lines while allowing the ISAR canvas
-        # to shrink on compact displays; it expands into all remaining space.
-        plot_canvas.setMinimumSize(320, 176 if tab_key == 'isar' else 240)
+        plot_canvas.setMinimumSize(320, 240)
         plot_canvas.setStyleSheet("background: transparent;")
         plot_ax = plot_figure.add_subplot(111)
         plot_ax.set_facecolor(palette["panel_bg"])
@@ -1818,7 +1790,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
 
         return PlotContext(
             isar_advanced=isar_advanced,
-            isar_tools=isar_tools,
             btn_export_plot=btn_export_plot,
             btn_dataset_ops=btn_dataset_ops,
             btn_settings=btn_settings,
@@ -1881,7 +1852,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             plot_grid_color=None,
             plot_text_color=None,
             last_plot_mode=None,
-            btn_export_isar_result=btn_export_isar_result,
             delta_map_controls=delta_map_controls,
         )
 
