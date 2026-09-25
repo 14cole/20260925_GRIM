@@ -80,11 +80,11 @@ class SolverCompressionTests(unittest.TestCase):
     def test_coarse_inverse_rebuild_releases_tree_and_preserves_exact_gate(self):
         a = np.eye(260, dtype=complex)*4
         factor = hf.HierarchicalFactor(a)
-        self.assertEqual(factor.tolerance, 1e-6)
+        self.assertEqual(factor.tolerance, hf.HierarchicalFactor.TOLERANCE)
         original = factor._apply
         old = weakref.ref(factor.root)
         def stalled(b, trans):
-            if factor.tolerance > 2e-10:
+            if factor.tolerance > factor.TIGHT_TOLERANCE:
                 return np.zeros_like(b)
             self.assertIsNone(old())
             return original(b, trans)
@@ -103,7 +103,7 @@ class SolverCompressionTests(unittest.TestCase):
         original = hf.HierarchicalFactor._build
         refs=[]
         def trial(factor, ids):
-            if factor.tolerance > 2e-10:
+            if factor.tolerance > factor.TIGHT_TOLERANCE:
                 buffer=np.ones(1024, complex);refs.append(weakref.ref(buffer))
                 raise hf.HierarchicalRejected('coarse inverse singular')
             self.assertIsNone(refs[0]())
@@ -165,7 +165,8 @@ class SolverCompressionTests(unittest.TestCase):
             def checked_lu(*args, **kwargs):
                 self.assertIsNone(refs[0]())
                 return original_lu(*args, **kwargs)
-            with mock.patch.dict(os.environ, {'GHOST_CPU_FACTORIZATION':'auto'}), \
+            with mock.patch.dict(os.environ, {'GHOST_CPU_FACTORIZATION':'auto',
+                                              'GHOST_HIERARCHICAL_MIN_UNKNOWNS':'2048'}), \
                  mock.patch.object(hf, 'HierarchicalFactor', Rejected), \
                  mock.patch.object(rcs._SCIPY_LINALG, 'lu_factor', checked_lu):
                 factor = DenseFactor(np.eye(2048, dtype=complex), {} if stage == 'condition' else None)
@@ -181,17 +182,28 @@ class SolverCompressionTests(unittest.TestCase):
                 DenseFactor(np.eye(32, dtype=complex))
 
     def test_memory_estimate_preserves_auto_fallback_and_strict_savings(self):
-        args = dict(nnodes=10000, use_cfie=False, system_dofs=16000, n_rhs=361,
-                    dense_resources=dict(formulation='multi_region', operator_entries=10**8,
-                        assembly_operator_entries=0, operator_map_bytes=10**7,
-                        mass_workspace_bytes=10**7, block_workspace_bytes=10**7,
-                        assembly_workspace_bytes=10**8))
-        with mock.patch.dict(os.environ, {'GHOST_CPU_FACTORIZATION':'dense'}):
-            dense = rcs._estimate_memory_gb(**args)
-        with mock.patch.dict(os.environ, {'GHOST_CPU_FACTORIZATION':'auto'}):
-            self.assertEqual(dense, rcs._estimate_memory_gb(**args))
-        with mock.patch.dict(os.environ, {'GHOST_CPU_FACTORIZATION':'hierarchical'}):
-            self.assertLess(rcs._estimate_memory_gb(**args), dense)
+        def estimate(mode, dofs, threshold=None):
+            environment = {'GHOST_CPU_FACTORIZATION': mode}
+            if threshold is not None:
+                environment['GHOST_HIERARCHICAL_MIN_UNKNOWNS'] = threshold
+            args = dict(nnodes=10000, use_cfie=False, system_dofs=dofs, n_rhs=361,
+                        dense_resources=dict(formulation='multi_region', operator_entries=10**8,
+                            assembly_operator_entries=0, operator_map_bytes=10**7,
+                            mass_workspace_bytes=10**7, block_workspace_bytes=10**7,
+                            assembly_workspace_bytes=10**8))
+            with mock.patch.dict(os.environ, environment):
+                return rcs._estimate_memory_gb(**args)
+        # Below the automatic threshold 'dense' and 'auto' factor with LU (the
+        # original plus its copy); a strict hierarchical request saves the copy.
+        small = hf.HIERARCHICAL_MIN_UNKNOWNS // 2
+        self.assertEqual(estimate('dense', small), estimate('auto', small))
+        self.assertLess(estimate('hierarchical', small), estimate('dense', small))
+        # From it both are factored hierarchically and priced so (an LU fallback
+        # spools the original); GHOST_HIERARCHICAL_MIN_UNKNOWNS=0 restores LU.
+        large = hf.HIERARCHICAL_MIN_UNKNOWNS + 6000
+        self.assertEqual(estimate('dense', large), estimate('auto', large))
+        self.assertEqual(estimate('dense', large), estimate('hierarchical', large))
+        self.assertLess(estimate('dense', large), estimate('dense', large, threshold='0'))
 
     def test_zero_contrast_layer_skips_operators_and_factorization(self):
         mesh = sheet_mesh([[-.05, 0], [.05, 0]], panels=16)

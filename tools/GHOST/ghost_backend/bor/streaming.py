@@ -136,6 +136,43 @@ def _stacked_right_groups(right) -> 'Dict[str, np.ndarray]':
             for lx, kinds in _EFIE_SOURCE_GROUPS}
 
 
+def far_weights(g, ne: 'int', go: 'int', ibc_zs_pt=None, pmchwt: 'bool' = False) -> 'Dict':
+    """Galerkin weights of the far contractions of one surface.
+
+    ``lv`` holds the test weights ``[2, P]`` of each kind (the two functions
+    of every element), ``left_all`` the kinds stacked for one test-side GEMM
+    per tile, and the ``right*`` entries the source weights arranged for the
+    batched source-side products (:func:`_stacked_right_groups`).  The
+    rotated-PV source weight carries the IBC impedance ``ibc_zs_pt`` or, for
+    PMCHWT, one.
+    """
+    if ibc_zs_pt is not None and pmchwt:
+        raise ValueError(
+            "Streaming rotated-PV blocks cannot be both IBC-weighted "
+            "and unit-weight PMCHWT blocks."
+        )
+    wrho = g.w * g.rho
+    lv = {
+        "r": np.stack([g.T0 * wrho * g.trho, g.T1 * wrho * g.trho]),
+        "z": np.stack([g.T0 * wrho * g.tz, g.T1 * wrho * g.tz]),
+        "1": np.stack([g.T0 * wrho, g.T1 * wrho]),
+        "s": np.stack([g.T0 * g.w, g.T1 * g.w]),
+        "d": np.stack([g.dRT0 * g.w, g.dRT1 * g.w]),
+    }
+    rv_ibc = None
+    if ibc_zs_pt is not None:
+        rv_ibc = np.stack([g.T0 * wrho * ibc_zs_pt, g.T1 * wrho * ibc_zs_pt])
+    elif pmchwt:
+        rv_ibc = np.stack([g.T0 * wrho, g.T1 * wrho])
+    right = {name: _source_weights(lv[name], ne, go) for name in _LEFT_KINDS}
+    right_ibc = None if rv_ibc is None else _source_weights(rv_ibc, ne, go)
+    return dict(lv=lv, rv_ibc=rv_ibc,
+                left_all=np.stack([lv[name] for name in _LEFT_KINDS], axis=0),
+                right=right, right_groups=_stacked_right_groups(right),
+                right_one=_stacked_right(right["1"]), right_ibc=right_ibc,
+                right_ibc_stacked=None if right_ibc is None else _stacked_right(right_ibc))
+
+
 def _efie_band(Gn, left, right_groups, modes, ord_lo: 'int', k, f0: 'int', f1: 'int',
                re: 'int', go_p: 'int') -> 'np.ndarray':
     """Nodal EFIE contributions of one tile summed in ``[4, fc + 1, re + 1, nm]``.
@@ -388,13 +425,15 @@ def _adjacent_pairs_near(near_sources) -> 'bool':
     return True
 
 
-def _banded_stream(stream, rows, kind, modes, sources=None, strict_upper=False):
+def _banded_stream(stream, rows, kind, modes, sources=None, strict_upper=False,
+                   near_free=False):
     """Banded far kernels of the test rows ``rows`` against source elements.
 
     ``sources`` is the half-open source-element range ``(f0, f1)`` (all when
     None).  Near element pairs, and with ``strict_upper`` every pair whose
     source element does not follow its test element (``f <= e``), are masked:
-    never sampled and returned as zeros.
+    never sampled and returned as zeros.  ``near_free`` asserts the caller has
+    checked that no pair of the tile is near (the mask is then not built).
     """
     if hasattr(stream, 'solver'):
         sp = sq = stream.solver
@@ -406,14 +445,17 @@ def _banded_stream(stream, rows, kind, modes, sources=None, strict_upper=False):
     first, stop, _ = rows.indices(sp.P)
     f0, f1 = (0, sq.gen.n_elems) if sources is None else (int(sources[0]), int(sources[1]))
     c0, c1 = f0 * go_q, f1 * go_q
-    near = np.zeros((stop - first, c1 - c0), bool)
-    for e in range(first // go_p, (stop + go_p - 1) // go_p):
-        r = slice(max(0, e * go_p - first), min(stop - first, (e + 1) * go_p - first))
-        for f in near_sources[e]:
-            if f0 <= f < f1:
-                near[r, (f - f0) * go_q:(f - f0 + 1) * go_q] = True
-        if strict_upper and e >= f0:
-            near[r, :(min(e + 1, f1) - f0) * go_q] = True
+    if near_free and not strict_upper:
+        near = np.zeros((1, 1), bool)
+    else:
+        near = np.zeros((stop - first, c1 - c0), bool)
+        for e in range(first // go_p, (stop + go_p - 1) // go_p):
+            r = slice(max(0, e * go_p - first), min(stop - first, (e + 1) * go_p - first))
+            for f in near_sources[e]:
+                if f0 <= f < f1:
+                    near[r, (f - f0) * go_q:(f - f0 + 1) * go_q] = True
+            if strict_upper and e >= f0:
+                near[r, :(min(e + 1, f1) - f0) * go_q] = True
     names = ('rho', 'z') if kind == 'g' else ('rho', 'z', 'trho', 'tz')
     args = tuple(getattr(gp, name)[rows, None] for name in names)
     args += tuple(getattr(gq, name)[None, c0:c1] for name in names)
@@ -1607,24 +1649,9 @@ class StreamingFarBlocks:
         Nn, go, mm = self.Nn, self.go, self.m_max
 
 
-        wrho = g.w * g.rho
-        self._lv = {
-            "r": np.stack([g.T0 * wrho * g.trho, g.T1 * wrho * g.trho]),
-            "z": np.stack([g.T0 * wrho * g.tz, g.T1 * wrho * g.tz]),
-            "1": np.stack([g.T0 * wrho, g.T1 * wrho]),
-            "s": np.stack([g.T0 * g.w, g.T1 * g.w]),
-            "d": np.stack([g.dRT0 * g.w, g.dRT1 * g.w]),
-        }
-        if ibc_zs_pt is not None and pmchwt:
-            raise ValueError(
-                "Streaming rotated-PV blocks cannot be both IBC-weighted "
-                "and unit-weight PMCHWT blocks."
-            )
-        rv_ibc = None
-        if ibc_zs_pt is not None:
-            rv_ibc = np.stack([g.T0 * wrho * ibc_zs_pt, g.T1 * wrho * ibc_zs_pt])
-        elif pmchwt:
-            rv_ibc = np.stack([g.T0 * wrho, g.T1 * wrho])
+        weights = far_weights(g, ne, go, ibc_zs_pt, pmchwt)
+        self._lv = weights["lv"]
+        rv_ibc = weights["rv_ibc"]
 
 
         self._efie = efie
@@ -1632,15 +1659,12 @@ class StreamingFarBlocks:
         self._has_ibc = ibc_zs_pt is not None or bool(pmchwt)
         self.rot_pv_unit_source = bool(pmchwt)
         self._rv_ibc = rv_ibc
-        # Left kinds stacked for one test-side GEMM per tile; right kinds
-        # arranged for the batched source-side products.
-        self._left_all = np.stack([self._lv[name] for name in _LEFT_KINDS], axis=0)
-        self._right = {name: _source_weights(self._lv[name], ne, go) for name in _LEFT_KINDS}
-        self._right_groups = _stacked_right_groups(self._right)
-        self._right_one = _stacked_right(self._right["1"])
-        self._right_ibc = None if rv_ibc is None else _source_weights(rv_ibc, ne, go)
-        self._right_ibc_stacked = (None if self._right_ibc is None
-                                   else _stacked_right(self._right_ibc))
+        self._left_all = weights["left_all"]
+        self._right = weights["right"]
+        self._right_groups = weights["right_groups"]
+        self._right_one = weights["right_one"]
+        self._right_ibc = weights["right_ibc"]
+        self._right_ibc_stacked = weights["right_ibc_stacked"]
         self.k = complex(k)
         # The outer mode workers only align the retained mode ranges (a range
         # holds every mode one worker wave reads).  The far tiles have their
@@ -2610,6 +2634,10 @@ def estimate_streaming_gb(n_elems: 'int', m_max: 'int', formulation: 'str' = "cf
     workers) is bounded by ``BOR_STREAM_TILE_BUDGET_GB`` at run time -- each
     tile is sized to its share of it -- and callers add that budget once.
     """
+    from ghost_backend.bor.compressed_far import estimate_compressed_far_gb, far_compression_selected
+    if far_compression_selected(int(n_elems) + 1):
+        return (estimate_compressed_far_gb(n_elems, m_max, formulation, has_ibc)
+                * (0.5 if single_blocks else 1.0))
     Nn = float(n_elems + 1)
     per = 8.0 if single_blocks else 16.0
 
@@ -2641,6 +2669,10 @@ def estimate_streaming_block_gb(
     block = int(mode_block)
     if ne < 1 or mm < 0 or block < 1 or block > mm + 1:
         raise ValueError("Streaming block estimate dimensions are invalid.")
+    from ghost_backend.bor.compressed_far import far_compression_selected
+    if far_compression_selected(ne + 1):
+        # The compressed store holds every mode at once, whatever the block.
+        return estimate_streaming_gb(ne, mm, formulation, has_ibc, single_blocks)
     nodes = float(ne + 1)
     item_bytes = 8.0 if single_blocks else 16.0
     worst = 0.0
@@ -2678,6 +2710,12 @@ def plan_streaming_mode_block(
     if not np.isfinite(budget) or budget <= 0.0:
         raise ValueError("Streaming block budget must be positive and finite.")
     mode_count = int(m_max) + 1
+    from ghost_backend.bor.compressed_far import far_compression_selected
+    if far_compression_selected(int(n_elems) + 1):
+        # The block budget bounds a dense range; a compressed store holds
+        # every mode and is priced by the solve's memory admission instead.
+        return mode_count, estimate_streaming_gb(
+            n_elems, m_max, formulation, has_ibc, single_blocks), max(1, int(workers))
     minimum = estimate_streaming_block_gb(
         n_elems, m_max, 1, formulation, has_ibc, single_blocks
     )

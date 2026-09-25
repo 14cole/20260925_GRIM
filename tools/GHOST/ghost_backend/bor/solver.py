@@ -68,6 +68,11 @@ BOR_CONDITION_EST_MAX = 1.0e12
 # about 1.3 GB, which reserved most of the RAM for idle copies and pushed the
 # automatic planner onto the compressed backend.
 BOR_DENSE_MATRIX_EQUIVALENTS = 3.0
+# A mode factored hierarchically (ModalFactor with coordinates, from
+# linalg.hierarchical.HIERARCHICAL_MIN_UNKNOWNS unknowns) holds its system
+# and a factor within 0.65 of it plus one off-diagonal block copy (a quarter)
+# while it builds, or its system and an LU copy if it falls back.
+BOR_HIERARCHICAL_MATRIX_EQUIVALENTS = 2.0
 BOR_DENSE_RHS_EQUIVALENTS = 12.0
 BOR_TABLE_BUILD_PEAK_FACTOR = 3.5
 BOR_PEAK_SAFETY_FACTOR = 1.20
@@ -288,13 +293,19 @@ def estimate_bor_dense_peak_gb(
     n_rhs: 'int',
     workers: 'int' = 1,
     mode_tasks: 'Optional[int]' = None,
+    hierarchical: 'bool' = False,
+    mirrored: 'bool' = False,
 ) -> 'float':
     """Conservative peak GB for the concurrent dense BoR linear systems.
 
     ``mode_tasks`` is the number of independent absolute-mode tasks that can
     actually be scheduled (normally ``m_max + 1``).  Capping the requested
     worker count by it accounts for real concurrency without charging for
-    idle executor threads.
+    idle executor threads.  ``hierarchical`` tells that the sweep gives its
+    mode factors coordinates, so a large enough system is priced as a
+    hierarchical factor (:data:`BOR_HIERARCHICAL_MATRIX_EQUIVALENTS`), and
+    ``mirrored`` that every mode is factored as mirror halves (the same
+    price: the system, its two half systems and their assembly workspace).
     """
 
     try:
@@ -343,8 +354,12 @@ def estimate_bor_dense_peak_gb(
                    payload + rhs_workspace)
         return (active_workers * peak + options['tile_cache_mib'] * 1024**2 + field_bytes) / 1.e9
 
+    from ghost_backend.linalg.hierarchical import automatic_hierarchical
+    equivalents = (BOR_HIERARCHICAL_MATRIX_EQUIVALENTS
+                   if mirrored or hierarchical and automatic_hierarchical(dofs)
+                   else BOR_DENSE_MATRIX_EQUIVALENTS)
     matrix_bytes = (
-        BOR_DENSE_MATRIX_EQUIVALENTS
+        equivalents
         * dofs
         * dofs
         * _COMPLEX128_BYTES
@@ -393,6 +408,12 @@ def estimate_bor_total_peak_gb(
     )
 
 
+def _factor_pricing(hierarchical, mirrored):
+    """The mode-factor keywords of :func:`estimate_bor_dense_peak_gb`, only when set."""
+    return {name: True for name, value in (('hierarchical', hierarchical), ('mirrored', mirrored))
+            if value}
+
+
 def _guard_bor_dense_memory(
     n_dofs: 'int',
     n_rhs: 'int',
@@ -402,6 +423,8 @@ def _guard_bor_dense_memory(
     context: 'str' = "The BoR solve",
     streaming: 'bool' = False,
     preparation_peak_gb: 'Optional[float]' = None,
+    hierarchical: 'bool' = False,
+    mirrored: 'bool' = False,
 ) -> 'float':
     """Gate a BoR solve before operator preparation and return required GB.
 
@@ -430,6 +453,7 @@ def _guard_bor_dense_memory(
         n_rhs,
         workers=workers,
         mode_tasks=mode_tasks,
+        **_factor_pricing(hierarchical, mirrored),
     )
     required = max(estimate_bor_total_peak_gb(assembly_peak, dense),
                    estimate_bor_total_peak_gb(preparation_peak, 0.0))
@@ -529,7 +553,8 @@ def _near_preparation_workers(workers: 'int') -> 'int':
 
 
 def plan_bor_mode_workers(n_dofs, n_rhs, workers, mode_tasks, assembly_peak_gb,
-                          memory_limit_gb=None, near_pairs=None):
+                          memory_limit_gb=None, near_pairs=None, hierarchical=False,
+                          mirrored=False):
     """Treat requested modal concurrency as a ceiling, sharing runtime admission.
 
     Keep the largest worker count that fits, including near-integration scratch,
@@ -539,7 +564,8 @@ def plan_bor_mode_workers(n_dofs, n_rhs, workers, mode_tasks, assembly_peak_gb,
     requested = max(1, int(workers))
     limit = _solve_memory_limit_gb() if memory_limit_gb is None else float(memory_limit_gb)
     for count in range(min(requested, max(1, int(mode_tasks))), 0, -1):
-        linear_peak = estimate_bor_dense_peak_gb(n_dofs, n_rhs, count, mode_tasks)
+        linear_peak = estimate_bor_dense_peak_gb(n_dofs, n_rhs, count, mode_tasks,
+                                                 **_factor_pricing(hierarchical, mirrored))
         near = plan_near_preparation(requested, assembly_peak_gb, linear_peak, limit,
                                      near_pairs=near_pairs, mode_tasks=mode_tasks)
         # The preparation phase (retained operators plus near scratch) and the
@@ -1298,8 +1324,12 @@ class BorPecSolver:
         """
 
         from ghost_backend.bor.streaming import StreamingFarBlocks
+        from ghost_backend.bor.compressed_far import CompressedFarBlocks, far_compression_selected
         self.close_streaming()
-        self._stream = StreamingFarBlocks(
+        # A large surface keeps its far blocks compressed (all modes, in RAM):
+        # the planners price that store through the same estimates.
+        store = CompressedFarBlocks if far_compression_selected(self.Nn) else StreamingFarBlocks
+        self._stream = store(
             self, m_max, efie=efie, mfie=mfie, ibc_zs_pt=ibc_zs_pt,
             pmchwt=pmchwt,
             dtype=np.complex64 if single_blocks else np.complex128,
@@ -2688,9 +2718,18 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
                      assembly_peak_gb: 'float' = 0.0,
                      memory_context: 'str' = "The BoR solve",
                      signed_mode_symmetry: 'bool' = False,
-                     stream_mode_block: 'Optional[int]' = None):
+                     stream_mode_block: 'Optional[int]' = None,
+                     coordinates: 'Optional[Callable]' = None,
+                     mirror: 'Optional[Callable]' = None):
     """
     Shared adaptive azimuthal-mode loop for every BoR formulation.
+
+    ``coordinates(m)``, when given, returns the meridian position of every
+    reduced unknown of mode ``m``: large mode systems are then factored
+    hierarchically (:class:`bor.factor.ModalFactor`) and priced as such.
+    ``mirror(m)``, for a body symmetric about a plane normal to its axis,
+    returns the ``(target, sign)`` mirror map of those unknowns: every mode is
+    then factored as its even and odd halves (:class:`bor.factor.MirrorSplit`).
 
     assemble(m) -> (A_masked, mask); rhs(m, theta, pol) -> V (full, unmasked);
     farfield(m, full_sol, theta, pol) -> complex modal far-field contribution.
@@ -2735,7 +2774,8 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
     from ghost_backend.bor.options import output_reserved_gb
     assembly_peak_gb += output_reserved_gb()
     worker_plan = plan_bor_mode_workers(n_dofs, n_rhs, workers,
-        max(1, int(m_max) + 1), assembly_peak_gb)
+        max(1, int(m_max) + 1), assembly_peak_gb, hierarchical=coordinates is not None,
+        mirrored=mirror is not None)
     workers = worker_plan['workers']
     near_plan = worker_plan['near_preparation']
     _guard_bor_dense_memory(
@@ -2747,6 +2787,8 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
         context=memory_context,
         streaming=stream_mode_block is not None,
         preparation_peak_gb=assembly_peak_gb + near_plan['scratch_gb'],
+        hierarchical=coordinates is not None,
+        mirrored=mirror is not None,
     )
     if prepare is not None:
         from ghost_backend.bor.near_parallel import process_scope
@@ -2809,7 +2851,9 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
             factor = (compressed_factor(A, m, monitor_cond, options, min(workers, m_max+1), checkpoint)
                       if isinstance(A, TileExpression)
                       else ModalFactor(A, m, monitor_cond, checkpoint, owned=True,
-                                       residual_storage=residual_storage))
+                                       residual_storage=residual_storage,
+                                       coordinates=None if coordinates is None else coordinates(m),
+                                       mirror=None if mirror is None else mirror(m)))
             A = None
             basis = SweepBasis(min(256, batch_size * len(pols)))
             reduction = None if mask is None else (mask if issparse(mask) else np.asarray(mask))
@@ -3644,6 +3688,64 @@ def _plan_multisurface_assembly(
     }
 
 
+# A generatrix whose reflection about the plane through the middle of its
+# end points matches its nodes to this fraction of the body size is mirror
+# symmetric (the mode factors then split into even and odd halves).
+MIRROR_NODE_TOLERANCE = 1e-9
+
+
+def mirror_split_pays(n_dofs: 'int', n_rhs: 'int') -> 'bool':
+    """Whether mirror halves beat LU for a mode of ``n_dofs`` unknowns and ``n_rhs`` columns.
+
+    The halves save three quarters of the LU (about 2 n^3 flops) and their
+    1e-8 coupling costs one refinement step against the exact matrix (a
+    product and a half solve, about 8 n^2 flops per right-hand side), so they
+    pay while ``n > 4 n_rhs`` (the 10 GHz ogive survey: 4,318 unknowns and
+    362 columns, 54.0 s against 56.5 s).
+    """
+    return int(n_dofs) > 4 * int(n_rhs)
+
+
+def mirror_map(solver, element_values=()) -> 'Optional[Callable]':
+    """``mirror(m) -> (target, sign)`` for a surface symmetric about a plane normal
+    to the axis, or None.
+
+    The reflection z -> 2 z0 - z must map the nodes onto themselves with the
+    traversal reversed (node ``i`` to node ``Nn - 1 - i``), and every
+    per-element property in ``element_values`` (impedances, sheet values;
+    None entries are ignored) onto itself.  A reduced unknown maps to the same
+    component of the mirrored node, ``J_t`` with sign -1 (the tangent reverses)
+    and ``J_phi`` with +1; at an axis pole of ``|m| = 1`` the reduced ``t``
+    unknown carries its tied ``phi`` component along, with the same sign.
+    """
+    nodes = np.asarray(solver.gen.nodes, float)
+    Nn = int(solver.Nn)
+    size = float(max(np.ptp(nodes[:, 1]), np.max(np.abs(nodes[:, 0])), 1e-300))
+    z0 = 0.5 * (nodes[0, 1] + nodes[-1, 1])
+    reflected = np.column_stack([nodes[::-1, 0], 2.0 * z0 - nodes[::-1, 1]])
+    if Nn < 4 or float(np.max(np.abs(reflected - nodes))) > MIRROR_NODE_TOLERANCE * size:
+        return None
+    if bool(solver.gen.node_on_axis(0)) != bool(solver.gen.node_on_axis(Nn - 1)):
+        return None
+    for values in element_values:
+        if values is None:
+            continue
+        values = np.asarray(values)
+        if len(values) != solver.gen.n_elems or not np.array_equal(values, values[::-1]):
+            return None
+
+    def mirror(m):
+        active = np.flatnonzero(solver.basis_mask(m))
+        lookup = np.full(2 * Nn, -1, dtype=int)
+        lookup[active] = np.arange(active.size)
+        node, component = active % Nn, active // Nn
+        target = lookup[component * Nn + (Nn - 1 - node)]
+        if np.any(target < 0):
+            return None
+        return target, np.where(component == 0, -1.0, 1.0)
+    return mirror
+
+
 def _validated_bor_aspects(thetas_deg) -> 'np.ndarray':
     """Validate the direct-solver monostatic aspect grid."""
 
@@ -3803,6 +3905,7 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
 
     sheet_mass = None
     sheet_weights = None
+    sheet_values = None
     if sheet_zs is not None:
         if zs is not None or form != "efie":
             raise ValueError("Free sheets require EFIE and cannot be combined with an opaque IBC.")
@@ -4056,7 +4159,12 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
                                            assembly_peak_gb=assembly_peak_gb,
                                            memory_context="The PEC/IBC BoR solve",
                                            stream_mode_block=mode_block,
-                                           signed_mode_symmetry=True)
+                                           signed_mode_symmetry=True,
+                                           coordinates=lambda m: solver.gen.nodes[
+                                               np.flatnonzero(solver.basis_mask(m)) % solver.Nn],
+                                           mirror=(mirror_map(solver, (zs_elem, sheet_values))
+                                                   if mirror_split_pays(n_dofs, 2 * len(thetas))
+                                                   else None))
         stream = solver._stream
         stream_meta = {
             "stream_mode_block": stream.mode_block if stream is not None else None,
@@ -4065,6 +4173,8 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
                 sampling_backend_name(stream) if use_streaming else None
             ),
             "stream_spill_gb": stream.spilled_gb() if stream is not None else 0.0,
+            "stream_far_compression": (dict(stream.evidence)
+                                       if getattr(stream, "evidence", None) else None),
         }
     finally:
         solver.close_streaming()

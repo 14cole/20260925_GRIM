@@ -109,6 +109,8 @@ def auto_spooled(nbytes):
 def selected(matrix, owned, factor_mode):
     from ghost_backend.execution.options import option
     policy = option('dense_residual_storage','auto')
-    eligible = (owned and factor_mode == 'dense' and matrix.flags.owndata
+    # 'dense' and 'auto' factor large systems hierarchically; an LU fallback
+    # that finds no room for its copy spools the original like any other.
+    eligible = (owned and factor_mode in ('dense', 'auto') and matrix.flags.owndata
                 and matrix.flags.f_contiguous and matrix.flags.writeable)
     return eligible and (policy == 'disk' or policy == 'auto' and auto_spooled(matrix.nbytes))

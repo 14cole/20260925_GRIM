@@ -43,6 +43,7 @@ class DenseFactor:
         if evidence is not None:
             evidence.append(self.event)
         from ghost_backend.linalg.hierarchical import (
+            automatic_hierarchical,
             factor_mode,
             HierarchicalFactor,
             HierarchicalRejected,
@@ -52,7 +53,11 @@ class DenseFactor:
             raise ValueError('This factorization requires a geometry-built compressed operator.')
         if self.factor_mode != 'dense' and requested_precision() == 'mixed':
             raise ValueError('Hierarchical CPU factorization requires double precision.')
-        if self.factor_mode == 'hierarchical' or self.factor_mode == 'auto' and len(self.a) >= 2048:
+        # Large dense systems are factored hierarchically by default: accepted
+        # by the same exact-matrix backward-error gate as LU, with LU as fallback.
+        automatic = (self.factor_mode in ('dense', 'auto') and requested_precision() == 'double'
+                     and self.a.ndim == 2 and automatic_hierarchical(len(self.a)))
+        if self.factor_mode == 'hierarchical' or automatic:
             try:
                 self.hierarchical = timed_stage('factorization')(HierarchicalFactor)(
                     self.a, coordinates, self.checkpoint, self.matrix_inf)
@@ -131,7 +136,7 @@ class DenseFactor:
                                                                scaling=self._condition_scaling)
                 method = 'equilibrated_1norm_hierarchical_refined_inverse'
             except (RuntimeError, np.linalg.LinAlgError, FloatingPointError, RuntimeWarning) as exc:
-                if self.factor_mode != 'auto':
+                if self.factor_mode == 'hierarchical':
                     raise
                 self.fallback_reason = 'Hierarchical condition check fell back to dense LU: {}'.format(exc)
                 failed = True
@@ -180,7 +185,7 @@ class DenseFactor:
                 self._sync_hierarchical_builds()
                 return result
             except (RuntimeError, np.linalg.LinAlgError, FloatingPointError, RuntimeWarning) as exc:
-                if self.factor_mode != 'auto':
+                if self.factor_mode == 'hierarchical':
                     raise
                 self.fallback_reason = 'Hierarchical residual check fell back to dense LU: {}'.format(exc)
 

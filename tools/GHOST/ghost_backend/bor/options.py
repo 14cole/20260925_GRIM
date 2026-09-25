@@ -12,10 +12,14 @@ from ghost_backend.execution.runtime import ScopedValue
 # the retained-block budget accumulate them once, for every mode, into
 # memory-mapped temporary files instead of rebuilding a block per mode range
 # (each range re-samples every far pair); 'off' keeps the per-range rebuild.
+# far_compression='auto' keeps the streamed far blocks of a surface with at
+# least bor.compressed_far.FAR_COMPRESSION_MIN_NODES nodes as a hierarchical
+# (compressed) store built by cross approximation; 'on' compresses every
+# streamed surface and 'off' keeps the dense streamed blocks.
 DEFAULTS = dict(version=1, angle_batch_size=64, rhs_compression='auto',
                 factorization='auto', compressed_storage_mib=0,
                 compression_tile=32, tile_cache_mib=16, near_backend='auto',
-                stream_spill='auto')
+                stream_spill='auto', far_compression='auto')
 _ACTIVE = ScopedValue('ghost_bor_options', default=None)
 _ABORT = ScopedValue('ghost_bor_abort', default=None)
 _OUTPUT_GB = ScopedValue('ghost_bor_output_gb', default=0.)
@@ -165,6 +169,8 @@ def validate_options(value):
         raise ValueError('BOR near_backend must be auto, threads, or processes.')
     if result['stream_spill'] not in ('auto', 'off'):
         raise ValueError('BOR stream_spill must be auto or off.')
+    if result['far_compression'] not in ('auto', 'on', 'off'):
+        raise ValueError('BOR far_compression must be auto, on, or off.')
     return result
 
 

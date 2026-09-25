@@ -2372,6 +2372,7 @@ def solve_monostatic_rcs_bor(
             "stream_sweeps": out.get("stream_sweeps"),
             "stream_spill_gb": float(out.get("stream_spill_gb", 0.0) or 0.0),
             "stream_sampling_backend": out.get("stream_sampling_backend"),
+            "stream_far_compression": out.get("stream_far_compression"),
             "near_quadrature": out.get("near_quadrature"),
             "mesh_elements_total": int(total_mesh_elements),
             "mesh_surface_count": int(len(surface_layout)),

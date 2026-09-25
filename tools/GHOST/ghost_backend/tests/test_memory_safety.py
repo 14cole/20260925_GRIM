@@ -217,47 +217,54 @@ class BorMemoryGateTests(unittest.TestCase):
                 workers=1,
             )
 
+    def _dense_streams(self):
+        """The dense streamed blocks (a 1,001-node surface is compressed by default)."""
+        from ghost_backend.bor.options import option_scope, validate_options
+        return option_scope(validate_options(dict(far_compression='off')))
+
     def test_streaming_mode_block_plan_matches_runtime_alignment_and_peak(self):
-        mode_block, retained_gb, effective_workers = (
-            bor_streaming.plan_streaming_mode_block(
-                n_elems=1000,
-                m_max=100,
-                formulation="cfie",
-                has_ibc=False,
-                single_blocks=False,
-                stream_budget_gb=8.0,
-                workers=64,
+        with self._dense_streams():
+            mode_block, retained_gb, effective_workers = (
+                bor_streaming.plan_streaming_mode_block(
+                    n_elems=1000,
+                    m_max=100,
+                    formulation="cfie",
+                    has_ibc=False,
+                    single_blocks=False,
+                    stream_budget_gb=8.0,
+                    workers=64,
+                )
             )
-        )
-        runtime_block = bor_streaming._aligned_stream_mode_block(
-            100, mode_block, effective_workers
-        )
-        self.assertEqual(mode_block, runtime_block)
-        # 83 modes fit (packed EFIE + full MFIE, ~96 MB each), aligned to 64 workers.
-        self.assertEqual(mode_block, 64)
-        self.assertEqual(effective_workers, 64)
-        self.assertAlmostEqual(
-            retained_gb,
-            bor_streaming.estimate_streaming_block_gb(
-                1000, 100, mode_block, "cfie", False, False
-            ),
-        )
-        self.assertLessEqual(retained_gb, 8.0)
+            runtime_block = bor_streaming._aligned_stream_mode_block(
+                100, mode_block, effective_workers
+            )
+            self.assertEqual(mode_block, runtime_block)
+            # 83 modes fit (packed EFIE + full MFIE, ~96 MB each), aligned to 64 workers.
+            self.assertEqual(mode_block, 64)
+            self.assertEqual(effective_workers, 64)
+            self.assertAlmostEqual(
+                retained_gb,
+                bor_streaming.estimate_streaming_block_gb(
+                    1000, 100, mode_block, "cfie", False, False
+                ),
+            )
+            self.assertLessEqual(retained_gb, 8.0)
 
     def test_streaming_mode_block_rejects_impossible_retained_budget(self):
-        minimum = bor_streaming.estimate_streaming_block_gb(
-            1000, 100, 1, "cfie", False, False
-        )
-        with self.assertRaisesRegex(ValueError, "one-mode retained minimum"):
-            bor_streaming.plan_streaming_mode_block(
-                n_elems=1000,
-                m_max=100,
-                formulation="cfie",
-                has_ibc=False,
-                single_blocks=False,
-                stream_budget_gb=0.5 * minimum,
-                workers=64,
+        with self._dense_streams():
+            minimum = bor_streaming.estimate_streaming_block_gb(
+                1000, 100, 1, "cfie", False, False
             )
+            with self.assertRaisesRegex(ValueError, "one-mode retained minimum"):
+                bor_streaming.plan_streaming_mode_block(
+                    n_elems=1000,
+                    m_max=100,
+                    formulation="cfie",
+                    has_ibc=False,
+                    single_blocks=False,
+                    stream_budget_gb=0.5 * minimum,
+                    workers=64,
+                )
 
     def test_combined_streaming_plan_counts_every_rectangular_mapping(self):
         requirements = (

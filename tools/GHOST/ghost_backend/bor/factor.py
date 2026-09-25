@@ -35,6 +35,89 @@ def _residual_spool_selected(matrix, owned, policy):
     return eligible and (policy == 'disk' or policy == 'auto' and auto_spooled(matrix.nbytes))
 
 
+class MirrorSplit:
+    """LU of the even and odd halves of a mirror-symmetric modal system.
+
+    A body symmetric about a plane z = z0 maps its generatrix onto itself with
+    the traversal reversed: node ``i`` to node ``Nn - 1 - i``, ``J_t`` changing
+    sign and ``J_phi`` not.  With ``R`` that signed permutation of the reduced
+    unknowns (``(R x)[u] = sign[u] x[target[u]]``) the system satisfies
+    ``A = R A R`` up to quadrature (3e-8 on the 10 GHz ogive: near and far
+    rules route a pair and its mirror image alike only to that accuracy), so
+    it splits into the even and odd subspaces of ``R``: two systems of half
+    the size, a quarter of the LU work, formed from ``A`` in O(n^2).  Their
+    solution is an approximate inverse whose coupling error (1e-8 of the
+    matrix) the caller's refinement against the exact ``A`` removes.
+    """
+
+    def __init__(self, matrix, target, sign):
+        n = len(matrix)
+        target = np.asarray(target, int)
+        sign = np.asarray(sign, float)
+        index = np.arange(n)
+        if target.shape != (n,) or sign.shape != (n,) or np.any(target[target] != index):
+            raise ValueError('The mirror map of a modal system must be an involution of its unknowns.')
+        if np.any(sign[target] != sign) or np.any(np.abs(sign) != 1.0):
+            raise ValueError('Mirror signs must be +-1 and shared by each mirrored pair.')
+        paired = index < target
+        self.p1, self.p2 = index[paired], target[paired]
+        self.s = sign[self.p2]
+        fixed = index == target
+        self.fe, self.fo = index[fixed & (sign > 0)], index[fixed & (sign < 0)]
+        self.n = n
+        a, p1, p2, s = matrix, self.p1, self.p2, self.s
+        k = len(p1)
+        # Pair blocks: A11 + S A22 S and A12 S + S A21 (S = diag(s)).
+        common = a[np.ix_(p1, p1)]
+        common += s[:, None] * a[np.ix_(p2, p2)] * s[None, :]
+        cross = a[np.ix_(p1, p2)] * s[None, :]
+        cross += s[:, None] * a[np.ix_(p2, p1)]
+        halves = []
+        r = 1.0 / math.sqrt(2.0)
+        for parity, fixed_points in ((1.0, self.fe), (-1.0, self.fo)):
+            size = k + len(fixed_points)
+            half = np.empty((size, size), dtype=complex, order='F')
+            np.add(common, parity * cross, out=half[:k, :k])
+            half[:k, :k] *= 0.5
+            if len(fixed_points):
+                half[:k, k:] = (a[np.ix_(p1, fixed_points)] + parity * s[:, None] * a[np.ix_(p2, fixed_points)]) * r
+                half[k:, :k] = (a[np.ix_(fixed_points, p1)] + parity * a[np.ix_(fixed_points, p2)] * s[None, :]) * r
+                half[k:, k:] = a[np.ix_(fixed_points, fixed_points)]
+            halves.append(half)
+        common = cross = None
+        getrf, self.getrs = get_lapack_funcs(('getrf', 'getrs'), (halves[0],))
+        self.factors = []
+        for half in halves:
+            lu, piv, info = getrf(half, overwrite_a=True)
+            if info:
+                raise np.linalg.LinAlgError('A mirror half of a BoR mode is singular (LAPACK info={}).'.format(info))
+            self.factors.append((lu, piv))
+
+    def solve(self, rhs, trans=0):
+        """Approximate ``A^-1 rhs`` (``trans`` 2: ``A^-H``) from the two halves."""
+        b = np.asarray(rhs, complex)
+        vector = b.ndim == 1
+        if vector:
+            b = b[:, None]
+        p1, p2, s = self.p1, self.p2, self.s[:, None]
+        r = 1.0 / math.sqrt(2.0)
+        even = np.vstack(((b[p1] + s * b[p2]) * r, b[self.fe]))
+        odd = np.vstack(((b[p1] - s * b[p2]) * r, b[self.fo]))
+        solved = []
+        for part, (lu, piv) in zip((even, odd), self.factors):
+            value, info = self.getrs(lu, piv, part, trans=trans)
+            if info:
+                raise np.linalg.LinAlgError('A mirror half solve failed (LAPACK info={}).'.format(info))
+            solved.append(value)
+        k = len(p1)
+        x = np.empty((self.n, b.shape[1]), dtype=complex)
+        x[p1] = (solved[0][:k] + solved[1][:k]) * r
+        x[p2] = s * (solved[0][:k] - solved[1][:k]) * r
+        x[self.fe] = solved[0][k:]
+        x[self.fo] = solved[1][k:]
+        return x[:, 0] if vector else x
+
+
 class ModalFactor:
     """LU of one modal system with original-coefficient residuals.
 
@@ -42,11 +125,24 @@ class ModalFactor:
     original coefficients go to a disk spool for the residuals, so one mode
     holds one dense matrix instead of the matrix plus its LU copy.  The
     caller must not use ``matrix`` afterwards (``solve_am`` never does).
+
+    With ``coordinates`` (the meridian position of every reduced unknown), a
+    system of at least ``linalg.hierarchical.HIERARCHICAL_MIN_UNKNOWNS`` is
+    factored hierarchically instead (the randomized HODLR of the 2-D dense
+    factor, refined against the exact matrix to the same backward error):
+    faster than LU there and a factor of a few percent of the matrix, so a
+    mode worker holds the matrix and that factor instead of two matrices.  A
+    rejected factor falls back to LU.
+
+    With ``mirror = (target, sign)`` (the mirror map of a body symmetric about
+    a plane normal to its axis, :class:`MirrorSplit`) the even and odd halves
+    are factored instead, a quarter of the LU work; their solutions are
+    refined against the exact matrix, and LU replaces them if that does not
+    reach the backward-error gate.
     """
 
     def __init__(self, matrix, mode, monitor_cond, checkpoint=None, owned=False,
-                 residual_storage=None):
-        from ghost_backend.bor.solver import BOR_CONDITION_EST_MAX
+                 residual_storage=None, coordinates=None, mirror=None):
         self.a = matrix
         self.mode = mode
         self.checkpoint = checkpoint or (lambda: None)
@@ -58,8 +154,9 @@ class ModalFactor:
         self.event = dict(factorizations=1, rhs_batches=0, max_rhs_columns=0,
                           max_backward_error=0., max_relative_residual=0., refinement_steps=0,
                           residual_storage='memory')
-        getrf, self.getrs, gecon = get_lapack_funcs(('getrf', 'getrs', 'gecon'), (matrix,))
-        norm = None
+        self.monitor_cond = monitor_cond
+        self._residual_storage = residual_storage
+        self.norm_1 = None
         if monitor_cond:
             # Row-stripped norm avoids an extra full real matrix from abs(A);
             # taken before an in-place factorization overwrites A.
@@ -67,7 +164,81 @@ class ModalFactor:
             for start in range(0, len(matrix), 64):
                 self.checkpoint()
                 sums += np.sum(abs(matrix[start:start + 64]), axis=0)
-            norm = float(np.max(sums))
+            self.norm_1 = float(np.max(sums))
+        self.hierarchical = self.mirror = None
+        self.lu = self.piv = None
+        policy, directory = residual_storage or residual_storage_settings()
+        if directory is not None and _residual_spool_selected(matrix, owned, policy):
+            # Memory the plan did not foresee (or disk residuals requested):
+            # factor in place with the original spooled, as before.
+            mirror = coordinates = None
+        if mirror is not None:
+            self._factor_mirror(mirror)
+        if self.mirror is None and coordinates is not None:
+            from ghost_backend.linalg.hierarchical import automatic_hierarchical
+            if automatic_hierarchical(len(matrix)):
+                self._factor_hierarchical(coordinates)
+        if self.hierarchical is None and self.mirror is None:
+            self._factor_lu(owned, residual_storage)
+        self._condition()
+
+    def _factor_mirror(self, mirror):
+        try:
+            self.mirror = timed_stage('factorization')(MirrorSplit)(self.a, *mirror)
+        except (np.linalg.LinAlgError, ValueError) as exc:
+            self.event['mirror_fallback'] = str(exc)
+            return
+        self.event.update(backend='mirror', mirror_halves=[len(lu) for lu, _ in self.mirror.factors])
+
+    def _factor_hierarchical(self, coordinates):
+        from ghost_backend.linalg.hierarchical import HierarchicalFactor, HierarchicalRejected
+        try:
+            self.hierarchical = timed_stage('factorization')(HierarchicalFactor)(
+                self.a, coordinates, self.checkpoint, self.matrix_inf)
+        except (HierarchicalRejected, np.linalg.LinAlgError, RuntimeWarning, ValueError) as exc:
+            self.event['hierarchical_fallback'] = str(exc)
+            return
+        self.event.update(backend='hodlr', hierarchical=self.hierarchical.evidence)
+
+    def _fall_back_to_lu(self, reason):
+        """Replace a hierarchical or mirror factor rejected by its refined solves with LU."""
+        key = 'hierarchical_fallback' if self.hierarchical is not None else 'mirror_fallback'
+        self.hierarchical = self.mirror = None
+        self.event.update(backend='lu', **{key: str(reason)})
+        self.event['factorizations'] += 1
+        # The matrix is kept for the residuals: LU works on its own copy.
+        self._factor_lu(False, self._residual_storage)
+        self._condition()
+
+    def _condition(self):
+        from ghost_backend.bor.solver import BOR_CONDITION_EST_MAX
+        self.condition = math.nan
+        if not self.monitor_cond:
+            return
+        norm = self.norm_1
+        approximate = self.hierarchical if self.hierarchical is not None else self.mirror
+        if approximate is not None:
+            from scipy.sparse.linalg import LinearOperator
+            from ghost_backend.twod.solver import _deterministic_onenormest
+            n = len(self.a)
+            inverse = LinearOperator((n, n), dtype=complex,
+                                     matvec=lambda z: approximate.solve(z),
+                                     rmatvec=lambda z: approximate.solve(z, trans=2))
+            self.condition = norm * timed_stage('condition_estimate')(_deterministic_onenormest)(inverse)
+        else:
+            # ||A||_1 is the infinity norm of the factored A^T.
+            reciprocal, info = timed_stage('condition_estimate')(self.gecon)(
+                self.lu, norm, norm='I' if self.trans else '1')
+            if info or not math.isfinite(float(reciprocal)) or reciprocal <= 0 or norm <= 0:
+                raise RuntimeError('BoR mode m={} condition estimation failed.'.format(self.mode))
+            self.condition = 1. / float(reciprocal)
+        if not math.isfinite(self.condition) or self.condition > BOR_CONDITION_EST_MAX:
+            raise RuntimeError('BoR mode m={} estimated 1-norm condition {} exceeds the release limit {}.'.format(
+                self.mode, self.condition, BOR_CONDITION_EST_MAX))
+
+    def _factor_lu(self, owned, residual_storage):
+        matrix, mode = self.a, self.mode
+        getrf, self.getrs, self.gecon = get_lapack_funcs(('getrf', 'getrs', 'gecon'), (matrix,))
         # 0: LU of A (solve A x = b); 1: LU of A^T in a C-ordered buffer
         # (solve with the transposed factors).
         self.trans = 0
@@ -96,17 +267,6 @@ class ModalFactor:
                 np.array(matrix, dtype=complex, order='F', copy=True), overwrite_a=True)
         if info:
             raise RuntimeError('BoR mode m={} LU factorization failed (LAPACK info={}).'.format(mode, info))
-        self.condition = math.nan
-        if monitor_cond:
-            # ||A||_1 is the infinity norm of the factored A^T.
-            reciprocal, info = timed_stage('condition_estimate')(gecon)(
-                self.lu, norm, norm='I' if self.trans else '1')
-            if info or not math.isfinite(float(reciprocal)) or reciprocal <= 0 or norm <= 0:
-                raise RuntimeError('BoR mode m={} condition estimation failed.'.format(mode))
-            self.condition = 1. / float(reciprocal)
-            if not math.isfinite(self.condition) or self.condition > BOR_CONDITION_EST_MAX:
-                raise RuntimeError('BoR mode m={} estimated 1-norm condition {} exceeds the release limit {}.'.format(
-                    mode, self.condition, BOR_CONDITION_EST_MAX))
 
     def close(self):
         """Release the residual spool (also released when the factor is collected)."""
@@ -116,13 +276,22 @@ class ModalFactor:
 
     def inverse(self, rhs):
         self.checkpoint()
+        if self.hierarchical is not None:
+            from ghost_backend.linalg.hierarchical import HierarchicalRejected
+            try:
+                return timed_stage('rhs_solve')(self.hierarchical.solve)(rhs)
+            except (HierarchicalRejected, np.linalg.LinAlgError, RuntimeWarning) as exc:
+                self._fall_back_to_lu(exc)
+        if self.mirror is not None:
+            return timed_stage('rhs_solve')(self.mirror.solve)(rhs)
         value, info = timed_stage('rhs_solve')(self.getrs)(self.lu, self.piv, rhs, trans=self.trans)
         if info:
             raise RuntimeError('BoR mode m={} LU solve failed (LAPACK info={}).'.format(self.mode, info))
         return value
 
-    def errors(self, x, b):
-        residual = self.a @ x - b
+    def errors(self, x, b, residual=None):
+        if residual is None:
+            residual = self.a @ x - b
         norms = np.linalg.norm(residual, axis=0)
         bnorms = np.linalg.norm(b, axis=0)
         relative = norms / np.where(bnorms > 0., bnorms, 1.)
@@ -132,14 +301,15 @@ class ModalFactor:
         backward[(denominator <= 0.) & (numerator > 0.)] = np.inf
         return residual, relative, backward
 
-    def solve(self, rhs):
+    def _refined(self, b, x, residual):
+        """``(x, relative, backward)`` after up to two refinement steps against ``self.a``."""
         from ghost_backend.bor.solver import BOR_LINEAR_BACKWARD_ERROR_MAX, BOR_LINEAR_RESIDUAL_MAX
-        b = np.asarray(rhs, complex)
-        if b.ndim != 2 or b.shape[0] != len(self.a) or not b.shape[1] or first_nonfinite(b) is not None:
-            raise RuntimeError('BoR mode m={} produced an invalid or non-finite excitation.'.format(self.mode))
-        x = self.inverse(b)
-        residual, relative, backward = self.errors(x, b)
-        for attempt in range(2):
+        if x is None:
+            x = self.inverse(b)
+        residual, relative, backward = self.errors(x, b, residual)
+        # The mirror halves leave their coupling (1e-8) for refinement: allow
+        # one more step than LU needs.
+        for attempt in range(3 if self.mirror is not None else 2):
             if np.max(relative) <= BOR_LINEAR_RESIDUAL_MAX and np.max(backward) <= BOR_LINEAR_BACKWARD_ERROR_MAX:
                 break
             candidate = x + self.inverse(-residual)
@@ -149,6 +319,32 @@ class ModalFactor:
             x = candidate
             residual, relative, backward = updated
             self.event['refinement_steps'] += 1
+        return x, relative, backward
+
+    def solve(self, rhs):
+        from ghost_backend.bor.solver import BOR_LINEAR_BACKWARD_ERROR_MAX, BOR_LINEAR_RESIDUAL_MAX
+        b = np.asarray(rhs, complex)
+        if b.ndim != 2 or b.shape[0] != len(self.a) or not b.shape[1] or first_nonfinite(b) is not None:
+            raise RuntimeError('BoR mode m={} produced an invalid or non-finite excitation.'.format(self.mode))
+        x = residual = None
+        if self.hierarchical is not None:
+            from ghost_backend.linalg.hierarchical import HierarchicalRejected
+            self.checkpoint()
+            try:
+                # The refined solve returns its final residual b - A x.
+                x, residual = timed_stage('rhs_solve')(self.hierarchical.solve)(b, return_residual=True)
+                np.negative(residual, out=residual)
+            except (HierarchicalRejected, np.linalg.LinAlgError, RuntimeWarning) as exc:
+                self._fall_back_to_lu(exc)
+                x = residual = None
+        x, relative, backward = self._refined(b, x, residual)
+        if self.mirror is not None and not (np.max(relative) <= BOR_LINEAR_RESIDUAL_MAX
+                                            and np.max(backward) <= BOR_LINEAR_BACKWARD_ERROR_MAX):
+            # The halves were too far from the exact system (an asymmetry
+            # beyond quadrature): solve this and later batches with LU.
+            self._fall_back_to_lu('refined mirror solve stopped at backward error {:.3g}'.format(
+                float(np.max(backward))))
+            x, relative, backward = self._refined(b, None, None)
         if (first_nonfinite(x) is not None or not np.all(np.isfinite(relative))
                 or not np.all(np.isfinite(backward)) or np.max(backward) > BOR_LINEAR_BACKWARD_ERROR_MAX):
             raise RuntimeError('BoR mode m={} normwise linear backward error {} exceeds the release limit {}.'.format(

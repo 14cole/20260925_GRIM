@@ -404,6 +404,50 @@ system's available memory to 8-10 MB; they now leave 14-15 GB free.
   once (half the products, a quarter of the combinations; 1.9x per EFIE tile
   of five rows, nothing to share in the one-row tiles of very large meshes).
 
+## September 25 architecture changes
+
+The dense far-block store was the largest stage of every high-frequency solve
+(work and memory growing as N^2 M, 12 GB written to disk for the 10 GHz ogive
+survey, 24 GB on its certified mesh). Far interactions between well-separated
+parts of a generatrix have low numerical rank, the same across modes and
+families, so large surfaces now keep their far blocks compressed. On the
+120 x 5 in ogive at 10 GHz (181 aspects, eight cores) the survey takes 53 s
+instead of 92-95 s and the certified solve 159 s instead of 334 s, with no
+spill (12 and 29 GB before); RCS agrees with the dense store to 4e-9 of the
+largest amplitude (1.5e-7 dB within 40 dB of the peak).
+
+- `CompressedFarBlocks` (`bor/compressed_far.py`) builds the streamed far
+  blocks as an H-matrix over the generatrix nodes with GHOST's own sampler and
+  contractions: near-diagonal leaves as tiles, admissible blocks by cross
+  approximation of the stack of all families and modes (one pivot row or
+  column tile yields every mode), then each family and mode slice truncated
+  to its own rank. Every mode is built at once and kept in RAM; mode assembly
+  writes the blocks into the system quadrants, so the LU, solves and
+  certification are unchanged. The 10 GHz ogive's far blocks: 17 s on eight
+  process workers (25 s on threads) against 43 s for the streamed build in
+  memory and 62 s spilled, 1.08 GB against 12.1 GB, agreement 2e-11 per mode.
+- The BoR option `far_compression` selects it: `auto` (default) for surfaces
+  of at least `FAR_COMPRESSION_MIN_NODES` (1,000) nodes, `on`, `off`. The
+  streaming estimates price the compressed store (2.0-2.4 times above the
+  measured stores) for every mode at once; the dense per-range stream budget
+  and the spill no longer apply to it. Conductor and dielectric solves price
+  it so; the coated, partial-coating and multi-region planners still price
+  their self streams as dense (an upper bound) and keep their cross-surface
+  streams dense.
+- Tiles are sampled in spawn processes when the near-preparation scope admits
+  a process pool (the same capability test and size); otherwise on threads.
+- Mode factors: a mode system of at least 10,000 unknowns on a single surface
+  is factored as the checked HODLR inverse of the 2-D dense factor (see
+  [numerical methods](NUMERICAL_METHODS.md)), priced at two matrix copies per
+  worker instead of three, and falls back to LU if rejected.
+- Mirror symmetry: a surface symmetric about a plane normal to its axis
+  (nodes, impedances and sheets) factors each mode as its even and odd halves
+  (`bor.factor.MirrorSplit`, a quarter of the LU), refined against the exact
+  system, whose 1e-8 asymmetry (near/far routing) costs one refinement step
+  per batch; LU replaces the halves if refinement does not reach the gate. It
+  is used while the unknowns exceed four times the right-hand sides (54.0 s
+  against 56.5 s for the 10 GHz survey; RCS identical to 1.5e-15).
+
 ## Geometry and angle conventions
 
 Generatrices use `(rho, z)` with nonnegative radius. A closed body runs from

@@ -224,6 +224,35 @@ retain their existing storage. Spools close on completion or failure. BoR modal
 factors follow the same policy: a mode worker whose copy does not fit factors a
 system of 512 MiB or more in place and computes its residuals from the spool.
 
+A dense double-precision system of at least 10,000 unknowns
+(`linalg.hierarchical.HIERARCHICAL_MIN_UNKNOWNS`; the environment variable
+`GHOST_HIERARCHICAL_MIN_UNKNOWNS` overrides it, 0 keeps LU) is factored as a
+HODLR inverse under the `dense` and `auto` factorizations. Its off-diagonal
+blocks are compressed by an adaptive randomized range finder (products of the
+block with 32 Gaussian probes at a time, re-orthogonalized, until fresh
+samples leave less than `1e-10 ||A||_inf`; then a truncated SVD through the QR
+of the projected block), and the factor is accepted exactly as before: every
+solve is refined against the original matrix to a normwise backward error of
+3e-15, the result must then pass the dense backward-error gate, and a factor
+that does not converge is rebuilt once at `1e-12`, then replaced by LU. On the
+certified airfoil's systems (three batches of 256 right-hand sides, eight
+cores) the factor tied LU at 9,082 unknowns (4.2 against 4.7 s) and was 1.7
+times faster at 13,618 (8.0 against 13.7 s, factor 182 MB against a 2,967 MB
+LU); below the threshold LU is faster (7,348 unknowns: 3.4 against 2.8 s).
+The block tolerance sets the cost: at `1e-9` refinement needed two steps, at
+`1e-6` seven, each a product with the original matrix per batch. A cluster
+tree over the coordinates keeps coincident unknowns of different densities in
+the same leaf; the natural order would split them at the top level, where one
+block then reached rank 1,024. Memory forecasts price such a system as the
+matrix and its factor budget (0.65 of it) instead of the matrix and an LU
+copy; an LU fallback that finds no room for its copy spools the original
+(`dense` and `auto`). End to end, the certified airfoil at 6 GHz takes 40.5 s
+instead of 51.7 s with LU (factorizations 12.9 against 25.3 s, peak 5.1
+against 7.6 GB, RCS equal to 1.7e-12 of the largest amplitude); at 10 GHz,
+where the LU copy did not fit the planner's margin on a 31 GB workstation and
+the compressed backend ran (90-92 s, 4.3 GB), the dense path is now admitted
+and takes 88 s (11.5 GB).
+
 ## BoR formulations and geometry
 
 Closed uniform IBC dispatch selects CFIE for reactive and resistive impedance.

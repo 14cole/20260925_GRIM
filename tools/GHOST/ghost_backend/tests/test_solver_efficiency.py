@@ -169,7 +169,7 @@ class SolverEfficiencyTests(unittest.TestCase):
             def checked(*args, **kwargs):
                 self.assertIsNone(refs[0]())
                 return original(*args, **kwargs)
-            with mock.patch.object(hf, 'compress', reject), mock.patch.object(hf.la, 'lu_factor', checked):
+            with mock.patch.object(hf, 'compress_sampled', reject), mock.patch.object(hf.la, 'lu_factor', checked):
                 factor = hf.HierarchicalFactor(a)
             np.testing.assert_array_equal(factor.solve(np.ones(260)), 1)
         finally:
