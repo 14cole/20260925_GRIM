@@ -43,7 +43,10 @@ qualified headless solver subset, install `.[test]` and run
 `python scripts/check_headless.py`. Run `scripts/check_installation.py` with the
 installed environment's Python from an unrelated working directory to check
 wheel resources and 2-D/BoR analytic reference cases. It deliberately refuses
-imports from a source checkout.
+imports from a source checkout. `scripts/check_speed_paths.py` checks the
+checkout it belongs to instead: whether the native BoR samplers, the 2-D native
+libraries and an optimized BLAS work on this machine, and whether a setting
+switches a fast path off; it exits with status 1 when anything would fall back.
 
 Tests that exercise the separate GRIM or FREDDY projects explicitly skip when
 those companion checkouts are absent. GHOST's own solver and file-format tests

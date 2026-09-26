@@ -448,6 +448,21 @@ largest amplitude (1.5e-7 dB within 40 dB of the peak).
   is used while the unknowns exceed four times the right-hand sides (54.0 s
   against 56.5 s for the 10 GHz survey; RCS identical to 1.5e-15).
 
+Which paths ran. `scripts/check_speed_paths.py` reports whether a machine can
+use the native samplers, the 2-D native libraries and an optimized BLAS (exit
+status 1 when any would fall back). Each BoR frequency's
+`metadata["per_frequency"]` entry records what a solve used:
+`stream_sampling_backend` (`banded_native_pairs` natively), `stream_far_compression`
+(null for the dense store; its `backend` is `processes`, or `threads` when no
+process pool was admitted, for example because the entry script has no
+`if __name__ == "__main__":` guard), `stream_spill_gb`, `near_preparation.backend`,
+and in `modal_execution.systems` each mode's factor `backend` with any
+`mirror_fallback` or `hierarchical_fallback`. A top-level
+`automatic_factorization_fallback` marks a switch to the compressed
+factorization. 2-D results record `linear_backend` (`cpu_hierarchical` for the
+hierarchical factor, `cpu` for LU), `dense_fallback_reasons` and, for automatic
+runs, `backend_selection`.
+
 ## Geometry and angle conventions
 
 Generatrices use `(rho, z)` with nonnegative radius. A closed body runs from

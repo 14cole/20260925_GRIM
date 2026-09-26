@@ -48,6 +48,18 @@ class PackageLayoutTests(unittest.TestCase):
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stdout)
 
+    def test_speed_path_check_runs_from_an_unrelated_directory(self):
+        script = BACKEND.parent / 'scripts' / 'check_speed_paths.py'
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run([sys.executable, str(script)], cwd=temporary,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        # Exit status 1 only reports a slow path of this machine, not a failure.
+        self.assertIn(result.returncode, (0, 1), result.stdout)
+        for label in ('BoR far sampler', 'BoR near kernels', '2D far library', '2D table library',
+                      'BLAS', 'Environment', 'September 25 speedups'):
+            self.assertIn(label, result.stdout)
+        self.assertRegex(result.stdout, r'September 25 speedups\s+OK')
+
     def test_nested_sources_are_distinct_and_invalidate_the_fingerprint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
