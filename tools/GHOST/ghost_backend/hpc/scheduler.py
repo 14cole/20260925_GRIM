@@ -199,37 +199,64 @@ def _host_memory_bytes() -> 'Optional[int]':
     return None
 
 
+def _cgroup_limit_gib() -> 'Optional[float]':
+    """Tightest memory limit of this process's cgroup and its ancestors, in GiB.
+
+    A SLURM job or systemd unit is a nested group whose limit the mount root
+    does not show (``execution.cgroup``); the mount root, the group inside a
+    cgroup namespace, is the fallback when no nested group has a limit.
+    """
+
+    from ghost_backend.execution.cgroup import memory_groups, root_groups
+
+    def read_text(path):
+        return Path(path).read_text()
+
+    def limit_of(group):
+        try:
+            text = read_text(group[0]).strip()
+        except OSError:
+            return None
+        if not text.isdigit():
+            return None
+        limit = float(text) / (1024.0 ** 3)
+        return limit if 0.5 < limit < 1.0e6 else None
+
+    limits = [value for value in map(limit_of, memory_groups(read_text)) if value is not None]
+    if limits:
+        return min(limits)
+    for group in root_groups():
+        value = limit_of(group)
+        if value is not None:
+            return value
+    return None
+
+
 def detect_memory_gb() -> 'float':
     """Memory this task may use, in GiB (see BYTES_PER_GIB).
 
-    SLURM's allocation is authoritative when present: a node with 750 GB
-    installed may still have been given a 64 GB cgroup, and /proc/meminfo
-    reports the machine, not the cgroup.  Without SLURM, a cgroup limit or
-    /proc/meminfo, the host's installed memory comes from psutil, then
+    SLURM's allocation and the task's cgroup limit both bound it and the
+    tighter wins: a node with 750 GB installed may still have been given a
+    64 GB cgroup, /proc/meminfo reports the machine, not the cgroup, and a
+    site can confine a job's cgroup below its request.  Without either, the
+    host's installed memory comes from /proc/meminfo, psutil, then
     GlobalMemoryStatusEx on Windows or sysconf elsewhere.  The fixed fallback
     is used only when every probe fails: it used to be what every Windows
     workstation got, so a 32 GB machine scheduled units against ~6 GB.
     """
 
+    declared = []
     raw = os.environ.get("SLURM_MEM_PER_NODE", "").strip()
+    per_cpu = os.environ.get("SLURM_MEM_PER_CPU", "").strip()
     if raw.isdigit() and int(raw) > 0:
-        return float(int(raw)) / 1024.0
-    raw = os.environ.get("SLURM_MEM_PER_CPU", "").strip()
-    if raw.isdigit() and int(raw) > 0:
-        return float(int(raw)) * float(detect_cores()) / 1024.0
-    for path, scale in (
-        ("/sys/fs/cgroup/memory.max", 1.0),
-        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", 1.0),
-    ):
-        try:
-            text = Path(path).read_text().strip()
-        except OSError:
-            continue
-        if text.isdigit():
-            limit = float(text) * scale / (1024.0 ** 3)
-
-            if 0.5 < limit < 1.0e6:
-                return limit
+        declared.append(float(int(raw)) / 1024.0)
+    elif per_cpu.isdigit() and int(per_cpu) > 0:
+        declared.append(float(int(per_cpu)) * float(detect_cores()) / 1024.0)
+    cgroup = _cgroup_limit_gib()
+    if cgroup is not None:
+        declared.append(cgroup)
+    if declared:
+        return min(declared)
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemTotal:"):

@@ -99,6 +99,51 @@ def _continuous_oriented_mesh(mesh):
     return LinearMesh(nodes=[nodes_by_key[key] for key in keys], elements=elements)
 
 
+# Consecutive panels whose tangents differ by less than this lie on one drawn
+# primitive (the mesher splits a primitive along its chord).
+_STRAIGHT_TURN_RAD = 1.0e-6
+
+
+def _drawing_curvature(mesh):
+    """Largest turn per unit length of the drawn midsurface (0 when it is straight).
+
+    A turn is measured over the straight runs of panels on either side of its
+    node, i.e. over the drawn primitives rather than the panels: splitting a
+    primitive into more panels must not raise the curvature of the drawing (a
+    64-gon split into 5 panels per primitive was refused while 4 passed, so a
+    certified run failed on its fine mesh).
+    """
+    parent = list(range(len(mesh.elements)))
+
+    def root(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    at_node = {}
+    for index, element in enumerate(mesh.elements):
+        for node in element.node_ids:
+            at_node.setdefault(mesh.nodes[node].key, []).append(index)
+    turns = []
+    for connected in at_node.values():
+        if len(connected) > 2:
+            raise ValueError("Thin-layer branching junctions require explicit bulk geometry.")
+        if len(connected) == 2:
+            a, b = connected
+            cosine = np.dot(mesh.elements[a].tangent, mesh.elements[b].tangent)
+            turn = math.acos(float(np.clip(cosine, -1, 1)))
+            if turn <= _STRAIGHT_TURN_RAD:
+                parent[root(a)] = root(b)
+            else:
+                turns.append((turn, a, b))
+    runs = {}
+    for index, element in enumerate(mesh.elements):
+        runs[root(index)] = runs.get(root(index), 0.0) + float(element.length)
+    return max((turn / (0.5 * (runs[root(a)] + runs[root(b)])) for turn, a, b in turns),
+               default=0.0)
+
+
 @timed_stage("thin_layer_operators_and_solve")
 def solve_thin_layer_fields(mesh, k0, incidence_angles_deg, polarization,
                             epsilon, permeability, thickness_m, *,
@@ -129,19 +174,7 @@ def solve_thin_layer_fields(mesh, k0, incidence_angles_deg, polarization,
             raise ValueError('A thin-layer solve needs finite observation angles.')
 
 
-    at_node = {}
-    for element in mesh.elements:
-        for node in element.node_ids:
-            at_node.setdefault(mesh.nodes[node].key, []).append(element)
-    max_curvature = 0.0
-    for connected in at_node.values():
-        if len(connected) > 2:
-            raise ValueError("Thin-layer branching junctions require explicit bulk geometry.")
-        if len(connected) == 2:
-            a, b = connected
-            turn = math.acos(float(np.clip(np.dot(a.tangent, b.tangent), -1, 1)))
-            max_curvature = max(max_curvature, turn / (0.5 * (a.length + b.length)))
-    curvature_ratio = d * max_curvature
+    curvature_ratio = d * _drawing_curvature(mesh)
     if curvature_ratio > 0.05:
         raise ValueError("Thin-layer thickness/curvature radius exceeds 0.05; use explicit bulk geometry.")
 
@@ -167,6 +200,7 @@ def solve_thin_layer_fields(mesh, k0, incidence_angles_deg, polarization,
         'limits': 'electrical thickness <= 0.15; thickness/radius <= 0.05; validate against bulk for application',
     }
     limit = rcs._solve_memory_limit_gb()
+    rcs._compressed_storage_gate(resources, 'Thin-layer solve')
     if required > limit:
         raise MemoryError(rcs._memory_gate_message(required, limit, 'Thin-layer solve', unit='GiB'))
     if zero_contrast:

@@ -122,6 +122,7 @@ class MemoryDetectionTests(unittest.TestCase):
     def test_slurm_allocation_stays_authoritative(self):
         fake = _FakePsutil(total=1024 * GIB, available=900 * GIB)
         with mock.patch.dict(os.environ, {"SLURM_MEM_PER_NODE": str(64 * 1024)}), \
+                mock.patch.object(hpc_scheduler, "Path", _NoLinuxProbe), \
                 mock.patch.dict(sys.modules, {"psutil": fake}):
             self.assertEqual(hpc_scheduler.detect_memory_gb(), 64.0)
 

@@ -29,11 +29,18 @@ _BACKEND_SOURCE_SUFFIXES = (
 
 
 def backend_source_paths(backend_dir: 'str') -> 'List[str]':
-    """Return Python and native artifacts from the backend and its packages."""
+    """Return Python and native artifacts from the backend and its packages.
+
+    The root-level ``run_*.py`` drivers and the GUI (``ui``) are not part of
+    a solve's identity.  A running driver is fingerprinted as its configured
+    copy (``driver_configured.py``, an extra record); counting the checkout's
+    drivers made every running unit of a run fail its provenance check as
+    soon as the next run's CONFIG block was edited in that checkout.
+    """
 
     paths: 'List[str]' = []
     packages = {"assembly", "bor", "compressed", "execution", "geometry",
-                "hpc", "io", "linalg", "runs", "twod", "ui", "validation"}
+                "hpc", "io", "linalg", "runs", "twod", "validation"}
     root = os.path.abspath(backend_dir)
     for directory, folders, filenames in os.walk(root):
         folders[:] = [name for name in folders if (
@@ -41,7 +48,8 @@ def backend_source_paths(backend_dir: 'str') -> 'List[str]':
             os.path.isfile(os.path.join(directory, name, "__init__.py"))
         )]
         paths.extend(os.path.join(directory, name) for name in filenames
-                     if name.endswith(_BACKEND_SOURCE_SUFFIXES))
+                     if name.endswith(_BACKEND_SOURCE_SUFFIXES)
+                     and not (directory == root and name.startswith("run_") and name.endswith(".py")))
     return sorted(paths)
 
 
@@ -753,13 +761,33 @@ def unit_solve_spec_fingerprint(unit: 'Dict[str, Any]') -> 'str':
 
 
 def _package_configuration(package: 'Any') -> 'Dict[str, Any]':
+    """A package's build configuration, without what it detects on this CPU.
+
+    NumPy's "SIMD Extensions" lists the extensions found on the running CPU
+    next to the build baseline; only the baseline is part of the build.
+    """
+
     config_module = getattr(package, "__config__", None)
     config = getattr(config_module, "CONFIG", None)
-    return _stable_json_value(config) if isinstance(config, dict) else {}
+    if not isinstance(config, dict):
+        return {}
+    config = dict(config)
+    simd = config.get("SIMD Extensions")
+    if isinstance(simd, dict):
+        config["SIMD Extensions"] = {key: value for key, value in simd.items()
+                                     if key not in ("found", "not found")}
+    return _stable_json_value(config)
 
 
 def runtime_environment_payload() -> 'Dict[str, Any]':
-    """Numerically relevant interpreter/platform/library configuration."""
+    """Numerically relevant interpreter/platform/library configuration.
+
+    Build and version facts only.  The HPC drivers take this fingerprint on
+    the submit (login) node and compare it on every compute node, so facts of
+    the host (kernel release, CPU model, SIMD extensions found at run time)
+    made every array task refuse to run wherever login and compute nodes
+    differ.
+    """
 
     import numpy as np
     try:
@@ -785,9 +813,7 @@ def runtime_environment_payload() -> 'Dict[str, Any]':
         "python_cache_tag": getattr(implementation, "cache_tag", ""),
         "byteorder": sys.byteorder,
         "platform_system": platform.system(),
-        "platform_release": platform.release(),
         "platform_machine": platform.machine(),
-        "platform_processor": platform.processor(),
         "numpy_version": np.__version__,
         "numpy_config": _package_configuration(np),
         "scipy_version": getattr(scipy, "__version__", "unavailable"),

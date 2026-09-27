@@ -1140,7 +1140,14 @@ _BYTES_PER_GIB = 1024.0 ** 3
 
 
 def _psutil_available_bytes() -> 'Optional[int]':
-    """Host-available bytes from psutil, without making it mandatory."""
+    """Host-available bytes from psutil, without making it mandatory.
+
+    On Windows this is also bounded by the commit headroom: an allocation
+    fails when the commit charge reaches the commit limit (RAM plus page
+    file), whatever physical memory is free.  On a workstation with a 2 GiB
+    page file free commit ran 5 GiB below free physical memory, and a
+    31.6 MiB allocation failed while another run held ~10 GiB.
+    """
 
     try:
         import psutil
@@ -1148,11 +1155,35 @@ def _psutil_available_bytes() -> 'Optional[int]':
         value = int(psutil.virtual_memory().available)
     except Exception:
         return None
+    commit = _windows_commit_available_bytes()
+    if commit is not None:
+        value = min(value, commit)
     return value if value >= 0 else None
 
 
+def _windows_commit_available_bytes() -> 'Optional[int]':
+    """Bytes this process can still commit (``ullAvailPageFile``), Windows only."""
+
+    status = _windows_memory_status()
+    if status is None or status.ullTotalPageFile <= 0:
+        return None
+    return int(status.ullAvailPageFile)
+
+
 def _windows_available_bytes() -> 'Optional[int]':
-    """Windows ``ullAvailPhys`` fallback when psutil is unavailable."""
+    """Windows ``ullAvailPhys`` fallback when psutil is unavailable, bounded by commit."""
+
+    status = _windows_memory_status()
+    if status is None:
+        return None
+    available = int(status.ullAvailPhys)
+    if status.ullTotalPageFile > 0:
+        available = min(available, int(status.ullAvailPageFile))
+    return available
+
+
+def _windows_memory_status():
+    """``GlobalMemoryStatusEx`` of this host, or None off Windows or on failure."""
 
     if os.name != "nt":
         return None
@@ -1180,7 +1211,7 @@ def _windows_available_bytes() -> 'Optional[int]':
         return None
     if not success:
         return None
-    return int(status.ullAvailPhys)
+    return status
 
 
 def _posix_available_bytes() -> 'Optional[int]':
@@ -1304,9 +1335,13 @@ def _slurm_available_bytes() -> 'Optional[int]':
 
     ``SLURM_MEM_PER_NODE`` is the job's memory on this node, shared by all of
     its local processes; ``SLURM_MEM_PER_CPU`` times the task's CPUs is one
-    task's share.  The resident memory of every local process drawing on that
-    allocation (this process, its pool workers, sibling tasks of the job) is
-    subtracted, not only this process's own.
+    task's share.  Without ``SLURM_CPUS_PER_TASK`` (``--exclusive`` without
+    ``--cpus-per-task``), ``SLURM_MEM_PER_CPU`` times ``SLURM_CPUS_ON_NODE`` is
+    the job's memory on the node, shared like ``SLURM_MEM_PER_NODE``: one CPU's
+    share gave a 3.35 GiB solve limit on a 414 GiB node.  The resident memory
+    of every local process drawing on that allocation (this process, its pool
+    workers, sibling tasks of the job) is subtracted, not only this process's
+    own.
     """
 
     capacity_mb = None
@@ -1317,11 +1352,15 @@ def _slurm_available_bytes() -> 'Optional[int]':
     else:
         raw = os.environ.get("SLURM_MEM_PER_CPU", "").strip()
         cpus_text = os.environ.get("SLURM_CPUS_PER_TASK", "").strip()
+        node_text = os.environ.get("SLURM_CPUS_ON_NODE", "").strip()
         sharing = ("SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_PROCID")
 
 
         if raw.isdigit() and int(raw) > 0:
-            if not cpus_text:
+            if not cpus_text and node_text.isdigit() and int(node_text) > 0:
+                cpus = int(node_text)
+                sharing = ("SLURM_JOB_ID",)
+            elif not cpus_text:
                 cpus = 1
             elif cpus_text.isdigit() and int(cpus_text) > 0:
                 cpus = int(cpus_text)
@@ -1350,30 +1389,58 @@ def _read_cgroup_int(path: 'str') -> 'Optional[int]':
     return value
 
 
-def _cgroup_available_bytes() -> 'Optional[int]':
-    """Remaining bytes under a cgroup v2 or v1 memory limit.
+def _read_cgroup_text(path: 'str') -> 'str':
+    with open(path) as stream:
+        return stream.read()
 
-    When the limit is readable but the usage is not, this process's own
-    resident memory is the known lower bound on usage (the host probe still
-    bounds the result); refusing every solve would turn an unreadable
-    counter into a hard failure.
+
+def _cgroup_memory_groups():
+    """This process's nested memory cgroups, innermost first (execution.cgroup)."""
+
+    from ghost_backend.execution.cgroup import memory_groups
+    return memory_groups(_read_cgroup_text)
+
+
+def _cgroup_available_bytes() -> 'Optional[int]':
+    """Remaining bytes under this process's cgroup v2 or v1 memory limits.
+
+    The process's own group and each ancestor with a limit count, and the
+    tightest headroom wins: a SLURM job or systemd unit is a nested group
+    whose limit the mount root does not show.  The mount root (the group
+    inside a cgroup namespace) is the fallback when no nested group has one.
+    Usage excludes reclaimable page cache (``inactive_file``), which the
+    group is charged for but gives up under pressure (mapped spill files,
+    written outputs).  When the limit is readable but the usage is not, this
+    process's own resident memory is the known lower bound on usage (the
+    host probe still bounds the result); refusing every solve would turn an
+    unreadable counter into a hard failure.
     """
 
-    for limit_path, usage_path in (
-        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
-        (
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-        ),
-    ):
+    from ghost_backend.execution.cgroup import root_groups, stat_value
+
+    def headroom(limit_path, usage_path, stat_path, reclaimable_key):
         limit = _read_cgroup_int(limit_path)
         if limit is None:
-            continue
+            return None
         usage = _read_cgroup_int(usage_path)
         if usage is None:
             usage = _process_rss_bytes()
+        else:
+            reclaimable = stat_value(_read_cgroup_text, stat_path, reclaimable_key) or 0
+            usage -= min(usage, reclaimable)
         return max(0, limit - usage)
-    return None
+
+    best = None
+    for group in _cgroup_memory_groups():
+        value = headroom(*group)
+        if value is not None:
+            best = value if best is None else min(best, value)
+    if best is None:
+        for group in root_groups():
+            best = headroom(*group)
+            if best is not None:
+                break
+    return best
 
 
 def _detect_available_gb() -> 'float':
@@ -1383,8 +1450,18 @@ def _detect_available_gb() -> 'float':
     limits.  Every 2-D memory quantity -- this availability, the solve limit
     (``_solve_memory_limit_gb``, ``GHOST_MAX_SOLVE_GB``, ``ram_budget_gib``)
     and the solve estimates (``_estimate_memory_gb``) -- is binary GiB; the
-    ``_gb`` names are historical.
+    ``_gb`` names are historical.  0.0 is also returned when no probe
+    answers; ``_available_memory_bounds`` tells the two apart.
     """
+
+    bounds = _available_memory_bounds()
+    if not bounds:
+        return 0.0
+    return float(min(bounds)) / _BYTES_PER_GIB
+
+
+def _available_memory_bounds() -> 'List[int]':
+    """Headroom in bytes from every probe that answered: host, SLURM, cgroup."""
 
     host_available = _psutil_available_bytes()
     if host_available is None:
@@ -1401,9 +1478,7 @@ def _detect_available_gb() -> 'float':
     cgroup_available = _cgroup_available_bytes()
     if cgroup_available is not None:
         bounds.append(max(0, cgroup_available))
-    if not bounds:
-        return 0.0
-    return float(min(bounds)) / _BYTES_PER_GIB
+    return bounds
 
 
 _MEMORY_LIMIT_FRACTION = 0.9
@@ -1427,8 +1502,15 @@ def _configured_solve_memory_limit_gb(resident_gb=0.0) -> 'float':
         except ValueError:
             value = 0.0
         if math.isfinite(value) and value > 0.0:
-            available = _detect_available_gb() if current_options() is not None else 0.0
-            return min(value, _MEMORY_LIMIT_FRACTION * available + resident_gb) if available > 0 else value
+            if current_options() is None:
+                return value
+            available = _detect_available_gb()
+            if available > 0:
+                return min(value, _MEMORY_LIMIT_FRACTION * available + resident_gb)
+            # Zero is an exhausted allocation when a probe answered it, and
+            # unknown availability when none did: only then does the explicit
+            # budget stand on its own.
+            return resident_gb if _available_memory_bounds() else value
     detected = _detect_available_gb()
     return _MEMORY_LIMIT_FRACTION * detected + resident_gb if detected > 0.0 else 0.0
 
@@ -1461,6 +1543,26 @@ def _memory_gate_message(
         + ("Review the saved RAM budget and current free memory before retrying."
            if current_options() is not None else
            "If a larger allocation is confirmed, set GHOST_MAX_SOLVE_GB to that explicit per-process limit and retry.")
+    )
+
+
+def _compressed_storage_gate(resources, context: 'str') -> 'None':
+    """Refuse, before assembly, a compressed solve whose storage exceeds its cap.
+
+    The compressed build and factor stop at the storage cap wherever it is
+    crossed (a paired P3 build failed after 30 s of assembly); the forecast
+    of ``_estimate_memory_gb`` says so first when its operator was sampled.
+    """
+
+    plan = (resources or {}).get('memory_estimate') or {}
+    if plan.get('storage_fits', True):
+        return
+    partner = ', its reserved polarization partner' if plan.get('partner_reserved_bytes') else ''
+    raise MemoryError(
+        f"{context} needs an estimated {plan['storage_required_bytes'] / _BYTES_PER_GIB:.2f} GiB of "
+        f"compressed storage (operator{partner} and inverse), but the compressed storage cap is "
+        f"{plan['storage_limit_bytes'] / _BYTES_PER_GIB:.2f} GiB. An automatic backend choice "
+        "tries the next admitted backend; otherwise use the dense backend or raise the cap."
     )
 
 
@@ -2355,6 +2457,7 @@ def solve_monostatic_rcs_2d_single_polarization(
             assembly=current_session()
             if assembly is not None:
                 assembly.compressed_partner=(mesh,_build_linear_coupled_infos(mesh,materials,freq_ghz,'TM',k0))
+                resources['compressed_partner'] = True
         est_gb = _estimate_memory_gb(
             resources["nodes"],
             use_cfie=False,
@@ -2380,6 +2483,7 @@ def solve_monostatic_rcs_2d_single_polarization(
             if state is not None:
                 state.memory_estimates.append(dict(method='paired_polarization_assembly',
                     partner_matrix_bytes=16*resources['system_dofs']**2,total_peak_gib=est_gb,admission_limit_gib=memory_limit_gb))
+        _compressed_storage_gate(resources, f"The {resources['formulation']} 2-D solve")
         if est_gb > memory_limit_gb:
             raise MemoryError(
                 _memory_gate_message(
@@ -3420,6 +3524,7 @@ def solve_bistatic_rcs_2d_single_polarization(
         est_gb += (len(inc_angles) * len(obs_angles) *
                    (1024 * len(frequencies) + 64)) / (1024 ** 3)
         memory_limit_gb = _solve_memory_limit_gb()
+        _compressed_storage_gate(resources, f"The {resources['formulation']} bistatic 2-D solve")
         if est_gb > memory_limit_gb:
             raise MemoryError(
                 _memory_gate_message(
@@ -4209,6 +4314,7 @@ def compute_boundary_densities(
         n_rhs=1,
     )
     memory_limit_gb = _solve_memory_limit_gb()
+    _compressed_storage_gate(resources, "Boundary-density diagnostics")
     if est_gb > memory_limit_gb:
         raise MemoryError(
             _memory_gate_message(

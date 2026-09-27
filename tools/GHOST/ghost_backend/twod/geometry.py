@@ -1465,6 +1465,13 @@ SURFACE_WAVE_MAX_DENSITY_FACTOR = 4.0
 SURFACE_WAVE_MAX_UNRESOLVED_FACTOR = 12.0
 # A tapered law is sampled at this many points along its segment.
 SURFACE_WAVE_TAPER_SAMPLES = 9
+# A free TYPE 1 card (air on both sides) guides the bound wave of an opaque
+# surface of twice its impedance: the field that is even about the card sees 2Z
+# on each side, and the odd field does not see the card. A closed 1-lambda
+# square card at 20 panels per wavelength had 6.4 % field error at 2+600j and
+# 45 % at 2+1000j ohm (TE, index 3.3 and 5.4); both certified runs failed.
+SURFACE_WAVE_SHEET_IMPEDANCE_FACTOR = 2.0
+_SURFACE_WAVE_TYPES = _OPAQUE_CONDUCTOR_TYPES + (1,)
 
 
 def _bound_surface_wave_index(
@@ -1501,9 +1508,13 @@ def _bound_surface_wave_index(
 
 def _segment_surface_wave_index(materials, seg_type: 'int', ibc_flag: 'int',
                                 pos_mat: 'int', freq_ghz: 'float') -> 'float':
-    """Largest bound-wave index of an opaque conductor segment's law at one frequency."""
+    """Largest bound-wave index of a segment's surface law at one frequency.
 
-    if seg_type not in _OPAQUE_CONDUCTOR_TYPES or ibc_flag <= 0:
+    An opaque conductor (TYPE 2/4) guides the wave of its own law, a free
+    TYPE 1 card the wave of twice its law; a thin dielectric layer is 0.
+    """
+
+    if seg_type not in _SURFACE_WAVE_TYPES or ibc_flag <= 0:
         return 0.0
     model = materials.impedance_models.get(ibc_flag)
     if model is None or isinstance(model, ThinLayerDefinition):
@@ -1518,14 +1529,15 @@ def _segment_surface_wave_index(materials, seg_type: 'int', ibc_flag: 'int',
         values = [materials.get_impedance(ibc_flag, freq_ghz, arc_s=float(s)) for s in positions]
     except ValueError:
         return 0.0      # an unevaluable law or medium: the field solve reports it
-    return max(_bound_surface_wave_index(z, eps, mu) for z in values)
+    factor = SURFACE_WAVE_SHEET_IMPEDANCE_FACTOR if seg_type == 1 else 1.0
+    return max(_bound_surface_wave_index(factor * z, eps, mu) for z in values)
 
 
 def _surface_wave_mesh_wavelength(material_wavelength: 'float', materials, seg_type: 'int',
                                   ibc_flag: 'int', pos_mat: 'int', frequencies) -> 'float':
     """Mesh wavelength of a segment: its material wavelength or its bound surface wavelength."""
 
-    if materials is None or not frequencies or seg_type not in _OPAQUE_CONDUCTOR_TYPES or ibc_flag <= 0:
+    if materials is None or not frequencies or seg_type not in _SURFACE_WAVE_TYPES or ibc_flag <= 0:
         return material_wavelength
     shortest = material_wavelength
     for freq_ghz in frequencies:

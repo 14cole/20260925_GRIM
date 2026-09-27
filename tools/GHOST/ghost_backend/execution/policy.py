@@ -36,10 +36,14 @@ def rank_candidates(candidates, budget_gib, margin=.2):
     for mode,c in available.items():
         if mode not in BACKENDS or any(not math.isfinite(float(c[k])) or c[k] <= 0 for k in ('cost','peak_gb')):
             raise ValueError('Invalid automatic backend forecast.')
-    fitting=[m for m,c in available.items() if c['peak_gb'] <= (1-margin)*budget_gib]
-    if not fitting:
-        fitting=[m for m,c in available.items() if c['peak_gb'] <= budget_gib]
-    if not fitting:
+    admitted=[m for m,c in available.items() if c['peak_gb'] <= budget_gib]
+    if not admitted:
         description=', '.join('{} {:.2f} GiB'.format(m,c['peak_gb']) for m,c in available.items())
         raise MemoryError('No compatible backend fits the {:.2f} GiB solve budget ({}).'.format(budget_gib,description))
-    return sorted(fitting,key=lambda m:(available[m]['cost'],BACKENDS.index(m)))
+    # Backends inside the margin lead. Every other backend that fits the budget
+    # stays in the order as a retry: dropping it let a compressed build that
+    # failed late end the run although dense (5.7 GiB measured against its
+    # 7.9 GiB forecast) fit the 9 GiB budget.
+    key=lambda m:(available[m]['cost'],BACKENDS.index(m))
+    margin_fitting=[m for m in admitted if available[m]['peak_gb'] <= (1-margin)*budget_gib]
+    return sorted(margin_fitting,key=key)+sorted((m for m in admitted if m not in margin_fitting),key=key)

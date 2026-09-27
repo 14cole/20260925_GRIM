@@ -1099,9 +1099,21 @@ def _integrate_linear_pair_adaptive_sk(
     Failure at ``max_depth`` is explicit: silently accepting an unresolved
     close-gap interaction can produce a small linear-system residual for the
     wrong discrete operator.
+
+    The K'/D error is judged against the larger of its own child norms and
+    the S child norms over the longer panel length, the size a K'/D block
+    has when the panels are not aligned.  Two collinear panels have an
+    exactly zero K'/D block; on a line that is not axis-aligned it evaluates
+    to rounding noise, which judged against its own norm never converges.
+    S is therefore evaluated whenever K'/D is, and returned only on request.
     """
 
     zero = np.zeros((2, 2), dtype=np.complex128)
+    floor = np.finfo(float).eps * max(
+        1.0,
+        float(obs_elem.length) * float(src_elem.length),
+    )
+    longer = max(float(obs_elem.length), float(src_elem.length), EPS)
 
     def evaluate(
         obs_interval: 'Tuple[float, float]',
@@ -1116,22 +1128,16 @@ def _integrate_linear_pair_adaptive_sk(
             src_interval=src_interval,
             obs_order=obs_order,
             src_order=src_order,
-            compute_single_layer=compute_single_layer,
+            compute_single_layer=compute_single_layer or compute_double_layer,
             compute_double_layer=compute_double_layer,
         )
 
     def relative_error(
         coarse: 'np.ndarray',
         children: 'List[np.ndarray]',
+        scale_norm: 'float',
     ) -> 'float':
-
-
         fine = sum(children, zero.copy())
-        scale_norm = sum(float(np.linalg.norm(block)) for block in children)
-        floor = np.finfo(float).eps * max(
-            1.0,
-            float(obs_elem.length) * float(src_elem.length),
-        )
         return float(np.linalg.norm(fine - coarse)) / max(scale_norm, floor)
 
     def recurse(
@@ -1156,12 +1162,15 @@ def _integrate_linear_pair_adaptive_sk(
         child_blocks = [evaluate(oi, si) for oi, si in child_intervals]
         s_children = [block[0] for block in child_blocks]
         k_children = [block[1] for block in child_blocks]
+        s_norm = sum(float(np.linalg.norm(block)) for block in s_children)
         err_s = (
-            relative_error(coarse_s, s_children)
+            relative_error(coarse_s, s_children, s_norm)
             if compute_single_layer else 0.0
         )
         err_k = (
-            relative_error(coarse_k, k_children)
+            relative_error(coarse_k, k_children, max(
+                sum(float(np.linalg.norm(block)) for block in k_children),
+                s_norm / longer))
             if compute_double_layer else 0.0
         )
         error = max(err_s, err_k)
@@ -1192,7 +1201,8 @@ def _integrate_linear_pair_adaptive_sk(
             k_total += child_k
         return s_total, k_total
 
-    return recurse((0.0, 1.0), (0.0, 1.0), depth=0)
+    s_block, k_block = recurse((0.0, 1.0), (0.0, 1.0), depth=0)
+    return (s_block if compute_single_layer else zero.copy()), k_block
 
 _TANGENT_OUTER = np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=np.complex128)
 

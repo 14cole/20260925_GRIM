@@ -350,6 +350,33 @@ def _primitive_breaks(chain: '_SegChain', index: 'int', count: 'int') -> 'List[f
     return breaks
 
 
+def _conductor_mesh(ordered, lam_target: 'float', max_elements: 'int', axis_tol: 'float',
+                    materials, freq_ghz: 'float'):
+    """``(points, per-element impedance)`` of a conductor or sheet solve (0 on PEC)."""
+
+    pts, elem_seg, elem_arc = _mesh_generatrix(ordered, lam_target, max_elements, axis_tol)
+    zs_elem = np.zeros(len(pts) - 1, dtype=complex)
+    for ei in range(len(zs_elem)):
+        chain = ordered[elem_seg[ei]]
+        if chain.ibc_flag > 0:
+            zs_elem[ei] = materials.get_impedance(
+                chain.ibc_flag, freq_ghz, arc_s=float(elem_arc[ei]))
+    return pts, zs_elem
+
+
+def _mirror_priced(points, element_values, n_dofs: 'int', n_rhs: 'int') -> 'bool':
+    """Whether a single-surface conductor solve factors its modes as mirror halves.
+
+    The preview side of solve_bor's ``mirror`` argument: the solve splits a
+    mirror-symmetric generatrix when the halves pay (``mirror_split_pays``),
+    and its admission then prices two matrices per mode worker, not three.
+    """
+
+    from ghost_backend.bor.solver import generatrix_mirror_symmetric, mirror_split_pays
+    return bool(mirror_split_pays(n_dofs, n_rhs)
+                and generatrix_mirror_symmetric(points, element_values))
+
+
 def _mesh_generatrix(ordered: 'List[_SegChain]', lam_target: 'float',
                      max_elements: 'int', axis_tol: 'float'):
     """Subdivide the ordered chains into elements.  Returns (points [Nn,2],
@@ -691,8 +718,8 @@ def _direct_dense_plan(supplied, layout, modes, order):
     from ghost_backend.bor.solver import (conductor_operator_kinds,
         estimate_bor_cross_table_gb, estimate_bor_table_gb, plan_bor_mode_workers)
     from ghost_backend.bor.streaming import (BOR_STREAM_TILE_BUDGET_GB,
-        combined_stream_mode_gb, estimate_streaming_block_gb,
-        plan_combined_streaming_mode_block, plan_streaming_mode_block)
+        combined_stream_mode_gb, compressed_self_store_gb, estimate_streaming_block_gb,
+        plan_combined_streaming_mode_block, plan_streaming_mode_block, self_stream_spec)
     from ghost_backend.twod.solver import _solve_memory_limit_gb
     workers = max(1, int(supplied.get('workers') or 1))
     assembly = str(supplied.get('assembly', 'auto')).strip().lower()
@@ -743,27 +770,39 @@ def _direct_dense_plan(supplied, layout, modes, order):
         if streaming:
             specs = []
             for elements, conductor in plain:
-                specs += [(elements, elements, True, False)] * (1 if conductor else 2)
+                specs += [self_stream_spec(elements, True)] * (1 if conductor else 2)
             # One streamed cross per surface pair: the reverse is derived.
             specs += [(a, b, True, False) for i, (a, _) in enumerate(plain)
                       for j, (b, _) in enumerate(plain) if i < j]
             plan = plan_combined_streaming_mode_block(modes, tuple(specs), budget, workers)
             # The solve's spill decision; exact for the coated solve, the
             # junction layouts as estimate_bor_resources prices them.
-            always_built = [(elements, elements, not conductor, False)
+            always_built = [self_stream_spec(elements, not conductor)
                             for elements, conductor in plain
                             for _side in range(1 if conductor else 2)]
             _, held, workers, _, _, _ = _mirror_stream_spill(
                 plan, workers, modes, combined_stream_mode_gb(modes, specs), exact=coated,
-                surely_short=(modes + 1) * combined_stream_mode_gb(modes, always_built) > budget)
+                surely_short=(modes + 1) * combined_stream_mode_gb(modes, always_built) > budget,
+                fixed_gb=compressed_self_store_gb(modes, specs))
             assembly_peak = held + BOR_STREAM_TILE_BUDGET_GB
         else:
             assembly_peak = _table_plan_peak_gb(decision if coated else decision - auxiliary, plain, modes, order)
     direct_output = estimate_output_gb(1, np.size(supplied['thetas_deg']))
+    # solve_bor gives its mode factors coordinates and splits a mirror-symmetric
+    # generatrix; its admission prices those factors, and so does this plan
+    # (a plain-LU price of 3 matrices per worker instead of 2 sent solves that
+    # fit dense to the compressed backend).
+    hierarchical = mirrored = False
+    if len(layout) == 1 and layout[0][1]:
+        hierarchical = True
+        pieces = [piece for piece, _ in _direct_pieces(supplied)]
+        mirrored = len(pieces) == 1 and _mirror_priced(
+            pieces[0], (supplied.get('zs'), supplied.get('sheet_zs')), dofs, rhs)
     # The same process limit as the snapshot chooser and the 2-D entries.
     plan = plan_bor_mode_workers(dofs, rhs, workers, modes + 1,
                                  assembly_peak + auxiliary + max(output_reserved_gb(), direct_output),
-                                 memory_limit_gb=_solve_memory_limit_gb())
+                                 memory_limit_gb=_solve_memory_limit_gb(),
+                                 hierarchical=hierarchical, mirrored=mirrored)
     plan['assumed_assembly'] = 'streaming' if streaming else 'tables'
     return plan
 
@@ -1040,8 +1079,10 @@ def estimate_bor_resources(
     elif kind == "coated":
         from ghost_backend.bor.streaming import (
             BOR_STREAM_TILE_BUDGET_GB,
-            estimate_rectangular_streaming_gb,
+            combined_stream_all_modes_gb,
             plan_combined_streaming_mode_block,
+            self_stream_spec,
+            with_stream_precision,
         )
 
         outer_elements = int(surface_layout[0][0])
@@ -1057,23 +1098,15 @@ def estimate_bor_resources(
             # As solve_bor_coated_pec streams: the core-to-outer blocks are
             # derived from the outer-to-core ones, not streamed.
             stream_specs_double = (
-                (outer_elements, outer_elements, True, False),
-                (outer_elements, outer_elements, True, False),
-                (core_elements, core_elements, True, False),
+                self_stream_spec(outer_elements, True),
+                self_stream_spec(outer_elements, True),
+                self_stream_spec(core_elements, True),
                 (outer_elements, core_elements, True, False),
             )
-            full_double = sum(
-                estimate_rectangular_streaming_gb(
-                    nt, ns, mode_cap, rotated, single
-                )
-                for nt, ns, rotated, single in stream_specs_double
-            )
+            full_double = combined_stream_all_modes_gb(mode_cap, stream_specs_double)
             use_single = precision == "single"
             persistent_gb = full_double / (2.0 if use_single else 1.0)
-            stream_specs = tuple(
-                (nt, ns, rotated, use_single)
-                for nt, ns, rotated, _single in stream_specs_double
-            )
+            stream_specs = with_stream_precision(stream_specs_double, use_single)
             (
                 stream_mode_block,
                 held_assembly_gb,
@@ -1083,10 +1116,12 @@ def estimate_bor_resources(
             )
             # These are exactly the solve's streams: mirror its spill.
             from ghost_backend.bor.streaming import combined_stream_mode_gb
+            from ghost_backend.bor.streaming import compressed_self_store_gb
             (stream_mode_block, held_assembly_gb, effective_workers, spill_gb,
              spill_candidate_gb, spill_directory) = _mirror_stream_spill(
                 (stream_mode_block, held_assembly_gb, effective_workers),
-                worker_count, mode_cap, combined_stream_mode_gb(mode_cap, stream_specs))
+                worker_count, mode_cap, combined_stream_mode_gb(mode_cap, stream_specs),
+                fixed_gb=compressed_self_store_gb(mode_cap, stream_specs))
             assembly_peak_gb = (
                 held_assembly_gb + BOR_STREAM_TILE_BUDGET_GB
             )
@@ -1104,8 +1139,10 @@ def estimate_bor_resources(
     else:
         from ghost_backend.bor.streaming import (
             BOR_STREAM_TILE_BUDGET_GB,
-            estimate_rectangular_streaming_gb,
+            combined_stream_all_modes_gb,
             plan_combined_streaming_mode_block,
+            self_stream_spec,
+            with_stream_precision,
         )
 
 
@@ -1139,9 +1176,7 @@ def estimate_bor_resources(
 
 
                 for _side in range(1 if is_conductor else 2):
-                    stream_specs_double.append(
-                        (int(elements), int(elements), True, False)
-                    )
+                    stream_specs_double.append(self_stream_spec(elements, True))
             # One streamed cross per surface pair; the reverse is derived.
             for test_index, (test_elements, _test_cond) in enumerate(surface_layout):
                 for source_index, (source_elements, _source_cond) in enumerate(surface_layout):
@@ -1149,17 +1184,9 @@ def estimate_bor_resources(
                         stream_specs_double.append((
                             int(test_elements), int(source_elements), True, False
                         ))
-            full_far_double = sum(
-                estimate_rectangular_streaming_gb(
-                    nt, ns, mode_cap, rotated, False
-                )
-                for nt, ns, rotated, _single in stream_specs_double
-            )
+            full_far_double = combined_stream_all_modes_gb(mode_cap, stream_specs_double)
             use_single = precision == "single"
-            stream_specs = tuple(
-                (nt, ns, rotated, use_single)
-                for nt, ns, rotated, _single in stream_specs_double
-            )
+            stream_specs = with_stream_precision(stream_specs_double, use_single)
             (
                 stream_mode_block,
                 held_far_gb,
@@ -1176,16 +1203,18 @@ def estimate_bor_resources(
             # mode either.
             from ghost_backend.bor.streaming import combined_stream_mode_gb
             always_built = tuple(
-                (int(elements), int(elements), not is_conductor, use_single)
+                self_stream_spec(elements, not is_conductor, use_single)
                 for elements, is_conductor in surface_layout
                 for _side in range(1 if is_conductor else 2))
+            from ghost_backend.bor.streaming import compressed_self_store_gb
             (stream_mode_block, held_far_gb, effective_workers, spill_gb,
              spill_candidate_gb, spill_directory) = _mirror_stream_spill(
                 (stream_mode_block, held_far_gb, effective_workers),
                 worker_count, mode_cap, combined_stream_mode_gb(mode_cap, stream_specs),
                 exact=False,
                 surely_short=(mode_cap + 1) * combined_stream_mode_gb(mode_cap, always_built)
-                > stream_budget)
+                > stream_budget,
+                fixed_gb=compressed_self_store_gb(mode_cap, stream_specs))
             full_far_gb = full_far_double / (2.0 if use_single else 1.0)
             persistent_gb = (
                 full_far_gb + auxiliary_estimate["retained_gb"]
@@ -1220,11 +1249,21 @@ def estimate_bor_resources(
         assembly_peak_gb += auxiliary_estimate['peak_gb']
         persistent_gb += auxiliary_estimate['retained_gb']
 
+    # A conductor or sheet solve (solve_bor) factors its modes hierarchically
+    # when large and as mirror halves on a mirror-symmetric generatrix; its
+    # admission prices those factors, so the preview does too.
+    hierarchical = mirrored = False
+    if kind in ('conductor', 'sheet'):
+        hierarchical = True
+        points, zs_elem = _conductor_mesh(groups[0], wavelength, max_elements, _axis_tol,
+                                          materials, frequency)
+        mirrored = _mirror_priced(points, (zs_elem,), unknowns, 2 * int(aspects.size))
     # The largest single preparation call decides the near backend, exactly
     # as the executor does, so preview charges process workers only if used.
     worker_plan = plan_bor_mode_workers(unknowns, 2 * int(aspects.size),
         effective_workers, mode_cap + 1, assembly_peak_gb + output_gb,
-        near_pairs=max(pair_counts.values(), default=0))
+        near_pairs=max(pair_counts.values(), default=0),
+        hierarchical=hierarchical, mirrored=mirrored)
     active_modes = worker_plan['workers']
     near_plan = worker_plan['near_preparation']
     peak_gb = worker_plan['estimated_peak_gb']
@@ -1682,7 +1721,7 @@ def _layout_storage(surface_layout, mode_cap, pair_counts=None, kinds=None, gaus
 
 def _mirror_stream_spill(plan, requested_workers: 'int', mode_cap: 'int',
                          per_mode_gb: 'float', exact: 'bool' = True,
-                         surely_short: 'bool' = True):
+                         surely_short: 'bool' = True, fixed_gb: 'float' = 0.0):
     """A streamed ``(mode block, held GB, workers)`` plan after the spill decision.
 
     Every streamed BoR solve applies ``plan_stream_spill`` to its plan: when
@@ -1700,7 +1739,8 @@ def _mirror_stream_spill(plan, requested_workers: 'int', mode_cap: 'int',
     when ``surely_short`` (the streams the solve always builds cannot hold
     every mode either); otherwise a plan short of every mode keeps its
     in-memory block and prices every requested worker, the union of both
-    outcomes.
+    outcomes.  ``fixed_gb`` is resident whatever the decision (compressed
+    self stores, which never spill).
     """
     from ghost_backend.bor.streaming import plan_stream_spill, stream_spill_candidate_gb
     mode_block, held_gb, workers = plan
@@ -1708,7 +1748,8 @@ def _mirror_stream_spill(plan, requested_workers: 'int', mode_cap: 'int',
     candidate = stream_spill_candidate_gb(mode_block, mode_count, per_mode_gb)
     base, spilled_block, resident_gb = plan_stream_spill(mode_block, mode_count, per_mode_gb)
     if base is not None and (exact or surely_short):
-        return spilled_block, resident_gb, int(requested_workers), candidate, candidate, str(base)
+        return (spilled_block, resident_gb + float(fixed_gb), int(requested_workers),
+                candidate, candidate, str(base))
     if candidate > 0.0 and not exact:
         workers = int(requested_workers)
     return mode_block, held_gb, workers, 0.0, candidate, None
@@ -1958,15 +1999,8 @@ def solve_monostatic_rcs_bor(
                     pass
 
         if kind in {"conductor", "sheet"}:
-            ordered = groups[0]
-            pts, elem_seg, elem_arc = _mesh_generatrix(ordered, lam0,
-                                                       max_elements, axis_tol)
-            zs_elem = np.zeros(len(pts) - 1, dtype=complex)
-            for ei in range(len(zs_elem)):
-                c = ordered[elem_seg[ei]]
-                if c.ibc_flag > 0:
-                    zs_elem[ei] = materials.get_impedance(
-                        c.ibc_flag, freq_ghz, arc_s=float(elem_arc[ei]))
+            pts, zs_elem = _conductor_mesh(groups[0], lam0, max_elements, axis_tol,
+                                           materials, freq_ghz)
             has_ibc = bool(np.any(np.abs(zs_elem) > 0.0))
             form = "efie" if kind == "sheet" else _conductor_formulation(zs_elem)
             out = solve_bor(pts, freq_hz, aspects, formulation=form,

@@ -3550,10 +3550,13 @@ def _plan_multisurface_assembly(
 
     from ghost_backend.bor.streaming import (
         BOR_STREAM_TILE_BUDGET_GB,
+        combined_stream_all_modes_gb,
         combined_stream_mode_gb,
-        estimate_rectangular_streaming_gb,
+        compressed_self_store_gb,
         plan_combined_streaming_mode_block,
         plan_stream_spill,
+        self_stream_spec,
+        with_stream_precision,
     )
 
     requirements = tuple(solver_requirements)
@@ -3601,12 +3604,7 @@ def _plan_multisurface_assembly(
 
     if use_streaming:
         stream_specs_double = tuple(
-            (
-                int(solver.gen.n_elems),
-                int(solver.gen.n_elems),
-                bool(mfie or ibc),
-                False,
-            )
+            self_stream_spec(solver.gen.n_elems, bool(mfie or ibc), families=(mfie, ibc))
             for solver, efie, mfie, ibc in merged_requirements
             if efie or mfie or ibc
         ) + tuple(
@@ -3618,17 +3616,9 @@ def _plan_multisurface_assembly(
             )
             for cross in crosses
         )
-        full_far_double = sum(
-            estimate_rectangular_streaming_gb(
-                nt, ns, int(m_max), rotated, False
-            )
-            for nt, ns, rotated, _single in stream_specs_double
-        )
+        full_far_double = combined_stream_all_modes_gb(int(m_max), stream_specs_double)
         use_single = precision == "single"
-        stream_specs = tuple(
-            (nt, ns, rotated, use_single)
-            for nt, ns, rotated, _single in stream_specs_double
-        )
+        stream_specs = with_stream_precision(stream_specs_double, use_single)
         mode_block, held_far_gb, effective_workers = (
             plan_combined_streaming_mode_block(
                 int(m_max), stream_specs, budget, worker_count
@@ -3639,7 +3629,8 @@ def _plan_multisurface_assembly(
         spill, mode_block, resident_gb = plan_stream_spill(
             mode_block, int(m_max) + 1, combined_stream_mode_gb(m_max, stream_specs))
         if spill is not None:
-            held_far_gb = resident_gb
+            # Compressed self stores never spill.
+            held_far_gb = resident_gb + compressed_self_store_gb(m_max, stream_specs)
             effective_workers = worker_count
         auxiliary_peak_gb = estimate_bor_operator_storage_gb(
             m_max,
@@ -3706,33 +3697,53 @@ def mirror_split_pays(n_dofs: 'int', n_rhs: 'int') -> 'bool':
     return int(n_dofs) > 4 * int(n_rhs)
 
 
-def mirror_map(solver, element_values=()) -> 'Optional[Callable]':
-    """``mirror(m) -> (target, sign)`` for a surface symmetric about a plane normal
-    to the axis, or None.
+def generatrix_mirror_symmetric(nodes, element_values=()) -> 'bool':
+    """Whether a generatrix is symmetric about a plane normal to the axis.
 
     The reflection z -> 2 z0 - z must map the nodes onto themselves with the
-    traversal reversed (node ``i`` to node ``Nn - 1 - i``), and every
-    per-element property in ``element_values`` (impedances, sheet values;
-    None entries are ignored) onto itself.  A reduced unknown maps to the same
-    component of the mirrored node, ``J_t`` with sign -1 (the tangent reverses)
-    and ``J_phi`` with +1; at an axis pole of ``|m| = 1`` the reduced ``t``
-    unknown carries its tied ``phi`` component along, with the same sign.
+    traversal reversed (node ``i`` to node ``Nn - 1 - i``), both ends must lie
+    on the axis or both off it, and every per-element property in
+    ``element_values`` (impedances, sheet values; None entries and scalars
+    are uniform) must read the same backwards.  The solve (:func:`mirror_map`)
+    and the dispatch previews share this test, so a preview prices the mirror
+    factors the solve will use.
     """
-    nodes = np.asarray(solver.gen.nodes, float)
-    Nn = int(solver.Nn)
+    from ghost_backend.bor.kernels import AXIS_TOL
+    nodes = np.asarray(nodes, float)
+    Nn = len(nodes)
+    if Nn < 4:
+        return False
     size = float(max(np.ptp(nodes[:, 1]), np.max(np.abs(nodes[:, 0])), 1e-300))
     z0 = 0.5 * (nodes[0, 1] + nodes[-1, 1])
     reflected = np.column_stack([nodes[::-1, 0], 2.0 * z0 - nodes[::-1, 1]])
-    if Nn < 4 or float(np.max(np.abs(reflected - nodes))) > MIRROR_NODE_TOLERANCE * size:
-        return None
-    if bool(solver.gen.node_on_axis(0)) != bool(solver.gen.node_on_axis(Nn - 1)):
-        return None
+    if float(np.max(np.abs(reflected - nodes))) > MIRROR_NODE_TOLERANCE * size:
+        return False
+    axis = AXIS_TOL * max(1.0, float(np.max(nodes[:, 0])))
+    if bool(nodes[0, 0] <= axis) != bool(nodes[-1, 0] <= axis):
+        return False
     for values in element_values:
         if values is None:
             continue
         values = np.asarray(values)
-        if len(values) != solver.gen.n_elems or not np.array_equal(values, values[::-1]):
-            return None
+        if values.ndim == 0:
+            continue
+        if len(values) != Nn - 1 or not np.array_equal(values, values[::-1]):
+            return False
+    return True
+
+
+def mirror_map(solver, element_values=()) -> 'Optional[Callable]':
+    """``mirror(m) -> (target, sign)`` for a surface symmetric about a plane normal
+    to the axis (:func:`generatrix_mirror_symmetric`), or None.
+
+    A reduced unknown maps to the same component of the mirrored node,
+    ``J_t`` with sign -1 (the tangent reverses) and ``J_phi`` with +1; at an
+    axis pole of ``|m| = 1`` the reduced ``t`` unknown carries its tied
+    ``phi`` component along, with the same sign.
+    """
+    if not generatrix_mirror_symmetric(solver.gen.nodes, element_values):
+        return None
+    Nn = int(solver.Nn)
 
     def mirror(m):
         active = np.flatnonzero(solver.basis_mask(m))
@@ -5242,10 +5253,13 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
 
     from ghost_backend.bor.streaming import (
         BOR_STREAM_TILE_BUDGET_GB,
+        combined_stream_all_modes_gb,
         combined_stream_mode_gb,
-        estimate_rectangular_streaming_gb,
+        compressed_self_store_gb,
         plan_combined_streaming_mode_block,
         plan_stream_spill,
+        self_stream_spec,
+        with_stream_precision,
     )
     tp = str(table_precision).strip().lower()
     if tp not in ("auto", "single", "double"):
@@ -5278,26 +5292,18 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
         or (asm == "auto" and table_far_double > 2.0)
     )
     stream_specs_double = (
-        (ne_outer, ne_outer, True, False),
-        (ne_outer, ne_outer, True, False),
-        (ne_core, ne_core, True, False),
+        self_stream_spec(ne_outer, True),
+        self_stream_spec(ne_outer, True),
+        self_stream_spec(ne_core, True),
         (ne_outer, ne_core, True, False),
     ) + (() if reverse_derived else ((ne_core, ne_outer, True, False),))
-    full_stream_double = sum(
-        estimate_rectangular_streaming_gb(
-            nt, ns, m_max, rotated, single
-        )
-        for nt, ns, rotated, single in stream_specs_double
-    )
+    full_stream_double = combined_stream_all_modes_gb(m_max, stream_specs_double)
     use_single = tp == "single"
     solve_workers = max(1, int(workers))
     mode_block = None
     stream_spill = None
     if use_streaming:
-        stream_specs = tuple(
-            (nt, ns, rotated, use_single)
-            for nt, ns, rotated, _single in stream_specs_double
-        )
+        stream_specs = with_stream_precision(stream_specs_double, use_single)
         mode_block, held_blocks_gb, solve_workers = (
             plan_combined_streaming_mode_block(
                 m_max, stream_specs, stream_budget, solve_workers
@@ -5308,7 +5314,8 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
         stream_spill, mode_block, resident_gb = plan_stream_spill(
             mode_block, m_max + 1, combined_stream_mode_gb(m_max, stream_specs))
         if stream_spill is not None:
-            held_blocks_gb = resident_gb
+            # Compressed self stores never spill.
+            held_blocks_gb = resident_gb + compressed_self_store_gb(m_max, stream_specs)
             solve_workers = max(1, int(workers))
         # The near contractions (self and cross) and their build workspace
         # stay resident when the far blocks stream, as solve_bor,
@@ -5833,18 +5840,25 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
                 if f_act[i]:
                     col[offset + Nn + i] = red; red += 1
 
+        # Only the currents through the junction circle (t) are tied: the
+        # junction basis carries the charge across it.  The phi currents flow
+        # around the circle, and each surface keeps its own end half-basis.
+        # Tying J_2phi = -J_dphi and J_1phi = +J_dphi forced both conductor
+        # pieces' phi current toward zero at every coating edge (a vacuum
+        # coating, which must be invisible, was 1.4 dB off at 6 elements per
+        # hemisphere and 0.16 dB untied, as the plain conductor mesh).
         assign(off_Jd, surf_mask(sd_e, d_jn_nodes, False))
         assign(off_M, surf_mask(sd_e, d_jn_nodes, True))
         t2, f2 = surf_mask(s2_L, c_jn_nodes, False)
         for jn in junctions:
-            t2[jn["c_node"]] = False; f2[jn["c_node"]] = False
+            t2[jn["c_node"]] = False
         assign(off_J2, (t2, f2))
         b_acts = []
         for bi, b in enumerate(bares):
             tb, fb = surf_mask(b, {n for (p, n) in b_jn_nodes if p == bi}, False)
             for jn in junctions:
                 if jn["bare"][0] == bi:
-                    tb[jn["bare"][1]] = False; fb[jn["bare"][1]] = False
+                    tb[jn["bare"][1]] = False
             b_acts.append((tb, fb))
             assign(off_J1[bi], (tb, fb))
 
@@ -5866,13 +5880,9 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
             cn = jn["c_node"]
             bi, bn = jn["bare"]
             master_t = col[off_Jd + dn]
-            master_f = col[off_Jd + Nd + dn]
             if master_t >= 0:
                 Q[off_J2 + cn, master_t] = 1.0
                 Q[off_J1[bi] + bn, master_t] = 1.0
-            if master_f >= 0:
-                Q[off_J2 + N2 + cn, master_f] = -1.0
-                Q[off_J1[bi] + N1[bi] + bn, master_f] = 1.0
         Q = Q.tocsr()
         _Q_cache[category] = Q
         return Q
@@ -6261,6 +6271,16 @@ class _MultiRegionBor:
             return Q
         jn_nodes = {(si, node) for jn in self.junctions for (si, node) in jn}
         slave = {(si, node) for jn in self.junctions for (si, node) in jn[1:]}
+        # The t currents of a slave are tied to its master: the junction basis
+        # carries the charge through the junction circle.  The phi currents
+        # flow around the circle; where three or more surfaces meet, each
+        # keeps its own end half-basis (J and M), as in the partial coating.
+        # Only a surface split into two pieces keeps its phi tie.  Tying phi
+        # at a coating patch's triple junction nearly doubled the error of a
+        # vacuum patch (1.82 against 0.98 dB at 6 elements, 0.92 with no
+        # patch at all).
+        own_phi = {(si, node) for jn in self.junctions if len(jn) > 2
+                   for (si, node) in jn[1:]}
 
 
         m_t_masked = {(si, node) for jn in self.junctions
@@ -6282,7 +6302,7 @@ class _MultiRegionBor:
                     f_act[end] = False
                 elif (si, end) in slave:
                     t_act[end] = False
-                    f_act[end] = False
+                    f_act[end] = (si, end) in own_phi
                 elif (si, end) in jn_nodes:
                     if is_m and (si, end) in m_t_masked:
                         t_act[end] = False
@@ -6316,6 +6336,7 @@ class _MultiRegionBor:
         for jn in self.junctions:
             sm, nm = jn[0]
             dir_m = self._dir(sm, nm)
+            split = len(jn) == 2
             for (ss, ns) in jn[1:]:
                 r = next(iter(set(self.adj[ss]) & set(self.adj[sm])))
                 sg_m, sg_s = self.sigma[(r, sm)], self.sigma[(r, ss)]
@@ -6325,14 +6346,14 @@ class _MultiRegionBor:
                 mf = col[self.off_J[sm] + self.Nn[sm] + nm]
                 if mt >= 0:
                     Q[self.off_J[ss] + ns, mt] = ct
-                if mf >= 0:
+                if mf >= 0 and split:
                     Q[self.off_J[ss] + self.Nn[ss] + ns, mf] = cf
                 if self.off_M[sm] is not None and self.off_M[ss] is not None:
                     mmt = col[self.off_M[sm] + nm]
                     mmf = col[self.off_M[sm] + self.Nn[sm] + nm]
                     if mmt >= 0:
                         Q[self.off_M[ss] + ns, mmt] = ct
-                    if mmf >= 0:
+                    if mmf >= 0 and split:
                         Q[self.off_M[ss] + self.Nn[ss] + ns, mmf] = cf
         Q = Q.tocsr()
         self._Q_cache[category] = Q

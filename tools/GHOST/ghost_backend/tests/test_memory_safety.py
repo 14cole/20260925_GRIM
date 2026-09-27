@@ -63,7 +63,8 @@ class AvailableMemoryDetectionTests(unittest.TestCase):
         # an unreadable usage counter no longer refuses every solve.
         with mock.patch.object(
             rcs, "_read_cgroup_int", side_effect=[4 * GIB, None]
-        ), mock.patch.object(rcs, "_process_rss_bytes", return_value=GIB):
+        ), mock.patch.object(rcs, "_process_rss_bytes", return_value=GIB), \
+                mock.patch.object(rcs, "_cgroup_memory_groups", return_value=[]):
             self.assertEqual(rcs._cgroup_available_bytes(), 3 * GIB)
 
     def test_slurm_mem_per_cpu_defaults_to_one_cpu_per_task(self):

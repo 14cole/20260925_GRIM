@@ -507,7 +507,8 @@ def configured_execution(function):
                 else:
                     if failures:
                         selection=dict(selection,initial_selection=selection['selected'],selected=mode,
-                                       failed_attempts=failures,reason='Selected after an admitted numerical/resource retry.')
+                                       retry_order=modes[index+1:],failed_attempts=failures,
+                                       reason='Selected after an admitted numerical/resource retry.')
                     return result
                 # Exception tracebacks no longer own failed native workspaces.
                 import gc
@@ -532,8 +533,11 @@ def configured_execution(function):
                 if adaptation.get('final_backend') and not per_frequency:
                     actual['factorization'] = adaptation['final_backend']
                     if selection is not None and selection['selected'] != actual['factorization']:
+                        order = [selection['selected']] + list(selection.get('retry_order', []))
+                        final = actual['factorization']
                         selection = dict(selection, initial_selection=selection['selected'],
-                            selected=actual['factorization'],
+                            selected=final,
+                            retry_order=order[order.index(final)+1:] if final in order else [],
                             reason='Backend reselected on the adaptive mesh; see adaptive_mesh steps for admission evidence.')
                 metadata['execution_options'] = actual
                 result['metadata'].setdefault('polynomial_degree', value['basis_order'])

@@ -162,6 +162,14 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
     Safety applies only to sampled operator storage. Structural inverse limits
     and phase workspaces are not multiplied again. floor_gb is a minimum total
     process reservation, not another copy of interpreter/geometry overhead.
+
+    The storage cap is a hard runtime limit: a co-polarized TE solve reserves
+    its spooled TM partner's bytes inside it (``resources['compressed_partner']``;
+    runtime.native/regional and CompressedFactor), so the partner is priced
+    too, taken as the size of this polarization's operator.  ``storage_fits``
+    is False when a sampled or exact operator, the partner and the inverse
+    ceiling exceed the cap, so the solve can be refused before assembly; a
+    dimensions-only ceiling (no sample) cannot say that.
     """
     if not math.isfinite(safety) or safety < 1 or not math.isfinite(floor_gb) or floor_gb < 0:
         raise ValueError('Compressed memory safety must be finite and >=1; floor must be finite and >=0.')
@@ -174,6 +182,9 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
     expected = sample['operator_bytes']
     operator = max(sample['operator_allowance_bytes'], int(math.ceil(expected*safety))) if sample['sampled'] else expected
     inverse, construction = inverse_storage(d)
+    partner = operator if resources.get('compressed_partner') else 0
+    required = operator+partner+inverse
+    known = bool(sample['sampled']) or sample['method'] == 'small_dense_ceiling'
 
     resident = min(storage_limit, operator+inverse)
     inverse_growth = max(0, construction-inverse)
@@ -209,4 +220,6 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
         storage_limit_bytes=int(storage_limit), temporary_disk_bytes=int(sample['operator_allowance_bytes']),
         temporary_disk_semantics='one partner estimate; exact payload depends on its material equations',
         storage_method=sample['method'], sampled=sample['sampled'], samples=sample['samples'],
-        safety=float(safety), floor_gb=float(floor_gb), forecast_is_hard_limit=False)
+        safety=float(safety), floor_gb=float(floor_gb), forecast_is_hard_limit=False,
+        partner_reserved_bytes=int(partner), storage_required_bytes=int(required),
+        storage_fits=bool(required <= storage_limit or not known))

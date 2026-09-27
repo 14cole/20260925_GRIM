@@ -1338,9 +1338,13 @@ def _release_spilled(array, ranges, flush: 'bool' = True) -> 'None':
 
     ``ranges`` are ``(start, stop)`` flat element offsets.  Only whole pages
     inside a range are released, so pages shared with data still being
-    written are never touched.  Windows removes pages from the working set
-    with ``VirtualUnlock`` on unlocked memory; POSIX with ``MADV_DONTNEED``,
-    which keeps the data of a shared file mapping in the page cache.  An
+    written are never touched.  Windows starts the write-back of the view
+    (``FlushViewOfFile`` returns without waiting) and removes the pages from
+    the working set with ``VirtualUnlock`` on unlocked memory.  POSIX drops
+    them with ``MADV_DONTNEED`` alone: the spill arrays are shared file
+    mappings, whose dirty pages stay in the page cache for the kernel to write
+    back.  ``flush`` is ignored there, because ``mmap.flush`` is a synchronous
+    ``msync`` per range (165 s instead of 0.7 s for a 1 GB store).  An
     in-memory array, or any failure, leaves the pages as they are.
     """
     mapping = getattr(array, "_mmap", None)
@@ -1353,7 +1357,7 @@ def _release_spilled(array, ranges, flush: 'bool' = True) -> 'None':
             start, stop = int(lo) * item, int(hi) * item
             if stop <= start:
                 continue
-            if flush:
+            if flush and os.name == "nt":
                 aligned = start - start % _SPILL_GRANULARITY
                 mapping.flush(aligned, stop - aligned)
             first = -(-start // _SPILL_PAGE) * _SPILL_PAGE
@@ -1580,17 +1584,81 @@ def stream_spill_candidate_gb(mode_block: 'int', mode_count: 'int',
     return int(mode_count) * float(per_mode_gb)
 
 
+def self_stream_spec(n_elements: 'int', rotated: 'bool', single: 'bool' = False,
+                     families=None):
+    """Requirement of a surface's own far stream in a combined plan.
+
+    The fifth entry marks a self stream: one of a surface with at least
+    ``FAR_COMPRESSION_MIN_NODES`` nodes is built as ``CompressedFarBlocks``
+    (every mode resident, never spilled), which the combined planners price
+    as a fixed all-mode store.  ``families`` is ``(mfie, ibc)`` when the
+    caller knows them (an impedance CFIE surface holds both); otherwise the
+    store holds the EFIE family and, when ``rotated``, one more.  Cross
+    streams stay four-tuples.
+    """
+    mark = True if families is None else tuple(bool(value) for value in families)
+    return (int(n_elements), int(n_elements), bool(rotated), bool(single), mark)
+
+
+def with_stream_precision(requirements, single: 'bool'):
+    """``requirements`` with their block precision set, self-stream marks kept."""
+    return tuple((nt, ns, rotated, bool(single)) + tuple(rest)
+                 for nt, ns, rotated, _single, *rest in requirements)
+
+
+def _split_compressed_self_streams(m_max: 'int', requirements):
+    """(streamed four-tuples, GB of the compressed self stores) of a combined plan.
+
+    A compressed self store holds the EFIE family and, when ``rotated``, the
+    MFIE bracket or rotated-PV family, like the rectangular estimate it
+    replaces; ``estimate_compressed_far_gb`` prices it for every mode.
+    """
+    from ghost_backend.bor.compressed_far import estimate_compressed_far_gb, far_compression_selected
+    streamed, fixed = [], 0.0
+    for nt, ns, rotated, single, *mark in requirements:
+        if mark and mark[0] and int(nt) == int(ns) and far_compression_selected(int(nt) + 1):
+            if mark[0] is True:
+                formulation, has_ibc = "efie", bool(rotated)
+            else:
+                mfie, ibc = mark[0]
+                formulation, has_ibc = ("cfie" if mfie else "efie"), bool(ibc)
+            fixed += (estimate_compressed_far_gb(int(nt), int(m_max), formulation, has_ibc)
+                      * (0.5 if single else 1.0))
+        else:
+            streamed.append((nt, ns, rotated, single))
+    return streamed, fixed
+
+
 def combined_stream_mode_gb(m_max: 'int', requirements) -> 'float':
-    """One mode of every stream of a combined plan, in GB.
+    """One mode of every spillable stream of a combined plan, in GB.
 
     ``requirements`` are those of :func:`plan_combined_streaming_mode_block`;
     streams that share one range also share one spill decision, priced with
-    this sum as ``per_mode_gb`` of :func:`plan_stream_spill`.
+    this sum as ``per_mode_gb`` of :func:`plan_stream_spill`.  Compressed self
+    stores never spill and are not a per-mode cost.
     """
+    streamed, _fixed = _split_compressed_self_streams(m_max, requirements)
     return sum(
         estimate_rectangular_streaming_block_gb(
             nt, ns, int(m_max), 1, bool(rotated), bool(single))
-        for nt, ns, rotated, single in requirements)
+        for nt, ns, rotated, single in streamed)
+
+
+def compressed_self_store_gb(m_max: 'int', requirements) -> 'float':
+    """GB of the compressed self stores of a combined plan: resident for every mode.
+
+    Callers that replace a plan's retained peak by a spill's resident modes
+    add these back: the stores never spill.
+    """
+    return _split_compressed_self_streams(m_max, requirements)[1]
+
+
+def combined_stream_all_modes_gb(m_max: 'int', requirements) -> 'float':
+    """Every mode of every stream of a combined plan, compressed self stores included, in GB."""
+    streamed, fixed = _split_compressed_self_streams(m_max, requirements)
+    return fixed + sum(
+        estimate_rectangular_streaming_gb(nt, ns, int(m_max), bool(rotated), bool(single))
+        for nt, ns, rotated, single in streamed)
 
 
 def _n_xi_efie(k: 'complex', rho_max: 'float', m_max: 'int', d_min: 'float' = 0.0) -> 'int':
@@ -2558,11 +2626,21 @@ def plan_combined_streaming_mode_block(
     """Plan one aligned range shared by several self/cross far streams.
 
     Each requirement is ``(test_elements, source_elements, has_rotated_pv,
-    single_blocks)``.  The returned retained peak is the sum of every stream's
-    current block; transient sampling tiles are budgeted separately by the
-    caller because streams are constructed sequentially.  ``workers`` are the
-    outer mode workers (range alignment only); the tiles of one build run on
-    :func:`streaming_tile_threads` threads within ``BOR_STREAM_TILE_BUDGET_GB``.
+    single_blocks)``, or a :func:`self_stream_spec`.  The returned retained
+    peak is the sum of every stream's current block; transient sampling tiles
+    are budgeted separately by the caller because streams are constructed
+    sequentially.  ``workers`` are the outer mode workers (range alignment
+    only); the tiles of one build run on :func:`streaming_tile_threads`
+    threads within ``BOR_STREAM_TILE_BUDGET_GB``.
+
+    A compressed self store (a surface of at least ``FAR_COMPRESSION_MIN_NODES``
+    nodes) holds every mode whatever the range and never spills: it is added
+    to the returned peak (:func:`compressed_self_store_gb`) but takes no part
+    in the range, the budget of streamed blocks or the worker alignment.
+    Pricing it as dense mode blocks under-priced the stores (4.6-9.1 GB
+    planned against 9.8-18.7 GB held) while shrinking the range: a coated
+    sphere ran 1 of 4 mode workers and 11 cross-stream builds, 17.6 s
+    instead of 10.9 s.
     """
 
     mm = int(m_max)
@@ -2572,6 +2650,9 @@ def plan_combined_streaming_mode_block(
         raise ValueError("Combined streaming planning needs modes and streams.")
     if not np.isfinite(budget) or budget <= 0.0:
         raise ValueError("Streaming block budget must be positive and finite.")
+    specs, fixed = _split_compressed_self_streams(mm, specs)
+    if not specs:
+        return mm + 1, fixed, min(max(1, int(workers)), mm + 1)
 
     def retained(block):
         return sum(
@@ -2608,7 +2689,7 @@ def plan_combined_streaming_mode_block(
             "Internal combined streaming planner error: aligned block "
             "exceeds its retained-memory budget."
         )
-    return aligned, held, effective_workers
+    return aligned, fixed + held, effective_workers
 
 
 def _self_efie_block_entries(nodes: 'float') -> 'float':
