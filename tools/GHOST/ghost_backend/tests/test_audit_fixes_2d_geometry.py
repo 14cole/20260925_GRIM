@@ -222,6 +222,13 @@ class SurfaceWaveDensityTests(unittest.TestCase):
 
     FREQUENCY = 3.0
 
+    def setUp(self):
+        # The counts below are the wavelength sizing alone; the squares' corners
+        # are also graded since 27 September (fix 18), which is tested there.
+        patcher = patch.object(g, 'EDGE_GRADING_MIN_PANELS', 10 ** 9)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_bound_wave_index(self):
         eta = g.ETA0
         index = g._bound_surface_wave_index
@@ -365,7 +372,8 @@ class HpEligibilityTests(unittest.TestCase):
         return _snapshot([_segment('c', _circle(radius, sides))])
 
     def test_predicted_size(self):
-        self.assertEqual(ag.predicted_hp_size([(10, False), (1, False), (9, True)]), (20, 3 + 1 + 9))
+        self.assertEqual(ag.predicted_hp_size([(10, False), (1, False), (9, True)]),
+                         (20, math.ceil(10 / ag.HP_COARSENING) + 1 + 9))
 
     def test_faceted_input_that_cannot_coarsen_is_refused(self):
         # one element per drawn primitive: the certified hp pair took 11.3 s against 6.9 s for P1
@@ -375,11 +383,11 @@ class HpEligibilityTests(unittest.TestCase):
         self.assertIn('Drawn primitives limit coarsening', reason)
 
     def test_coarsenable_polygon_is_admitted(self):
-        # 640 reference panels on 64 primitives (192 hp elements): previously refused as small,
-        # although the certified hp pair took 1.1 s against 3.1 s for P1
+        # 640 reference panels on 64 primitives (192 hp elements at coarsening 4, 128 at 6):
+        # previously refused as small, although the certified hp pair took 1.1 s against 3.1 s for P1
         materials = g.MaterialLibrary.from_entries([], [], '.')
         counts = g._reference_panel_counts(self._ngon(64, 0.5), 1.0, g.C0 / 3e9, materials, [3.0])
-        self.assertEqual(ag.predicted_hp_size(counts), (640, 192))
+        self.assertEqual(ag.predicted_hp_size(counts), (640, 64 * math.ceil(10 / ag.HP_COARSENING)))
         self.assertEqual(ag.eligible_snapshot(self._ngon(64, 0.5), materials, [3.0], 1.0, None), (True, ''))
         self.assertTrue(ag.eligible_snapshot(self._ngon(128, 0.5), materials, [3.0], 1.0, None)[0])
 

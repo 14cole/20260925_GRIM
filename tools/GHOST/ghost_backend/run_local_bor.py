@@ -103,7 +103,9 @@ STREAM_BUDGET_GB = 8.0            # maximum held streaming-block budget; the
 MESH_CERTIFICATION = True         # recommended: compare base/fine meshes;
                                   # False solves the base mesh only
 WORKERS_PER_UNIT = 4              # threads inside one BoR solve
-BLAS_THREADS_PER_WORKER = 1
+BLAS_THREADS_PER_WORKER = None    # None = each solve's CPU reservation,
+                                  # shared by its mode workers; an int pins
+                                  # every unit process to it
 
 # --- Memory admission ------------------------------------------------------
 # A local machine has far less RAM than a compute node and is usually running
@@ -425,13 +427,17 @@ def _solve_and_export_star(args: 'tuple') -> 'tuple':
     The optional fourth argument is the unit's CPU reservation.  Units run
     side by side in separate processes, and each would otherwise size its
     native thread teams, near-preparation workers and BLAS limits to the
-    whole host (``execution.options.allocated_cpu_budget``).
+    whole host (``execution.options.allocated_cpu_budget``).  A true fifth
+    argument widens BLAS to that reservation for the solve
+    (``BLAS_THREADS_PER_WORKER = None``).
     """
 
     unit, context, results_dir_str = args[:3]
     cpus = args[3] if len(args) > 3 else None
+    automatic_blas = bool(args[4]) if len(args) > 4 else False
     try:
-        with hpc_scheduler.cpu_allocation_scope(cpus):
+        with hpc_scheduler.cpu_allocation_scope(cpus), \
+                hpc_scheduler.unit_blas_scope(automatic_blas and cpus is not None):
             status, path = _solve_and_export(unit, context, results_dir_str)
         return ("ok", status, path)
     except Exception:
@@ -573,6 +579,8 @@ def _validate_config() -> 'List[float]':
         sys.exit("ERROR: MEMORY_HEADROOM must be in (0, 1].")
     if int(WORKERS_PER_UNIT) < 1:
         sys.exit("ERROR: WORKERS_PER_UNIT must be >= 1.")
+    if BLAS_THREADS_PER_WORKER is not None and int(BLAS_THREADS_PER_WORKER) < 1:
+        sys.exit("ERROR: BLAS_THREADS_PER_WORKER must be a positive integer or None.")
     if int(TASKS_PER_CHILD) < 1:
         sys.exit("ERROR: TASKS_PER_CHILD must be >= 1.")
     if WORKERS is not None and int(WORKERS) < 1:
@@ -584,7 +592,9 @@ def main() -> 'None':
     aspects = _validate_config()
     mesh_policy = accuracy_target_policy(ACCURACY_TARGET)
     pols = ["VV", "HH"]
-    hpc_scheduler.pin_blas_threads(int(BLAS_THREADS_PER_WORKER))
+    # Automatic units import on one thread and widen per solve
+    # (hpc_scheduler.unit_blas_scope).
+    hpc_scheduler.pin_blas_threads(int(BLAS_THREADS_PER_WORKER or 1))
     hpc_scheduler.install_fingerprint_cache()
     # Spill left by a killed earlier solve would otherwise shrink the space
     # the previews below see (and keep tens of GB of disk occupied).
@@ -643,7 +653,8 @@ def main() -> 'None':
         "accuracy_target": ACCURACY_TARGET,
         "mesh_convergence_policy": mesh_policy,
         "workers_per_unit": int(WORKERS_PER_UNIT),
-        "blas_threads_per_worker": int(BLAS_THREADS_PER_WORKER),
+        "blas_threads_per_worker": (None if BLAS_THREADS_PER_WORKER is None
+                                    else int(BLAS_THREADS_PER_WORKER)),
     }
     manifest: 'Dict[str, Any]' = {
         "schema": MANIFEST_SCHEMA,
@@ -767,9 +778,11 @@ def main() -> 'None':
     cpu_counts = sorted(set(unit_cpus.values()))
     cpu_label = (str(cpu_counts[0]) if len(cpu_counts) == 1
                  else f"{cpu_counts[0]}-{cpu_counts[-1]}")
+    blas_label = ("CPU reservation" if BLAS_THREADS_PER_WORKER is None
+                  else BLAS_THREADS_PER_WORKER)
     print(f"  Workers       : {pool_size} procs x {WORKERS_PER_UNIT} threads "
           f"of {cores} cpus; {cpu_label} cpus reserved per solve  "
-          f"(BLAS threads/worker: {BLAS_THREADS_PER_WORKER})")
+          f"(BLAS threads/worker: {blas_label})")
     reservations = list(reservations_gib.values())
     available_text = (f", {available_gb:.1f} GiB available"
                       if available_gb is not None else "")
@@ -806,7 +819,8 @@ def main() -> 'None':
             name,
             reservations_gib[name],
             (_solve_and_export_star,
-             ((unit, context, str(unit_dir), unit_cpus[name]),)),
+             ((unit, context, str(unit_dir), unit_cpus[name],
+               BLAS_THREADS_PER_WORKER is None),)),
         )
 
     def _finished():
@@ -833,7 +847,7 @@ def main() -> 'None':
         with _ExecutorPool(
             processes=pool_size,
             initializer=_pool_initializer,
-            initargs=(int(BLAS_THREADS_PER_WORKER),),
+            initargs=(int(BLAS_THREADS_PER_WORKER or 1),),
             max_tasks_per_child=int(TASKS_PER_CHILD),
         ) as pool:
             dispatcher = hpc_scheduler.MemoryAwareDispatcher(

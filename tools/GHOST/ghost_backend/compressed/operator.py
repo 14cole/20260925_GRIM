@@ -1,7 +1,6 @@
 """One-pass tile assembly and compressed operator storage."""
 import collections
 import contextvars
-import os
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from ghost_backend.twod.assembly.compact import CompactOperator
@@ -9,10 +8,20 @@ import scipy.linalg as la
 from ghost_backend.linalg.sweep import _qr_basis
 from ghost_backend.linalg.hierarchical import spatial_order
 
-# Multi-column tile products run per output group on a few threads; more would
-# oversubscribe the BLAS threads that solves already widen.
-MATMUL_WORKERS=min(4,os.cpu_count() or 1)
+# Multi-column tile products run per output group on at most this many
+# threads, within the solve's CPU allocation (a fixed four took three cores
+# from its neighbours in a one-CPU unit), each on one BLAS thread
+# (execution.options.single_thread_blas): concurrent multithreaded OpenBLAS
+# products can fault the process (BOR_PERFORMANCE.md, fix 12 of 24 September),
+# and BoR units widen BLAS to their allocation.
+MATMUL_WORKERS=4
 MATMUL_THREADED_COLUMNS=8
+
+
+def product_threads():
+    """Threads for one call's multi-column products: at most the solve's BLAS cores."""
+    from ghost_backend.execution.options import blas_core_budget
+    return max(1,min(MATMUL_WORKERS,blas_core_budget()))
 
 
 def tile_payload(raw, tail, tolerance, method, probe=True):
@@ -228,7 +237,8 @@ class StreamedOperator:
                 largest=np.maximum(largest,np.max(magnitude,axis=0))
                 total+=np.sum(magnitude,axis=0)
             return cols,largest,total
-        with ThreadPoolExecutor(max_workers=MATMUL_WORKERS,thread_name_prefix='ghost-equilibrate') as pool:
+        from ghost_backend.execution.options import single_thread_blas
+        with single_thread_blas(),ThreadPoolExecutor(max_workers=product_threads(),thread_name_prefix='ghost-equilibrate') as pool:
             futures=[pool.submit(contextvars.copy_context().run,group,j) for j in by_column]
             for future in futures:
                 cols,largest,total=future.result()
@@ -291,7 +301,8 @@ class StreamedOperator:
             raise ValueError('Invalid operator RHS.')
         result=np.zeros_like(b,dtype=complex)
         def adj(a):return a.T if trans==1 else a.conj().T
-        if b.shape[1]<MATMUL_THREADED_COLUMNS or MATMUL_WORKERS<2:
+        workers=product_threads() if b.shape[1]>=MATMUL_THREADED_COLUMNS else 1
+        if workers<2:
             for (i,j),(left,right) in self.tiles.items():
                 self.checkpoint()
                 rows,cols=self.groups[i],self.groups[j]
@@ -314,7 +325,8 @@ class StreamedOperator:
                 else:
                     value+=adj(left)@b[self.groups[i]] if right is None else adj(right)@(adj(left)@b[self.groups[i]])
             return first,value
-        with ThreadPoolExecutor(max_workers=MATMUL_WORKERS,thread_name_prefix='ghost-matmul') as pool:
+        from ghost_backend.execution.options import single_thread_blas
+        with single_thread_blas(),ThreadPoolExecutor(max_workers=workers,thread_name_prefix='ghost-matmul') as pool:
             futures=[pool.submit(contextvars.copy_context().run,group,keys) for keys in outputs.values()]
             for future in futures:
                 index,value=future.result()

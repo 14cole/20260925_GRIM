@@ -215,6 +215,13 @@ class MeshConvergenceFloorTests(unittest.TestCase):
         self.assertTrue(any('phase' in v for v in rotated['violations']))
 
     def test_real_plate_with_deep_nulls_certifies_tight_and_coarse_mesh_fails(self):
+        # The gate is what is tested: on ungraded corners the base and fine nulls
+        # disagree by more than the tight dB limit. Graded corners (27 September
+        # fix 18) converge this plate to 0.11 dB even at its nulls.
+        from ghost_backend.twod import geometry
+        patcher = mock.patch.object(geometry, 'EDGE_GRADING_MIN_PANELS', 10 ** 9)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         angles = list(np.arange(0.0, 90.01, 0.25))
         tight = accuracy_target_policy('tight')
         result = rcs.solve_monostatic_rcs_2d_certified(

@@ -589,6 +589,16 @@ on one of these square cross sections does not make it a valid BoR model.
   the density beyond 32 panels per wavelength, which keeps the second order
   on fine meshes; BoR keeps four levels (second order through 73 elements per
   wavelength, not asymptotically). Both keep their resonance protection.
+  The same grading is applied to other places where the current is singular:
+  - the linear 2D mesh grades free strip and card ends, branch points and
+    corners of 150 degrees or less (four panels per free end, eight per
+    corner);
+  - BoR grades the rims, corners and tips of conductor and sheet bodies.
+
+  Thin layers, dielectric-only interfaces and the corners of BoR material
+  bodies are not graded this way. Neither are explicit counts (`N > 0`) or
+  primitives of fewer than eight automatic panels (corrugations, short facets,
+  densely drawn outlines).
 - A nonzero TYPE 4 backing impedance remains a **2D-only** capability.
   TYPE 3/5 bulk interfaces cannot carry an IBC flag in either solver.
 

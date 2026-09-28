@@ -1,8 +1,56 @@
 """Reusable CPU factorization with bounded solves and shared residual evidence."""
+import math
+
 import numpy as np
 from ghost_backend.execution.metrics import timed_stage
 from ghost_backend.linalg.workspace import matrix_inf_norm, first_nonfinite, checked_row_norms
 from ghost_backend.linalg.refined_lu import requested_precision
+
+
+# LU factors P A P^T with the stride permutation p_i = (i s) mod N,
+# s ~ 0.618 N.  Boundary-element systems in contour order have large pivot
+# growth under partial pivoting (2.5e3 at N = 2,888 and up to 3e4 at N = 9,000
+# on P1 closed bodies), which put the backward error over the 1e-12 gate and
+# cost a refinement solve and a second residual product on every angle batch
+# (linear_solve 5.6 s against 2.8-3.4 s at N = 5,000); spreading neighbouring
+# panels over the elimination order keeps it at 1-30 for the same LU time.
+LU_STRIDE_FRACTION = 0.6180339887498949
+
+
+def stride_permutation(n):
+    """``p`` with ``p_i = (i s) mod n``, ``s`` the coprime stride nearest ``0.618 n``."""
+    n = int(n)
+    stride = max(1, int(round(LU_STRIDE_FRACTION * n)))
+    while math.gcd(stride, n) != 1:
+        stride += 1
+    return (np.arange(n, dtype=np.intp) * stride) % n
+
+
+def _permute_in_place(matrix, perm):
+    """``matrix[:] = matrix[perm][:, perm]`` without a second full-size array."""
+    n = len(perm)
+    for axis in (0, 1):
+        done = np.zeros(n, dtype=bool)
+        for start in range(n):
+            if done[start] or perm[start] == start:
+                done[start] = True
+                continue
+            index = start
+            saved = (matrix[index] if axis == 0 else matrix[:, index]).copy()
+            while True:
+                done[index] = True
+                source = perm[index]
+                if source == start:
+                    break
+                if axis == 0:
+                    matrix[index] = matrix[source]
+                else:
+                    matrix[:, index] = matrix[:, source]
+                index = source
+            if axis == 0:
+                matrix[index] = saved
+            else:
+                matrix[:, index] = saved
 
 
 class DenseFactor:
@@ -24,6 +72,7 @@ class DenseFactor:
             rcs._ensure_finite_linear_system(self.a, label=label)
             self.matrix_inf = matrix_inf_norm(self.a)
         self.lu = self.piv = self.mixed = None
+        self._perm = None
         self._residual_spool = None
         self._spooled_buffer = None
         # Certification: the equilibration's column pass, before any in-place LU.
@@ -109,12 +158,16 @@ class DenseFactor:
                         raise
                 else:
                     original = self.a
+                    perm = stride_permutation(len(original))
                     try:
+                        # The original is on disk now: permute its buffer in place.
+                        _permute_in_place(original, perm)
                         self.lu, self.piv = timed_stage('factorization')(rcs._SCIPY_LINALG.lu_factor)(
                             original, overwrite_a=True, check_finite=False)
                     except BaseException:
                         spool.close()
                         raise
+                    self._perm = perm
                     self.a = self._residual_spool = spool
                     self._spooled_buffer = original
                     self._condition_scaling = scaling
@@ -122,10 +175,32 @@ class DenseFactor:
                         original_matrix_disk_bytes=original.nbytes,
                         original_matrix_buffer_bytes=spool.buffer_bytes)
                     self.event['factorizations'] += 1
+                    self.event['lu_order'] = 'stride'
                     return
+            perm = stride_permutation(len(self.a))
+            # The permuted copy replaces the one lu_factor would make, in
+            # LAPACK's column order so that it is factored in place.
+            permuted = np.empty(self.a.shape, dtype=np.complex128, order='F')
+            for column, source in enumerate(perm):
+                if column % 4096 == 0:
+                    self.checkpoint()
+                permuted[:, column] = self.a[perm, source]
             self.lu, self.piv = timed_stage('factorization')(rcs._SCIPY_LINALG.lu_factor)(
-                self.a, check_finite=False)
+                permuted, overwrite_a=True, check_finite=False)
+            self._perm = perm
             self.event['factorizations'] += 1
+            self.event['lu_order'] = 'stride'
+
+    def _lu_solve(self, b, trans=0):
+        """Solve with the stride-ordered LU: ``A x = b`` (or ``A^H x = b`` for trans=2)."""
+        import ghost_backend.twod.solver as rcs
+        if self._perm is None:
+            return rcs._SCIPY_LINALG.lu_solve((self.lu, self.piv), b, trans=trans, check_finite=False)
+        solved = rcs._SCIPY_LINALG.lu_solve((self.lu, self.piv), b[self._perm], trans=trans,
+                                            check_finite=False)
+        x = np.empty_like(solved)
+        x[self._perm] = solved
+        return x
 
     def _condition(self):
         import ghost_backend.twod.solver as rcs
@@ -150,7 +225,7 @@ class DenseFactor:
                 self.fallback_reason = 'Mixed precision fell back to double LU: {}'.format(exc)
                 failed = True
         elif self.lu is not None:
-            estimate = rcs._equilibrated_condition_from_lu(self.a, self.lu, self.piv,
+            estimate = rcs._equilibrated_condition_from_lu(self.a, self.lu, self.piv, self._lu_solve,
                 scaling=self._condition_scaling)
             method = 'equilibrated_1norm_lu_onenormest'
         else:
@@ -205,8 +280,7 @@ class DenseFactor:
             self.event['factorizations'] += 1
             x = np.linalg.solve(self.a, b)
         else:
-            x = timed_stage('rhs_solve')(rcs._SCIPY_LINALG.lu_solve)(
-                (self.lu, self.piv), b, check_finite=False)
+            x = timed_stage('rhs_solve')(self._lu_solve)(b)
         return (x, None) if return_residual else x
 
     @timed_stage('linear_solve')
@@ -227,26 +301,34 @@ class DenseFactor:
 
             np.negative(inner_residual, out=inner_residual)
             self.event['residual_products_reused'] = self.event.get('residual_products_reused', 0) + 1
-        def metrics(candidate, residual=None):
+        def metrics(candidate, rhs, residual=None):
             if residual is None:
-                residual = self.a @ candidate - b
+                residual = self.a @ candidate - rhs
             ri = np.max(np.abs(residual), axis=0)
-            den = self.matrix_inf * np.max(np.abs(candidate), axis=0) + np.max(np.abs(b), axis=0)
+            den = self.matrix_inf * np.max(np.abs(candidate), axis=0) + np.max(np.abs(rhs), axis=0)
             errors = np.divide(ri, den, out=np.zeros_like(ri), where=den > 0)
             errors[(den <= 0) & (ri > 0)] = np.inf
-            return residual, float(np.max(errors))
-        residual, error = metrics(x, inner_residual)
+            return residual, errors
+        residual, errors = metrics(x, b, inner_residual)
         inner_residual = None
         steps = 0
         for attempt in range(2):
-            if error <= rcs.DENSE_LINEAR_BACKWARD_ERROR_MAX:
+            # Only the columns above the gate are refined: one more solve and
+            # residual product for them, not for the whole batch.
+            columns = np.flatnonzero(~(errors <= rcs.DENSE_LINEAR_BACKWARD_ERROR_MAX))
+            if not columns.size:
                 break
-            candidate = x + self._apply_inverse(-residual)
-            updated, candidate_error = metrics(candidate)
-            if candidate_error >= error:
+            candidate = x[:, columns] + self._apply_inverse(-residual[:, columns])
+            updated, candidate_errors = metrics(candidate, b[:, columns])
+            better = candidate_errors < errors[columns]
+            if not np.any(better):
                 break
-            x, residual, error = candidate, updated, candidate_error
+            improved = columns[better]
+            x[:, improved] = candidate[:, better]
+            residual[:, improved] = updated[:, better]
+            errors[improved] = candidate_errors[better]
             steps += 1
+        error = float(np.max(errors))
         if not np.isfinite(error) or error > rcs.DENSE_LINEAR_BACKWARD_ERROR_MAX:
             raise RuntimeError('{} normwise backward error {} exceeds the release limit {}.'.format(
                 self.label, error, rcs.DENSE_LINEAR_BACKWARD_ERROR_MAX))

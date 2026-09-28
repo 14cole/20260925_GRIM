@@ -117,8 +117,17 @@ selection and HPC scheduling pass the same material library and frequencies to
 `_build_panels` and count the same panels; a caller without a library has only
 inline laws evaluated, and a table is then graded only against PEC. The rule is
 a threshold: a table crossing it between two frequencies of a sweep changes
-that junction's mesh by eight panels there. Free strip ends, triple junctions
-and TYPE 1 sheet joints are not graded. The real HPC driver was run end to end
+that junction's mesh by eight panels there. The linear mesh also grades, with
+the same levels, the free ends, branch points and corners of 150 degrees or
+less of conductor and sheet contours (TYPE 1, 2 and 4; `_add_edge_vertices`,
+`EDGE_GRADING_TURN_DEG`). At 20 panels per wavelength this lowered the error
+16x at strip ends and 13-69x at corners of 20 to 150 degrees. Thin layers,
+dielectric-only interfaces and hp meshes are not graded this way; hp meshes
+cluster their own elements toward these vertices. Neither are explicit counts
+(N > 0) or primitives of fewer than eight base panels
+(`EDGE_GRADING_MIN_PANELS`: corrugations, short facets, densely drawn
+outlines), which grading would more than double. The base mesh decides, so a
+certification pair grades alike. The real HPC driver was run end to end
 on such bodies (plan without submission, then the worker in an interpreter
 where importing Qt raises): for a rectangle with two PEC/impedance junctions (24 and
 36 panels per side at 1 GHz, 180 to 540 per wavelength, so seven to nine levels)
@@ -291,7 +300,14 @@ uniform and 0.17 / 0.066 / 0.024 dB with three levels; the EFIE behaves alike
 (0.15 / 0.074 / 0.036 to 0.057 / 0.015 / 0.004 dB). This had been refused by
 the near angular rule, whose failure was a rounding floor (see Certification).
 Only the conductor kind is graded: bare pieces of partial and banded coatings,
-material junctions and sheets are not. The BoR HPC driver was run end to end on
+material junctions and sheets are not. Conductor and sheet generatrices are
+also graded, with the same levels, at vertices that turn by 30 degrees or
+more (rims, corners), at axial tips that meet the axis at least 15 degrees off
+a right angle, and at free sheet edges (`_mark_edge_vertices`), except on
+explicit counts and primitives of fewer than eight base elements
+(`BOR_EDGE_GRADING_MIN_ELEMENTS`). A PEC cylinder (`ka = 3`, `L = 2a`) went
+from 0.060 dB with 40 elements to 0.0039 dB with 56. Material bodies are not
+graded at corners yet. The BoR HPC driver was run end to end on
 a graded sphere (plan, then the headless worker): 32 elements, one graded
 junction, IBC-CFIE, and 24 with a zero-ohm law. Around the first cavity resonance
 (`ka = 2.70..2.80`, 60 elements) the EFIE departs from its neighbours by 1.5 dB

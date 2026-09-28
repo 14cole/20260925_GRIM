@@ -749,11 +749,16 @@ JUNCTION_GRADING_DENSITY = 32.0
 _OPAQUE_CONDUCTOR_TYPES = (2, 4)
 
 
-def _junction_grading_levels(panel_length: 'float', wavelength) -> 'int':
-    """Levels for a junction whose end panel has this length on a mesh of this wavelength."""
+def _junction_grading_levels(panel_length: 'float', wavelength, extra: 'int' = 0) -> 'int':
+    """Levels for a junction whose end panel has this length on a mesh of this wavelength.
+
+    ``extra`` levels are added below the density rule: the hp accuracy check
+    grades one level deeper than its candidate (``HP_CHECK_SINGULAR_LEVELS``).
+    """
     levels = int(JUNCTION_GRADING_LEVELS)
     if levels <= 0 or not panel_length > 0.0:
         return max(levels, 0)
+    levels += max(0, int(extra))
     if wavelength is not None and math.isfinite(wavelength) and wavelength > 0.0:
         density = float(wavelength) / float(panel_length)
         if density > JUNCTION_GRADING_DENSITY:
@@ -850,24 +855,89 @@ def _boundary_condition_junctions(segments, meters_scale: 'float', materials,
     return junctions
 
 
-def _grade_toward_junctions(pts, junctions, wavelength=None):
-    """Split the end panels of a primitive geometrically toward junction vertices."""
+# Free ends, branch points and corners of conductor and sheet contours hold the
+# linear basis to first order as impedance junctions do (the current is
+# singular there too), and are graded the same way on the linear path. Four
+# levels at 20 panels per wavelength, 1 GHz, monostatic amplitude against
+# cosine-graded references, error over peak (TM / TE):
+#   PEC strip end         2.4e-3          -> 1.5e-4           (8 more panels)
+#   20 degree wedge tip   2.0e-3 / 6.7e-3 -> 1.2e-4 / 4.3e-4
+#   square (90 degrees)   6.4e-4 / 2.6e-3 -> 1.8e-5 / 1.8e-4
+#   octagon (135)         2.9e-4 / 1.3e-3 -> 4.1e-6 / 8.7e-5
+#   12-gon (150)          9.0e-5 / 1.3e-3 -> 4.0e-6 / 9.5e-5
+# Uniform refinement halves such an error only by doubling every panel. A
+# vertex that turns less (a drawn curve) is left alone, hp meshes cluster their
+# own elements toward these vertices (adaptive_geometry.protected_vertices),
+# and thin layers keep their qualified discretization. So do explicit counts
+# (N > 0), and a primitive of fewer than EDGE_GRADING_MIN_PANELS base panels (a
+# corrugation or short facet), which grading would more than double: a
+# corrugated body drawn with one panel per primitive would grow tenfold.
+EDGE_GRADING_TURN_DEG = 30.0
+EDGE_GRADING_MIN_PANELS = 8
+_EDGE_GRADED_TYPES = (1, 2, 4)
+
+
+def _add_edge_vertices(edges: '_JunctionVertices', geometry_snapshot, meters_scale: 'float',
+                       materials) -> 'None':
+    """Add the free ends, branch points and sharp corners of conductor and sheet contours to ``edges``."""
+
+    thin_flags = {flag for flag, model in getattr(materials, "impedance_models", {}).items()
+                  if isinstance(model, ThinLayerDefinition)}
+    for row in geometry_snapshot.get("ibcs", []) or []:
+        if row and len(row) > 1 and str(row[1]).strip().lower() == "thin_dielectric":
+            thin_flags.add(_parse_flag(row[0]))
+    welder = edges.welder
+    incident: 'Dict[Tuple[int, int], List[np.ndarray]]' = {}
+    excluded = set()
+    for seg in geometry_snapshot.get("segments", []) or []:
+        seg_type, _n, ibc_flag, _pos, _neg = _segment_mesh_flags(seg)
+        for pair in seg.get("point_pairs", []) or []:
+            a = np.asarray([_parse_float(pair.get("x1", 0.0), 0.0), _parse_float(pair.get("y1", 0.0), 0.0)],
+                           dtype=float) * meters_scale
+            b = np.asarray([_parse_float(pair.get("x2", 0.0), 0.0), _parse_float(pair.get("y2", 0.0), 0.0)],
+                           dtype=float) * meters_scale
+            length = float(np.linalg.norm(b - a))
+            if not length > EPS:
+                continue
+            start, end = welder.key(a), welder.key(b)
+            if seg_type == 1 and ibc_flag in thin_flags:
+                excluded.update((start, end))
+                continue
+            if seg_type not in _EDGE_GRADED_TYPES:
+                continue
+            incident.setdefault(start, []).append((b - a) / length)
+            incident.setdefault(end, []).append((a - b) / length)
+    # Two outgoing directions of a vertex that turns by t have dot product -cos(t).
+    sharp = -math.cos(math.radians(EDGE_GRADING_TURN_DEG)) - 1.0e-9
+    for key, directions in incident.items():
+        if key not in excluded and (len(directions) != 2 or float(np.dot(*directions)) >= sharp):
+            edges.add(key)
+
+
+def _grade_toward_junctions(pts, junctions, wavelength=None, extra_levels=0, edges=None):
+    """Split the end panels of a primitive geometrically toward junction (and edge) vertices."""
 
     pts = [np.asarray(point, dtype=float) for point in pts]
-    if len(pts) < 2 or not junctions:
+    if len(pts) < 2 or not (junctions or edges):
         return pts
-    if isinstance(junctions, _JunctionVertices):
-        at_start, at_end = junctions.at(pts[0]), junctions.at(pts[-1])
-    else:
-        at_start = _linear_node_snap_key(pts[0]) in junctions
-        at_end = _linear_node_snap_key(pts[-1]) in junctions
+
+    def graded(point):
+        if junctions and (junctions.at(point) if isinstance(junctions, _JunctionVertices)
+                          else _linear_node_snap_key(point) in junctions):
+            return True
+        return bool(edges) and edges.at(point)
+    at_start, at_end = graded(pts[0]), graded(pts[-1])
     if not (at_start or at_end):
         return pts
     if len(pts) == 2 and at_start and at_end:
+        # A primitive too short to hold one level at either half (a nanometre
+        # notch between two graded corners) is not split below the node snap.
+        if _junction_grading_levels(0.5 * float(np.linalg.norm(pts[1] - pts[0])), wavelength, extra_levels) == 0:
+            return pts
         pts = [pts[0], 0.5 * (pts[0] + pts[1]), pts[1]]
 
     def fractions(first, second):
-        levels = _junction_grading_levels(float(np.linalg.norm(second - first)), wavelength)
+        levels = _junction_grading_levels(float(np.linalg.norm(second - first)), wavelength, extra_levels)
         return [JUNCTION_GRADING_RATIO ** level for level in range(levels, 0, -1)]
     if at_start:
         pts = [pts[0]] + [pts[0] + (pts[1] - pts[0]) * f for f in fractions(pts[0], pts[1])] + pts[1:]
@@ -1574,15 +1644,38 @@ def _spread_rank(index: 'int') -> 'float':
     return result
 
 
+def _mirror_paired_spread(group: 'Sequence[int]', count: 'int') -> 'List[int]':
+    """At least ``count`` members of ``group`` (chain order), spread along it in mirror pairs.
+
+    Member ``k`` is taken with member ``m - 1 - k``, so the choice read
+    backwards is the choice for the reversed chain: a mirror-symmetric chain,
+    or a chain and its mirror image, is refined symmetrically.  One more
+    member than ``count`` may be taken to complete a pair.
+    """
+
+    m = len(group)
+    chosen: 'List[int]' = []
+    for k in sorted(range((m + 1) // 2), key=_spread_rank):
+        if len(chosen) >= count:
+            break
+        chosen.append(group[k])
+        if m - 1 - k != k:
+            chosen.append(group[m - 1 - k])
+    return chosen
+
+
 def _certification_fine_counts(base_counts: 'Sequence[int]', lengths: 'Sequence[float]',
-                               factor: 'float') -> 'List[int]':
+                               factor: 'float', mirror_pairs: 'bool' = False) -> 'List[int]':
     """Fine-mesh panel counts for one segment chain of the certification pair.
 
     The chain receives max(B + 1, ceil(factor * B)) panels for B base panels,
     added where the panels are longest (never fewer than the base count on any
     primitive). The former per-primitive max(n + 1, ceil(factor * n)) gave a
     densely drawn polyline twice its panels (8x the LU work) when every
-    primitive carried a single panel.
+    primitive carried a single panel.  ``mirror_pairs`` refines equal panels
+    in mirror pairs along the chain (:func:`_mirror_paired_spread`; BoR keeps
+    a symmetric generatrix symmetric for its mirror-split factors), which may
+    add one panel per group.
     """
 
     counts = [max(1, int(c)) for c in base_counts]
@@ -1628,7 +1721,8 @@ def _certification_fine_counts(base_counts: 'Sequence[int]', lengths: 'Sequence[
                 break
             group = [i for i in range(len(counts)) if key[i] == value]
             if len(group) > remainder + allowance:
-                group = sorted(group, key=_spread_rank)[:remainder]
+                group = (_mirror_paired_spread(group, remainder) if mirror_pairs
+                         else sorted(group, key=_spread_rank)[:remainder])
             for i in group:
                 counts[i] += 1
             remainder -= len(group)
@@ -1778,6 +1872,7 @@ def _build_panels(
     from ghost_backend.twod.adaptive_geometry import protected_vertices, panel_parameters
     hp = '_2d_hp_coarsening' in geometry_snapshot
     protected = protected_vertices(geometry_snapshot, meters_scale) if hp else set()
+    singular_levels = int(geometry_snapshot.get('_2d_hp_singular_levels', 0)) if hp else 0
     panels: 'List[Panel]' = []
     segments = geometry_snapshot.get("segments", []) or []
     refinement_factor = float(
@@ -1803,6 +1898,9 @@ def _build_panels(
     law_library = materials if materials is not None else _inline_impedance_laws(geometry_snapshot)
     junctions = _boundary_condition_junctions(
         segments, meters_scale, law_library, frequencies_ghz)
+    edges = _JunctionVertices(welder=junctions.welder)
+    if not hp:
+        _add_edge_vertices(edges, geometry_snapshot, meters_scale, law_library)
     mesh_frequencies = _positive_frequencies(frequencies_ghz)
     panel_limit = max(1, int(max_panels))
     for seg_idx, seg in enumerate(segments):
@@ -1848,8 +1946,10 @@ def _build_panels(
             if not hp and len(panels) + fine_total > panel_limit:
                 raise ValueError('Discretization exceeds the configured panel limit.')
             counts = _certification_fine_counts(base_counts, lengths, refinement_factor) if ends else []
+            explicit_counts = base_n_prop > 0
         else:
             counts = [_panel_count_from_n(n_prop, length, wavelength) for length in lengths]
+            base_counts, explicit_counts = counts, n_prop > 0
 
         local_wavelength = None
         sagitta = 0.0
@@ -1893,7 +1993,7 @@ def _build_panels(
                     "geometric error; draw more primitives if the true surface is curved."
                 )
 
-        for (p0, p1, prim_len), count in zip(ends, counts):
+        for (p0, p1, prim_len), count, base_count in zip(ends, counts, base_counts):
             primitive_id = ''
             if hp:
                 reference_n = _parse_int(base_segment_n[seg_idx], 0) if refinement_factor > 1 else n_prop
@@ -1912,8 +2012,11 @@ def _build_panels(
                         "tolerance. Reduce N."
                     )
                 pts = _discretize_primitive(p0, p1, count)
-            if junctions:
-                pts = _grade_toward_junctions(pts, junctions, wavelength)
+            # Base mesh decides, so a certification pair grades the same edges.
+            edge_ends = (edges if edges and not explicit_counts and base_count >= EDGE_GRADING_MIN_PANELS
+                         else None)
+            if junctions or edge_ends:
+                pts = _grade_toward_junctions(pts, junctions, wavelength, singular_levels, edge_ends)
                 count = len(pts) - 1
             if len(panels) + count > panel_limit:
                 raise ValueError('Discretization exceeds the configured panel limit.')
@@ -2399,7 +2502,9 @@ def _mesh_wavelength_for_snapshot(
     refractive-index magnitude is at least one. Only dielectric flags actually
     referenced by TYPE 3/4/5 boundaries participate; unused library rows do not
     over-refine a model. For lossy media ``|n|`` is a conservative spatial scale
-    covering both phase variation and attenuation.
+    covering both phase variation and attenuation. A TYPE 1 thin dielectric
+    layer participates with the index of its guided mode
+    (:func:`_thin_slab_mode_index`), not of its bulk material.
     """
 
     freq = float(frequency_ghz)
@@ -2409,6 +2514,7 @@ def _mesh_wavelength_for_snapshot(
         )
 
     material_flags: 'Set[int]' = set()
+    thin_layers = []
     for seg in _snapshot_segments(geometry_snapshot):
         props = list(seg.get("properties", []) or [])
         if len(props) < 5:
@@ -2420,7 +2526,7 @@ def _mesh_wavelength_for_snapshot(
         neg_mat = _parse_flag(props[4])
         sheet_model = materials.impedance_models.get(_parse_flag(props[2]))
         if seg_type == 1 and isinstance(sheet_model, ThinLayerDefinition):
-            material_flags.add(sheet_model.dielectric_flag)
+            thin_layers.append(sheet_model)
         if seg_type in (3, 4) and pos_mat > 0:
             material_flags.add(pos_mat)
         elif seg_type == 5:
@@ -2439,13 +2545,39 @@ def _mesh_wavelength_for_snapshot(
                 f"{index_mag!r} at {freq:g} GHz."
             )
         max_index = max(max_index, index_mag)
+    for layer in thin_layers:
+        eps, mu = materials.get_medium(layer.dielectric_flag, freq)
+        max_index = max(max_index, _thin_slab_mode_index(eps, mu, layer.thickness_m, freq))
 
     free_space_wavelength = C0 / (freq * 1.0e9)
     return (
         float(free_space_wavelength / max_index),
         float(max_index),
-        sorted(material_flags),
+        sorted(material_flags | {layer.dielectric_flag for layer in thin_layers}),
     )
+
+
+def _thin_slab_mode_index(eps: 'complex', mu: 'complex', thickness_m: 'float',
+                          frequency_ghz: 'float') -> 'float':
+    """Phase index of the guided mode of a thin dielectric layer in air.
+
+    A slab much thinner than the wavelength guides fundamental TE and TM
+    modes that decay outside it as ``kappa/k0 = k0 d |eps mu - 1| /
+    (2 min(|eps|, |mu|))`` (first order in ``k0 d``); their index is
+    ``sqrt(1 + (kappa/k0)^2)``.  Along the surface the layer carries that
+    wave, not the wavelength inside its bulk material: on a 64-gon at 20
+    panels per free-space wavelength a 0.3 mm layer of eps = 10-1j was within
+    1.6e-6 (TM) and 1.8e-5 (TE) of a 12x finer mesh, closer than PEC on the
+    same panels, while bulk sizing gave it 4x the panels (about 64x the LU
+    work).  Inside the thin-layer limit (electrical thickness <= 0.15) the
+    index is at most about 1.1.
+    """
+
+    k0 = 2.0 * math.pi * float(frequency_ghz) * 1.0e9 / C0
+    eps, mu = complex(eps), complex(mu)
+    contrast = abs(eps * mu - 1.0)
+    kappa = k0 * float(thickness_m) * contrast / (2.0 * max(min(abs(eps), abs(mu)), 1e-12))
+    return float(math.sqrt(1.0 + kappa * kappa))
 
 def _conservative_mesh_wavelength_for_frequencies(
     geometry_snapshot: 'Dict[str, Any]',

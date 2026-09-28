@@ -118,10 +118,15 @@ class SheetBoundWaveMeshTests(unittest.TestCase):
                                math.sqrt(1 + (2000.0 / 376.730313668) ** 2), places=2)
 
     def test_inductive_card_is_meshed_for_its_bound_wave(self):
-        resistive_panels = self.solve(self.card(), 0.0)[1]
-        reference = self.solve(self.card(360), 600.0)[0]
-        amplitudes, panels = self.solve(self.card(), 600.0)
+        from unittest import mock
+        from ghost_backend.twod import geometry
+        # Sizing alone: the corners of both cards are also graded (fix 18).
+        with mock.patch.object(geometry, 'EDGE_GRADING_MIN_PANELS', 10 ** 9):
+            resistive_panels = self.solve(self.card(), 0.0)[1]
+            panels = self.solve(self.card(), 600.0)[1]
         self.assertGreaterEqual(panels, 3 * resistive_panels)
+        reference = self.solve(self.card(360), 600.0)[0]
+        amplitudes = self.solve(self.card(), 600.0)[0]
         # 6.4 % on the 80-panel mesh the card had before.
         self.assertLess(np.max(np.abs(amplitudes - reference)) / np.max(np.abs(reference)), 5e-3)
 
@@ -521,6 +526,508 @@ class SpillReleaseFlushTests(unittest.TestCase):
 
     def test_windows_still_flushes_before_unlocking(self):
         self.assertEqual(self.release('nt'), ['flush', 'unlock'])
+
+
+# ---------------------------------------------------------------------------
+# Second round: speed items and grading.
+
+
+class ThinLayerSizingTests(unittest.TestCase):
+    """T2-12: a thin layer is meshed for its guided mode, not its bulk wavelength."""
+
+    def test_slab_mode_index_is_the_first_order_thin_slab_mode(self):
+        from ghost_backend.twod import geometry as geo
+        k0d = 2 * math.pi * 1.5e9 / 299_792_458.0 * 0.0003
+        self.assertAlmostEqual(geo._thin_slab_mode_index(10.0, 1.0, 0.0003, 1.5),
+                               math.sqrt(1 + (k0d * 9 / 2) ** 2), places=12)
+        self.assertEqual(geo._thin_slab_mode_index(1.0, 1.0, 0.001, 3.0), 1.0)
+
+    def test_thin_layer_polygon_gets_the_free_space_density(self):
+        theta = np.linspace(0.0, -2 * np.pi, 65)
+        points = 0.1 * np.column_stack((np.cos(theta), np.sin(theta)))
+        points[-1] = points[0]
+
+        def solve(per_primitive):
+            snapshot = dict(segments=[dict(name='layer', seg_type=1,
+                                           properties=['1', str(per_primitive), '1', '0', '0'],
+                                           point_pairs=_pairs(points))],
+                            ibcs=[['1', 'thin_dielectric', '0.0003', '2']],
+                            dielectrics=[['2', '10', '-1', '1', '0']])
+            result = rcs.solve_monostatic_rcs_2d_single_polarization(
+                snapshot, [1.5], [0.0, 45.0, 90.0], polarization='TE', geometry_units='meters',
+                strict_quality_gate=False, execution_options=DENSE_P1)
+            amplitudes = np.array([complex(r['rcs_amp_real'], r['rcs_amp_imag']) for r in result['samples']])
+            return amplitudes, result['metadata']['panel_count']
+
+        reference, _ = solve(12)
+        amplitudes, panels = solve(0)
+        self.assertEqual(panels, 64)            # 256 at the bulk wavelength before
+        self.assertLess(np.max(np.abs(amplitudes - reference)) / np.max(np.abs(reference)), 1e-4)
+
+
+class StrideOrderedLuTests(unittest.TestCase):
+    """T2-10: dense LU factors P A P^T with a stride permutation."""
+
+    def matrix(self, n=301, seed=3):
+        rng = np.random.default_rng(seed)
+        a = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n)) + 4 * np.eye(n)
+        return np.asfortranarray(a), rng.standard_normal((n, 6)) + 1j * rng.standard_normal((n, 6))
+
+    def test_permutation_and_in_place_application_are_exact(self):
+        from ghost_backend.linalg import dense
+        for n in (1, 2, 7, 64, 301):
+            perm = dense.stride_permutation(n)
+            self.assertEqual(sorted(perm.tolist()), list(range(n)))
+            a = np.asfortranarray(np.arange(n * n, dtype=complex).reshape(n, n))
+            expected = a[np.ix_(perm, perm)]
+            dense._permute_in_place(a, perm)
+            np.testing.assert_array_equal(a, expected)
+
+    def test_memory_and_spooled_factors_solve_and_estimate_like_natural_order(self):
+        import tempfile
+        import scipy.linalg as la
+        from ghost_backend.linalg.dense import DenseFactor
+        from ghost_backend.execution.options import execution_scope, validate_options
+        a, b = self.matrix()
+        reference = np.linalg.solve(a, b)
+        natural = rcs._equilibrated_condition_from_lu(a, *la.lu_factor(a))
+        diagnostics = {}
+        factor = DenseFactor(a.copy(order='F'), diagnostics=diagnostics)
+        self.assertEqual(factor.event['lu_order'], 'stride')
+        np.testing.assert_allclose(factor.solve(b), reference, rtol=1e-11, atol=1e-13)
+        self.assertAlmostEqual(diagnostics['condition_est'] / natural, 1.0, places=8)
+        with tempfile.TemporaryDirectory() as directory, \
+                execution_scope(validate_options(dict(dense_residual_storage='disk',
+                                                      temporary_directory=directory))):
+            owned = a.copy(order='F')
+            spooled = DenseFactor(owned, owned_matrix=True)
+            self.assertEqual(spooled.event['residual_storage'], 'disk')
+            np.testing.assert_allclose(spooled.solve(b), reference, rtol=1e-11, atol=1e-13)
+            spooled.restore_original()
+            np.testing.assert_array_equal(owned, a)
+            spooled.close()
+
+    def test_only_columns_above_the_gate_are_refined(self):
+        from unittest import mock
+        from ghost_backend.linalg.dense import DenseFactor
+        a, b = self.matrix()
+        factor = DenseFactor(a.copy(order='F'))
+        first = factor._apply_inverse(b)
+        residual = a @ first - b
+        errors = (np.max(np.abs(residual), axis=0)
+                  / (factor.matrix_inf * np.max(np.abs(first), axis=0) + np.max(np.abs(b), axis=0)))
+        gate = float(np.median(errors))
+        widths = []
+        original = factor._apply_inverse
+
+        def spy(rhs, return_residual=False):
+            widths.append(rhs.shape[1])
+            return original(rhs, return_residual=return_residual)
+
+        with mock.patch.object(rcs, 'DENSE_LINEAR_BACKWARD_ERROR_MAX', gate), \
+                mock.patch.object(factor, '_apply_inverse', spy):
+            factor.solve(b)
+        self.assertEqual(widths[0], b.shape[1])
+        self.assertEqual(widths[1], int(np.sum(errors > gate)))
+
+    def test_closed_p1_system_no_longer_needs_refinement(self):
+        from unittest import mock
+        import ghost_backend.twod.fields as fields
+        t = np.linspace(0, -2 * np.pi, 513)
+        points = np.column_stack((0.5 * np.cos(t), 0.15 * np.sin(t)))
+        points[-1] = points[0]
+        snapshot = dict(segments=[dict(name='e', seg_type=2, properties=['2', '-20', '0', '0', '0'],
+                                       point_pairs=_pairs(points))], ibcs=[], dielectrics=[])
+        captured = []
+        original = fields._solve_fields
+
+        def capture(mesh, matrix, k0, angles, rhs_builder, diagnostics, label, **kw):
+            captured.append((np.array(matrix, copy=True),
+                             rhs_builder(np.linspace(0, 360, 256, endpoint=False))))
+            return original(mesh, matrix, k0, angles, rhs_builder, diagnostics, label, **kw)
+
+        with mock.patch.object(fields, '_solve_fields', capture):
+            rcs.solve_monostatic_rcs_2d_single_polarization(
+                snapshot, [12.0], [0.0], polarization='TE', geometry_units='meters',
+                strict_quality_gate=False, execution_options=DENSE_P1)
+        from ghost_backend.linalg.dense import DenseFactor
+        matrix, rhs = captured[0]
+        diagnostics = {}
+        DenseFactor(np.asfortranarray(matrix), diagnostics=diagnostics).solve(rhs)
+        # Natural order: growth 277, 4 of 256 columns over 1e-12, one refinement step.
+        self.assertEqual(diagnostics['linear_refinement_steps'], 0)
+        self.assertLess(diagnostics['linear_backward_error'], 1e-13)
+
+
+def _junction_square(side=3.2 * 0.299792458):
+    """A 6.4-wavelength (1 GHz) square: PEC on three sides and half the fourth, 75-20j on the rest."""
+    middle, top_right, bottom_right, bottom_left, top_left = (
+        np.array(p) for p in ([0, side], [side, side], [side, -side], [-side, -side], [-side, side]))
+
+    def segment(name, points, ibc):
+        return dict(name=name, seg_type=2, properties=['2', '0', str(ibc), '0', '0'],
+                    point_pairs=_pairs(points))
+    return dict(segments=[segment('pec', [top_right, bottom_right, bottom_left, top_left, middle], 0),
+                          segment('ibc', [middle, top_right], 1)],
+                ibcs=[['1', 'constant', '75', '-20', '0', '0']], dielectrics=[])
+
+
+class HpCoarseningTests(unittest.TestCase):
+    """T2-1 with the A-5 guard: coarser hp candidates, checked one grading step deeper at junctions."""
+
+    def test_check_mesh_grades_each_junction_side_deeper(self):
+        from ghost_backend.twod import geometry as geo
+        from ghost_backend.twod import adaptive_geometry as ag
+        self.assertEqual(ag.HP_COARSENING, 6.)
+        snapshot = dict(_junction_square(), _2d_hp_coarsening=ag.HP_COARSENING, _2d_hp_refinements={})
+        wavelength = 0.299792458
+        candidate = geo._build_panels(snapshot, 1.0, wavelength, frequencies_ghz=[1.0])
+        check = geo._build_panels(dict(snapshot, _2d_hp_singular_levels=ag.HP_CHECK_SINGULAR_LEVELS),
+                                  1.0, wavelength, frequencies_ghz=[1.0])
+        # Two junctions (the ends of the impedance side), two sides each.
+        self.assertEqual(len(check) - len(candidate), 4 * ag.HP_CHECK_SINGULAR_LEVELS)
+        shortest = min(panel.length for panel in check)
+        self.assertAlmostEqual(min(panel.length for panel in candidate) / shortest,
+                               2 ** ag.HP_CHECK_SINGULAR_LEVELS, places=6)
+
+    def test_forecast_and_solve_use_the_same_check_mesh(self):
+        from unittest import mock
+        from ghost_backend.twod import adaptive_geometry as ag
+        from ghost_backend.twod.preparation import prepare_geometry
+        snapshot = _junction_square()
+        materials = prepare_geometry(snapshot, None, 'meters')[2]
+        with mock.patch.object(ag, 'MIN_AUTOMATIC_REFERENCE_PANELS', 0):
+            meshes = ag.candidate_meshes(snapshot, materials, 1.5, True, [1.0], 1.0)
+        (_, base, base_degree), (_, check, check_degree) = meshes
+        self.assertEqual((base_degree, check_degree), (2, 3))
+        self.assertNotIn('_2d_hp_singular_levels', base)
+        self.assertEqual(check['_2d_hp_singular_levels'], ag.HP_CHECK_SINGULAR_LEVELS)
+        with mock.patch.object(ag, 'MIN_AUTOMATIC_REFERENCE_PANELS', 0):
+            result = rcs.solve_monostatic_rcs_2d_certified(
+                snapshot, [1.0], list(np.linspace(20.0, 160.0, 15)), geometry_units='meters',
+                execution_options=dict(mesh_strategy='adaptive', factorization='dense',
+                                       assembly_threads=2, blas_threads=2))
+        steps = result['metadata']['adaptive_mesh']['steps']
+        self.assertTrue(result['metadata']['adaptive_mesh']['used'])
+        self.assertEqual(steps[1]['panels'] - steps[0]['panels'], 4 * ag.HP_CHECK_SINGULAR_LEVELS)
+
+
+class UnitBlasTests(unittest.TestCase):
+    """P-6: BoR driver units widen BLAS from the import-time pin to their CPU allocation."""
+
+    @staticmethod
+    def blas_threads():
+        from ghost_backend.execution.thread_control import threadpool_info
+        return max(int(pool['num_threads']) for pool in threadpool_info() if pool.get('user_api') == 'blas')
+
+    def test_scope_widens_to_the_allocation_and_restores_the_pin(self):
+        from ghost_backend.execution.thread_control import threadpool_limits
+        from ghost_backend.execution.options import physical_core_count
+        from ghost_backend.hpc import scheduler
+        with threadpool_limits(limits=1, user_api='blas'):
+            with scheduler.cpu_allocation_scope(3), scheduler.unit_blas_scope(True) as threads:
+                self.assertEqual(threads, min(3, physical_core_count()))
+                self.assertEqual(self.blas_threads(), threads)
+            self.assertEqual(self.blas_threads(), 1)
+            with scheduler.cpu_allocation_scope(3), scheduler.unit_blas_scope(False) as threads:
+                self.assertIsNone(threads)
+                self.assertEqual(self.blas_threads(), 1)
+
+    def test_drivers_widen_automatic_units_only(self):
+        from unittest import mock
+        from ghost_backend.execution.thread_control import threadpool_limits
+        from ghost_backend import run_local_bor, run_hpc_bor_monostatic
+        self.assertIsNone(run_local_bor.BLAS_THREADS_PER_WORKER)
+        self.assertIsNone(run_hpc_bor_monostatic.BLAS_THREADS_PER_WORKER)
+        seen = []
+
+        def solve(*_args, **_kwargs):
+            seen.append(self.blas_threads())
+            return 'written', 'path'
+        with threadpool_limits(limits=1, user_api='blas'), \
+                mock.patch.object(run_local_bor, '_solve_and_export', solve), \
+                mock.patch.object(run_hpc_bor_monostatic, '_solve_and_export', solve):
+            run_local_bor._solve_and_export_star(({}, {}, 'dir', 2, True))
+            run_local_bor._solve_and_export_star(({}, {}, 'dir', 2, False))
+            run_local_bor._solve_and_export_star(({}, {}, 'dir', 2))
+            run_hpc_bor_monostatic._solve_and_export_star(({}, {}, 'base', 'run', 2, True))
+            run_hpc_bor_monostatic._solve_and_export_star(({}, {}, 'base', 'run', 2, False))
+        self.assertEqual(seen, [2, 1, 1, 2, 1])
+
+    def test_configurations_accept_the_automatic_setting(self):
+        from ghost_backend.runs.config import validate_settings
+        from ghost_backend.hpc.bundle import BundleError, _validate_settings
+        keys = {'BLAS_THREADS_PER_WORKER'}
+        self.assertEqual(validate_settings({'BLAS_THREADS_PER_WORKER': None}, keys),
+                         {'BLAS_THREADS_PER_WORKER': None})
+        self.assertEqual(validate_settings({'BLAS_THREADS_PER_WORKER': 2}, keys)['BLAS_THREADS_PER_WORKER'], 2)
+        with self.assertRaises(ValueError):
+            validate_settings({'BLAS_THREADS_PER_WORKER': 0}, keys)
+        self.assertIsNone(_validate_settings('bor', {'BLAS_THREADS_PER_WORKER': None})['BLAS_THREADS_PER_WORKER'])
+        with self.assertRaises(BundleError):
+            _validate_settings('bor', {'BLAS_THREADS_PER_WORKER': 0})
+
+
+class CompressedProductThreadTests(unittest.TestCase):
+    """F4: compressed products take their threads from the allocation, one BLAS thread each."""
+
+    def operator(self, n=260):
+        from ghost_backend.compressed.operator import StreamedOperator
+
+        class Exact:
+            dropped_routes = calls = entries = 0
+
+            def __init__(self, a):
+                self.a, self.n = a, len(a)
+
+            def get_with_error(self, rows, cols):
+                value = self.a[np.ix_(rows, cols)].copy()
+                self.calls += 1
+                self.entries += value.size
+                return value, np.zeros(value.shape)
+        rng = np.random.RandomState(17)
+        u = rng.randn(n, 5) + 1j * rng.randn(n, 5)
+        a = np.eye(n) * 20 + u @ (rng.randn(5, n) + 1j * rng.randn(5, n)) / n
+        return a, StreamedOperator(Exact(a), np.arange(n)[:, None], tile=64)
+
+    def test_threads_follow_the_allocation_and_results_do_not(self):
+        from contextlib import contextmanager
+        from unittest import mock
+        from ghost_backend.compressed import operator as op
+        from ghost_backend.execution import options
+        from ghost_backend.execution.options import physical_core_count
+        from ghost_backend.hpc.scheduler import cpu_allocation_scope
+        a, operator = self.operator()
+        b = np.arange(len(a) * 12).reshape(len(a), 12) * (1 + 0.5j)
+        entered = []
+        original = options.single_thread_blas
+
+        @contextmanager
+        def spy():
+            entered.append(True)
+            with original():
+                yield
+        results = {}
+        with mock.patch.object(options, 'single_thread_blas', spy):
+            for cpus in (1, 3):
+                with cpu_allocation_scope(cpus):
+                    self.assertEqual(op.product_threads(), min(cpus, physical_core_count(), op.MATMUL_WORKERS))
+                    results[cpus] = operator.matmul(b)
+                    operator.equilibrate()
+        # One CPU: the serial product and a one-thread equilibration pool.
+        self.assertEqual(len(entered), 3)
+        scale = np.max(np.abs(a @ b))
+        self.assertLess(np.max(np.abs(results[1] - results[3])) / scale, 1e-15)
+        self.assertLess(np.max(np.abs(results[3] - a @ b)) / scale, 1e-13)
+
+
+class BorChainFineMeshTests(unittest.TestCase):
+    """TB-1: BoR certification refines each chain 1.5x, in mirror pairs."""
+
+    @staticmethod
+    def sphere(primitives, radius=0.1, halves=False):
+        theta = np.linspace(0.0, np.pi, primitives + 1)
+        rho, z = radius * np.sin(theta), radius * np.cos(theta)
+        rho[0] = rho[-1] = 0.0
+        z[0], z[-1] = radius, -radius
+        pairs = _pairs(np.column_stack((rho, z)))
+        parts = [pairs[:primitives // 2], pairs[primitives // 2:]] if halves else [pairs]
+        return dict(segments=[dict(name='s%d' % i, seg_type=2, properties=['2', '0', '0', '0', '0'],
+                                   point_pairs=part) for i, part in enumerate(parts)],
+                    ibcs=[], dielectrics=[])
+
+    def test_densely_drawn_sphere_is_refined_1_5x_and_stays_symmetric(self):
+        import copy
+        from ghost_backend.bor import dispatch
+        from ghost_backend.bor.solver import generatrix_mirror_symmetric
+        wavelength = 0.0299792458
+        for primitives, halves in ((512, False), (511, False), (512, True)):
+            with self.subTest(primitives=primitives, halves=halves):
+                snapshot = self.sphere(primitives, halves=halves)
+                fine = copy.deepcopy(snapshot)
+                fine['_bor_certification_refinement_factor'] = 1.5
+                fine['_bor_certification_base_segment_n'] = ['0'] * len(snapshot['segments'])
+                base_chains = dispatch._chains_from_snapshot(snapshot, 1.0)
+                fine_chains = dispatch._chains_from_snapshot(fine, 1.0)
+                self.assertEqual(dispatch._run_element_count(base_chains, wavelength), primitives)
+                self.assertEqual(dispatch._run_element_count(fine_chains, wavelength),
+                                 math.ceil(1.5 * primitives))   # 2x (per primitive) before
+                points = dispatch._mesh_generatrix(fine_chains, wavelength, 10 ** 5, 1e-12)[0]
+                self.assertEqual(len(points) - 1, math.ceil(1.5 * primitives))
+                self.assertTrue(generatrix_mirror_symmetric(points))
+
+    def test_paired_spread_is_closed_under_reversal(self):
+        from ghost_backend.twod.geometry import _mirror_paired_spread
+        for size in (1, 2, 7, 12, 511):
+            for count in range(0, size + 1, max(1, size // 5)):
+                chosen = set(_mirror_paired_spread(list(range(size)), count))
+                self.assertGreaterEqual(len(chosen), count)
+                self.assertLessEqual(len(chosen), count + 1)
+                self.assertEqual(chosen, {size - 1 - i for i in chosen})
+
+
+class EdgeGradingTests(unittest.TestCase):
+    """A-4: the linear 2D mesh grades free ends, branch points and corners like junctions."""
+
+    WAVELENGTH = 0.299792458
+
+    def snapshot(self, points, kind=2, n=-20, ibcs=(), flag=0, **extra):
+        return dict(segments=[dict(name='s', seg_type=kind, properties=[str(kind), str(n), str(flag), '0', '0'],
+                                   point_pairs=_pairs(points))],
+                    ibcs=[list(row) for row in ibcs], dielectrics=[['2', '10', '-1', '1', '0']], **extra)
+
+    def polygon(self, sides, radius, rotate=0.0):
+        t = rotate - np.linspace(0, 2 * np.pi, sides + 1)
+        points = radius * np.column_stack((np.cos(t), np.sin(t)))
+        points[-1] = points[0]
+        return points
+
+    def test_graded_vertices_and_untouched_ones(self):
+        from ghost_backend.twod import geometry as geo
+        lam = self.WAVELENGTH
+        square = self.polygon(4, 2 * lam / math.sqrt(2), math.pi / 4)
+        strip = np.array([[-lam, 0.0], [lam, 0.0]])
+
+        def count(snapshot):
+            return len(geo._build_panels(snapshot, 1.0, lam, frequencies_ghz=[1.0]))
+        self.assertEqual(count(self.snapshot(square)), 160 + 4 * 8)
+        self.assertEqual(count(self.snapshot(strip)), 40 + 2 * 4)             # one side per free end
+        self.assertEqual(count(self.snapshot(self.polygon(64, lam))), 128)      # a drawn curve
+        self.assertEqual(count(self.snapshot(square, n=10)), 40)                # explicit counts are kept
+        small = self.polygon(4, 0.2 * lam / math.sqrt(2), math.pi / 4)
+        self.assertEqual(count(self.snapshot(small)), 16)                       # 4-panel sides: under the minimum
+        self.assertEqual(count(self.snapshot(square, n=0, _2d_hp_coarsening=6.0, _2d_hp_refinements={})), 28)
+        thin = self.snapshot(strip, kind=1, flag=1, ibcs=[['1', 'thin_dielectric', '0.0003', '2']])
+        self.assertEqual(count(thin), 40)                                       # qualified thin layer
+
+    def test_strip_end_error_falls_16x(self):
+        lam = self.WAVELENGTH
+        strip = np.array([[-lam, 0.0], [lam, 0.0]])
+        t = 0.5 * (1 - np.cos(np.pi * np.arange(601) / 600))
+        reference_points = strip[0] + t[:, None] * (strip[1] - strip[0])
+        angles = list(np.linspace(0, 180, 37))
+
+        def solve(snapshot):
+            result = rcs.solve_monostatic_rcs_2d_single_polarization(
+                snapshot, [1.0], angles, polarization='TM', geometry_units='meters',
+                strict_quality_gate=False, execution_options=DENSE_P1)
+            return np.array([complex(r['rcs_amp_real'], r['rcs_amp_imag']) for r in result['samples']])
+        reference = solve(self.snapshot(reference_points, n=1))
+        error = np.max(np.abs(solve(self.snapshot(strip)) - reference)) / np.max(np.abs(reference))
+        self.assertLess(error, 2.5e-4)          # 2.4e-3 on the uniform 40 panels
+
+
+class RimGradingTests(unittest.TestCase):
+    """A-2: BoR conductor generatrices are graded at rims, corners and tips."""
+
+    A, L = 0.1, 0.2
+
+    def snapshot(self, points):
+        return dict(segments=[dict(name='body', seg_type=2, properties=['2', '0', '0', '0', '0'],
+                                   point_pairs=_pairs(np.asarray(points, float)))], ibcs=[], dielectrics=[])
+
+    def elements(self, points, wavelength):
+        from ghost_backend.bor import dispatch
+        chains = dispatch._chains_from_snapshot(self.snapshot(points), 1.0)
+        groups, _tol, _axis_tol = dispatch._prepare_bor_groups(chains, dispatch._classify(chains))
+        return dispatch._run_element_count(groups[0], wavelength)
+
+    def test_rims_and_tips_are_graded_and_poles_are_not(self):
+        from ghost_backend.bor.solver import sphere_generatrix
+        from ghost_backend.bor.kernels import C0
+        wavelength = 2 * math.pi * self.A / 3.0
+        cylinder = [[0, self.L / 2], [self.A, self.L / 2], [self.A, -self.L / 2], [0, -self.L / 2]]
+        self.assertEqual(self.elements(cylinder, wavelength), 40 + 2 * 8)
+        sphere = sphere_generatrix(self.A, 64)
+        self.assertEqual(self.elements(sphere, C0 / 3e9), 64)
+        # A 30 degree cone tip on a flat base: the tip gains one side, the rim
+        # only its slant side (the base, 6 elements, is below the minimum of 8).
+        cone = [[0, self.L], [self.L * math.tan(math.radians(15)), 0], [0, 0]]
+        lengths = [math.hypot(*np.subtract(q, p)) for p, q in zip(cone[:-1], cone[1:])]
+        uniform = [max(1, math.ceil(length / (wavelength / 20))) for length in lengths]
+        self.assertEqual(uniform[1], 6)
+        self.assertEqual(self.elements(cone, wavelength), sum(uniform) + 4 + 4)
+        # Explicit counts and corrugations keep their elements.
+        explicit = self.snapshot(cylinder)
+        explicit['segments'][0]['properties'][1] = '5'
+        from ghost_backend.bor import dispatch
+        chains = dispatch._chains_from_snapshot(explicit, 1.0)
+        groups = dispatch._prepare_bor_groups(chains, dispatch._classify(chains))[0]
+        self.assertEqual(dispatch._run_element_count(groups[0], wavelength), 15)
+
+    def test_cylinder_rim_error_falls_15x(self):
+        from ghost_backend.bor import dispatch
+        from ghost_backend.bor import solver as bor
+        from ghost_backend.bor.kernels import C0
+        frequency = 3.0 * C0 / (2 * math.pi * self.A)
+        aspects = [0., 20., 45., 70., 90., 110., 135., 160., 180.]
+        step = C0 / frequency / 120
+
+        def run(p0, p1, levels_start, levels_end):
+            n = max(2, int(math.ceil(math.hypot(p1[0] - p0[0], p1[1] - p0[1]) / step)))
+            t = set(np.linspace(0, 1, n + 1)) | {0.5 ** k / n for k in range(1, levels_start + 1)} \
+                | {1 - 0.5 ** k / n for k in range(1, levels_end + 1)}
+            t = np.array(sorted(t))[:, None]
+            return np.asarray(p0) + t * (np.subtract(p1, p0))
+        a, half = self.A, self.L / 2
+        reference_points = np.vstack([run((0, half), (a, half), 0, 4), run((a, half), (a, -half), 4, 4)[1:],
+                                      run((a, -half), (0, -half), 4, 0)[1:]])
+        reference = bor.solve_bor(reference_points, frequency, aspects, formulation='cfie')
+        expected = np.concatenate([reference['sigma_vv'], reference['sigma_hh']])
+        result = dispatch.solve_monostatic_rcs_bor_survey(
+            geometry_snapshot=self.snapshot([[0, half], [a, half], [a, -half], [0, -half]]),
+            frequencies_ghz=[frequency / 1e9], elevations_deg=aspects, geometry_units='meters')
+        sigma = np.concatenate([[row['rcs_linear'] for row in result['co_solved_samples'][pol]]
+                                for pol in ('VV', 'HH')])
+        self.assertEqual(result['metadata']['per_frequency'][0]['mesh_elements_total'], 56)
+        self.assertLess(np.max(np.abs(10 * np.log10(sigma / expected))), 0.006)   # 0.060 dB uniform
+
+
+class BorOwnShareTests(unittest.TestCase):
+    """H-1: a BoR array task runs its own share before it takes its peers' units."""
+
+    def test_no_task_is_starved_by_a_fast_starter(self):
+        import os
+        import re
+        import subprocess
+        import tempfile
+        from ghost_backend.bor import solver as bor
+        from ghost_backend.hpc.common import configure_driver, latest_run_dir
+        backend = ROOT / 'ghost_backend'
+        points = bor.sphere_generatrix(0.1, 24)
+        rows = '\n'.join('{:.12g} {:.12g} {:.12g} {:.12g}'.format(*a, *b) for a, b in zip(points[:-1], points[1:]))
+        tasks, frequencies = 3, [1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+        with tempfile.TemporaryDirectory() as folder:
+            work = Path(folder)
+            (work / 'geometry').mkdir()
+            (work / 'geometry' / 'sphere.geo').write_text(
+                'Title: PEC sphere\nSegment: pec 2\nproperties: 2 1 0 0 0\n' + rows
+                + '\nIBCS_Resistances:\nDielectrics:\n')
+            driver = configure_driver(backend / 'run_hpc_bor_monostatic.py', work / 'driver.py', dict(
+                GEOMETRY_DIRS=[str(work / 'geometry')], FREQUENCIES_GHZ=frequencies, AZIMUTHS_DEG=[0.],
+                ELEVATIONS_DEG=[0., 30.], OUTPUT_DIR=str(work / 'runs'), N_NODES=tasks, N_JOBS=1,
+                GEOMETRY_UNITS='meters', MESH_CERTIFICATION=False, WORKERS_PER_UNIT=1, SUBMIT=False))
+            env = dict(os.environ, PYTHONPATH=str(backend.parent), OPENBLAS_NUM_THREADS='1',
+                       OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', PYTHONDONTWRITEBYTECODE='1')
+            submit = subprocess.run([sys.executable, str(driver)], env=env, cwd=work,
+                                    capture_output=True, text=True, timeout=600)
+            self.assertEqual(submit.returncode, 0, submit.stdout + submit.stderr)
+            run_dir = latest_run_dir(work / 'runs')
+            workers = [subprocess.Popen([sys.executable, str(driver), '--worker', str(run_dir), '0', str(task)],
+                                        env=env, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True)
+                       for task in range(tasks)]
+            outputs = [worker.communicate(timeout=900)[0] for worker in workers]
+            self.assertTrue(all(worker.returncode == 0 for worker in workers), '\n'.join(outputs))
+            wrote = [int(re.search(r'wrote=(\d+)', output).group(1)) for output in outputs]
+            planned = [int(re.search(r'planned here: (\d+)', output).group(1)) for output in outputs]
+            pools = [int(re.search(r'pool: (\d+) x', output).group(1)) for output in outputs]
+            self.assertEqual(sum(wrote), len(frequencies))
+            self.assertTrue(all(count > 0 for count in wrote), wrote)
+            # The pool was sized from every candidate (6), so a task that
+            # started first could claim the whole run before its peers began.
+            self.assertEqual(pools, planned)
+            self.assertEqual(sum(planned), len(frequencies))
 
 
 if __name__ == '__main__':

@@ -25,9 +25,9 @@ class LoadedConfiguration:
             raise ValueError('Driver configuration changed after loading. Restart with a stable configuration.')
 
 
-OPTIONAL_INTS = {'WORKERS', 'N_MODES', 'CORES_PER_NODE', 'MAX_WORKERS_PER_NODE'}
-POSITIVE_INTS = {'N_NODES', 'N_JOBS', 'MAX_ELEMENTS',
-                 'BLAS_THREADS_PER_WORKER', 'WORKERS_PER_UNIT', 'TASKS_PER_CHILD'}
+OPTIONAL_INTS = {'WORKERS', 'N_MODES', 'CORES_PER_NODE', 'MAX_WORKERS_PER_NODE',
+                 'BLAS_THREADS_PER_WORKER'}
+POSITIVE_INTS = {'N_NODES', 'N_JOBS', 'MAX_ELEMENTS', 'WORKERS_PER_UNIT', 'TASKS_PER_CHILD'}
 OPTIONAL_TEXT = {'SLURM_ACCOUNT', 'SLURM_QOS', 'SLURM_TIME', 'MEM_PER_NODE',
                  'SLURM_MAIL_TYPE', 'SLURM_MAIL_USER'}
 TEXT = {'OUTPUT_DIR', 'SLURM_PARTITION', 'PYTHON_EXE'}

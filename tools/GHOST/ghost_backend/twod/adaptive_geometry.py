@@ -123,8 +123,21 @@ def eligible_snapshot(snapshot, materials, frequencies=None, scale=1., mesh_refe
 
 # The hp candidate coarsens wavelength-sized counts by this factor, but never
 # below one element per drawn primitive; the accuracy check runs at this degree.
-HP_COARSENING = 4.
+# Certified NACA 0012 (c = 8 m, 10 GHz, 361 angles): 4 took 26.4 s with a P2/P3
+# difference of 4.9e-5 against the 2e-3 acceptance limit; 6 took 13.5 s, 2.2e-4,
+# and moved the published field by 3.3e-6. A 1 m PEC circle stayed within
+# 9.6e-7 of the exact series (4.5 s against 10.5 s).
+HP_COARSENING = 6.
 HP_CHECK_DEGREE = 3
+# The accuracy check also grades impedance junctions this many geometric levels
+# deeper than the candidate it is compared with. On one mesh, P2 and P3 miss
+# the innermost element at an r**-1/2 junction: with one PEC|75-20j junction
+# on a 6.4 wavelength square (TM) the true error was 4.1x the reported change,
+# with sixteen 5.2x. Two deeper levels made the change an overestimate
+# (0.2x and 0.6x) and lowered the true error 10x and 2.3x, for two more
+# elements per junction side. Corners were already overestimated and open
+# strip ends within 1.2x.
+HP_CHECK_SINGULAR_LEVELS = 2
 # The cubic candidate may have at most this multiple of the P1 reference
 # unknowns (at most one element per two reference panels; the P2/P3 LU flops
 # then stay within the certified P1 pair's). Certified dense solves at 3 GHz:
@@ -153,7 +166,9 @@ def candidate_meshes(snapshot, materials, factor, adaptive, frequencies=None, sc
         candidate = copy.deepcopy(snapshot)
         candidate['_2d_hp_coarsening'] = HP_COARSENING
         candidate['_2d_hp_refinements'] = {}
-        return [('base', candidate, 2), ('fine', candidate, 3)]
+        check = copy.deepcopy(candidate)
+        check['_2d_hp_singular_levels'] = HP_CHECK_SINGULAR_LEVELS
+        return [('base', candidate, 2), ('fine', check, 3)]
     records = [('base', snapshot, 1)]
     if factor > 1:
         fine = scale_snapshot_panel_density(snapshot, factor)

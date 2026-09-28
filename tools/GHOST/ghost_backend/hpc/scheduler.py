@@ -349,6 +349,33 @@ def cpu_allocation_scope(cpus: 'Optional[int]'):
         yield count
 
 
+@contextmanager
+def unit_blas_scope(automatic: 'bool'):
+    """BLAS threads up to the unit's CPU allocation while its solve runs.
+
+    Unit processes start on one BLAS thread (``pin_blas_threads``), so
+    OpenBLAS does not reserve buffers for every core at import (about 1 GB
+    of commit for 16 threads), and the solvers only ever lower BLAS limits:
+    ``bor.solver._bounded_blas_threads`` splits them among mode workers and
+    ``execution.options.single_thread_blas`` holds thread pools at one.  A
+    unit granted many CPUs therefore factored every mode on one thread (LU
+    at n = 2,500: 0.52 s against 0.31 s on its 2 CPUs).  Inside
+    ``cpu_allocation_scope`` this raises the limit to the unit's
+    ``blas_core_budget`` (its CPUs, at most the physical cores) and restores
+    it afterwards; ``automatic=False`` (an explicit per-worker count) leaves
+    the pinned limit alone.
+    """
+
+    if not automatic:
+        yield None
+        return
+    from ghost_backend.execution.options import blas_core_budget
+    from ghost_backend.execution.thread_control import threadpool_limits
+    threads = blas_core_budget()
+    with threadpool_limits(limits=threads, user_api="blas"):
+        yield threads
+
+
 def free_disk_gib(path: 'os.PathLike') -> 'Optional[float]':
     """Free space of the filesystem holding ``path`` in GiB, or None."""
 

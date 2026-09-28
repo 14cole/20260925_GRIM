@@ -135,7 +135,9 @@ MESH_CERTIFICATION      = True           # recommended base/fine comparison;
 WORKERS_PER_UNIT        = 4              # threads inside one BoR solve (modes
                                          # + streaming tiles); pool size =
                                          # cores // WORKERS_PER_UNIT
-BLAS_THREADS_PER_WORKER = 1
+BLAS_THREADS_PER_WORKER = None           # None = each solve's CPU reservation,
+                                         # shared by its mode workers; an int
+                                         # pins every unit process to it
 
 # --- Scheduling ------------------------------------------------------------
 # Units are costed at submit time and assigned longest-first, then claimed
@@ -707,11 +709,15 @@ def _solve_and_export_star(args):
     # type: (tuple) -> tuple
     """Pool entry point; the optional fifth argument is the unit's CPU
     reservation, which bounds its native teams, near-preparation workers and
-    BLAS limits instead of letting every concurrent unit size to the node."""
+    BLAS limits instead of letting every concurrent unit size to the node.
+    A true sixth argument widens BLAS to that reservation for the solve
+    (``BLAS_THREADS_PER_WORKER = None``)."""
     u, snap, mat_base, run_dir_str = args[:4]
     cpus = args[4] if len(args) > 4 else None
+    automatic_blas = bool(args[5]) if len(args) > 5 else False
     try:
-        with hpc_scheduler.cpu_allocation_scope(cpus):
+        with hpc_scheduler.cpu_allocation_scope(cpus), \
+                hpc_scheduler.unit_blas_scope(automatic_blas and cpus is not None):
             status, path = _solve_and_export(u, snap, mat_base, run_dir_str)
         return ("ok", status, path, u)
     except Exception:
@@ -831,7 +837,7 @@ def submit():
         or not math.isfinite(float(STREAM_BUDGET_GB))
         or float(STREAM_BUDGET_GB) <= 0.0
         or int(WORKERS_PER_UNIT) < 1
-        or int(BLAS_THREADS_PER_WORKER) < 1
+        or BLAS_THREADS_PER_WORKER is not None and int(BLAS_THREADS_PER_WORKER) < 1
         or not math.isfinite(float(MEMORY_HEADROOM))
         or not 0.0 < float(MEMORY_HEADROOM) <= 1.0
         or int(TASKS_PER_CHILD) < 1
@@ -1114,16 +1120,19 @@ def worker(run_dir_str, job_index, node_index):
     manifest = json.loads((run_dir / "manifest.json").read_text())
     _verify_run_provenance(manifest)
     solver_config = dict(manifest.get("solver_config", {}) or {})
-    blas_threads = int(solver_config.get(
+    blas_threads = solver_config.get(
         "blas_threads_per_worker", BLAS_THREADS_PER_WORKER
-    ))
+    )
+    blas_threads = None if blas_threads is None else int(blas_threads)
     workers_per_unit = int(solver_config.get(
         "workers_per_unit", WORKERS_PER_UNIT
     ))
     geometry_units = str(solver_config.get(
         "geometry_units", GEOMETRY_UNITS
     ))
-    _pin_blas_threads(blas_threads)
+    # Automatic units import on one thread and widen per solve
+    # (hpc_scheduler.unit_blas_scope).
+    _pin_blas_threads(blas_threads or 1)
     output_units = manifest["units"]
     units = _paired_solve_units(output_units)
     n_nodes  = int(manifest.get("n_nodes", 1))
@@ -1140,12 +1149,12 @@ def worker(run_dir_str, job_index, node_index):
         key = _unit_claim_key(unit)
         return (-costs.get(key, 1.0), key)
 
-    mine = [u for u in units if _unit_claim_key(u) in mine_keys]
-    others = [u for u in units if _unit_claim_key(u) not in mine_keys]
+    mine = sorted((u for u in units if _unit_claim_key(u) in mine_keys), key=_order_key)
+    others = sorted((u for u in units if _unit_claim_key(u) not in mine_keys), key=_order_key)
     # Planned share first (dearest first), then everyone else's as a steal
     # pool. Array tasks are interchangeable: nothing is stranded when a task is
     # cancelled, preempted, or never scheduled.
-    candidates = sorted(mine, key=_order_key) + sorted(others, key=_order_key)
+    candidates = mine + others
 
     cores    = _detect_cores()
     memory_gb = hpc_scheduler.detect_memory_gb()
@@ -1155,15 +1164,21 @@ def worker(run_dir_str, job_index, node_index):
     by_threads = max(1, cores // max(1, workers_per_unit))
     worker_cap = by_threads if MAX_WORKERS_PER_NODE is None else \
         max(1, min(by_threads, int(MAX_WORKERS_PER_NODE)))
-    pool_size = max(1, min(worker_cap, len(candidates))) if candidates else 1
+    # Concurrency comes from this task's own share, as in the 2-D worker:
+    # sized from every candidate, the first task to start filled its pool
+    # from the head of the list and ran past its share into its peers'
+    # (simulated: 9 units on 3 tasks, one task ran all 9); the per-unit CPU
+    # shares follow the same pool.
+    pool_size = max(1, min(worker_cap, len(mine)))
 
     print("=" * 70)
     print(f"  Slot {slot_id}/{n_slots - 1}  "
           f"(job={job_index}, node={node_index})")
     print(f"  Physical solves: {len(units)}   planned here: {len(mine)}")
     print(f"  Output files: {len(output_units)}")
+    blas_label = "CPU reservation" if blas_threads is None else blas_threads
     print(f"  Cores: {cores}   pool: {pool_size} x {workers_per_unit} threads "
-          f"(BLAS/worker: {blas_threads})")
+          f"(BLAS/worker: {blas_label})")
     print(f"  Memory: {memory_gb:.1f} GiB allocated, {budget_gb:.1f} GiB "
           "schedulable with per-solve admission")
     print("=" * 70, flush=True)
@@ -1296,7 +1311,7 @@ def worker(run_dir_str, job_index, node_index):
             (_solve_and_export_star,
              ((unit, snapshots[unit["geometry"]][0],
                snapshots[unit["geometry"]][1], str(run_dir),
-               unit_cpus[key]),)),
+               unit_cpus[key], blas_threads is None),)),
         )
         all_outputs_exist = all(
             _unit_output_path(run_dir, channel).exists()
@@ -1354,7 +1369,7 @@ def worker(run_dir_str, job_index, node_index):
     try:
         with ExecutorPool(processes=pool_size,
                           initializer=_pool_initializer,
-                          initargs=(blas_threads,),
+                          initargs=(blas_threads or 1,),
                           max_tasks_per_child=int(TASKS_PER_CHILD)) as pool:
             dispatcher = hpc_scheduler.MemoryAwareDispatcher(
                 pool, budget_gb=budget_gb, max_concurrent=pool_size,
@@ -1362,8 +1377,13 @@ def worker(run_dir_str, job_index, node_index):
                 disk_budget_gb=lambda: hpc_scheduler.free_disk_gib(spill_dir),
             )
             try:
-                dispatcher.run(candidates, _prepare, _on_result, _on_error,
+                # Own share first; only then does this task reach for its
+                # peers' units, so a fast starter cannot swallow the run.
+                dispatcher.run(mine, _prepare, _on_result, _on_error,
                                _resources)
+                if others:
+                    dispatcher.run(others, _prepare, _on_result, _on_error,
+                                   _resources)
                 def _output_ready(unit):
                     return all(
                         _unit_output_path(run_dir, channel).is_file()

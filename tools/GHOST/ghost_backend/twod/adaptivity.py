@@ -152,13 +152,18 @@ def _run_certified(low_level_solver, geometry_snapshot, solver_kwargs,
                           failed_backends=failures, marked_primitives=len(indicators.marked())))
         return result, indicators
 
+    from ghost_backend.twod import adaptive_geometry
     snapshot = copy.deepcopy(geometry_snapshot)
-    snapshot['_2d_hp_coarsening'] = 4.
+    snapshot['_2d_hp_coarsening'] = adaptive_geometry.HP_COARSENING
     snapshot['_2d_hp_refinements'] = {}
     try:
         base, indicators = solve(snapshot, 2, 'Adaptive mesh: quadratic candidate')
         # A global increase of polynomial degree tests every primitive, including
-        # ones whose modal indicator happened to be small.
+        # ones whose modal indicator happened to be small. P2 and P3 on one mesh
+        # miss the innermost element at an r**-1/2 impedance junction (true
+        # error 4-6x their difference), so each check grades junctions deeper.
+        snapshot = copy.deepcopy(snapshot)
+        snapshot['_2d_hp_singular_levels'] = adaptive_geometry.HP_CHECK_SINGULAR_LEVELS
         fine, indicators = solve(snapshot, 3, 'Adaptive mesh: cubic accuracy check')
         for attempt in range(3):
             try:
@@ -180,6 +185,7 @@ def _run_certified(low_level_solver, geometry_snapshot, solver_kwargs,
             # Global h enrichment supplies an independent comparison; marked
             # primitives receive an additional local refinement.
             snapshot['_2d_hp_coarsening'] = max(1., snapshot['_2d_hp_coarsening'] / policy['fine_factor'])
+            snapshot['_2d_hp_singular_levels'] += adaptive_geometry.HP_CHECK_SINGULAR_LEVELS
             refinements = snapshot['_2d_hp_refinements']
             for key in indicators.marked(): refinements[key] = min(4., 1.5*refinements.get(key, 1.))
             fine, indicators = solve(snapshot, 3, 'Adaptive mesh: local refinement and global accuracy check')

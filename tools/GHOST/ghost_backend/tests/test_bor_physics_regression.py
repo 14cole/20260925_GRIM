@@ -296,7 +296,8 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
             fine_chains, wavelength
         )
         self.assertEqual(base_count, 12)
-        self.assertEqual(fine_count, 24)
+        # 1.5x over the chain, not max(b + 1, 1.5 b) per one-element primitive (24).
+        self.assertEqual(fine_count, 18)
         self.assertGreater(fine_count, base_count)
 
     def test_near_depth_changes_graded_quadrature(self):

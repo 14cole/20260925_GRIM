@@ -129,6 +129,9 @@ class _SegChain:
         # chain whose evaluated surface impedance jumps.
         self.grade_start = False
         self.grade_end = False
+        # Vertex indices graded as rims, corners, tips or free ends
+        # (_mark_edge_vertices).
+        self.graded_vertices = frozenset()
 
 
 def _chains_from_snapshot(snapshot: 'Dict[str, Any]', scale: 'float') -> 'List[_SegChain]':
@@ -274,18 +277,37 @@ def _element_count(n_prop: 'int', prim_len: 'float', lam_target: 'float') -> 'in
     return max(1, int(math.ceil(prim_len / target)))
 
 
-def _chain_element_count(
-    chain: '_SegChain', prim_len: 'float', lam_target: 'float'
-) -> 'int':
-    """Return a primitive count, refining the realized base discretization."""
+def _chain_mesh_counts(chain: '_SegChain', lam_target: 'float') -> 'Tuple[List[int], List[bool]]':
+    """Element counts of a chain's primitives, refining the realized base mesh, and
+    which primitives may be graded toward an edge vertex (``_mark_edge_vertices``).
 
+    A certification fine mesh gives the chain max(B + 1, ceil(factor * B))
+    elements for its B base elements, where they are longest and in mirror
+    pairs (``twod.geometry._certification_fine_counts``), so a symmetric
+    generatrix keeps its mirror-split factors.  The former per-primitive
+    max(b + 1, ceil(factor * b)) doubled a densely drawn generatrix: a ka = 10
+    sphere drawn with 512 primitives was certified on 1,024 fine elements
+    (32.5 s; a survey at 768 elements takes 16.1 s against 23.6 s at 1,024).
+    Edge grading follows the base mesh, so a certification pair grades alike.
+    """
+
+    cached = getattr(chain, "_mesh_counts", None)
+    if cached is not None and cached[0] == lam_target:
+        return cached[1], cached[2]
+    lengths = [float(length) for length in chain.prim_lengths]
     factor = float(chain.certification_refinement_factor)
     if factor > 1.0:
-        base_count = _element_count(
-            int(chain.certification_base_n or 0), prim_len, lam_target
-        )
-        return max(base_count + 1, int(math.ceil(base_count * factor)))
-    return _element_count(chain.n_prop, prim_len, lam_target)
+        from ghost_backend.twod.geometry import _certification_fine_counts
+        explicit = int(chain.certification_base_n or 0) > 0
+        base = [_element_count(int(chain.certification_base_n or 0), length, lam_target)
+                for length in lengths]
+        counts = _certification_fine_counts(base, lengths, factor, mirror_pairs=True)
+    else:
+        explicit = int(chain.n_prop) > 0
+        base = counts = [_element_count(chain.n_prop, length, lam_target) for length in lengths]
+    edge_ok = [not explicit and count >= BOR_EDGE_GRADING_MIN_ELEMENTS for count in base]
+    chain._mesh_counts = (lam_target, counts, edge_ok)
+    return counts, edge_ok
 
 
 # Where the surface impedance of a closed conductor jumps, the current has the
@@ -326,19 +348,86 @@ def _mark_impedance_junctions(ordered: 'List[_SegChain]', materials, freq_ghz: '
     return graded
 
 
-def _primitive_mesh_plan(chain: '_SegChain', index: 'int', count: 'int'):
+# Rims, corners, tips and free edges of a conductor or sheet generatrix hold
+# the elements to first order as impedance junctions do (the current is
+# singular there too) and are graded the same way. PEC cylinder, ka = 3,
+# L = 2a, CFIE, against a graded lambda/120 reference: 0.165 -> 0.0077 dB at
+# 10 elements per wavelength (20 -> 36 elements) and 0.060 -> 0.0039 dB at the
+# default 20 (40 -> 56), below a uniform 40 per wavelength (0.022 dB, 79). A
+# 15 degree cone tip: two levels 0.167 -> 0.112 dB, as doubling every element.
+# A vertex that turns less (a drawn curve), and an axial end within half that
+# of meeting the axis at a right angle (a smooth pole), are left alone, as are
+# explicit counts (N > 0) and a primitive of fewer than
+# BOR_EDGE_GRADING_MIN_ELEMENTS base elements (a corrugation or short facet),
+# which grading would more than double.
+BOR_EDGE_GRADING_TURN_DEG = 30.0
+BOR_EDGE_GRADING_MIN_ELEMENTS = 8
+
+
+def _mark_edge_vertices(ordered: 'List[_SegChain]', axis_tol: 'float') -> 'int':
+    """Mark the rims, corners, tips and free edges of one stitched conductor or sheet generatrix.
+
+    Geometry only, so preview and solve (both through ``_prepare_bor_groups``)
+    mark the same vertices. Returns the number of graded vertices.
+    """
+    sharp = -math.cos(math.radians(BOR_EDGE_GRADING_TURN_DEG)) - 1.0e-9
+    owners: 'List[List[Tuple[int, int]]]' = []
+    points: 'List[np.ndarray]' = []
+    for chain_index, chain in enumerate(ordered):
+        for local, point in enumerate(chain.pts):
+            if chain_index and local == 0:
+                owners[-1].append((chain_index, 0))     # shared with the previous chain's end
+                continue
+            owners.append([(chain_index, local)])
+            points.append(np.asarray(point, float))
+
+    def unit(vector):
+        length = float(np.hypot(vector[0], vector[1]))
+        return vector / length if length > 0.0 else None
+
+    graded = []
+    last = len(points) - 1
+    closed = last > 1 and float(np.hypot(*(points[0] - points[last]))) <= axis_tol
+    for vertex in range(last + 1):
+        if 0 < vertex < last:
+            before, after = unit(points[vertex - 1] - points[vertex]), unit(points[vertex + 1] - points[vertex])
+        elif closed:
+            # A run that closes on itself off the axis turns across its seam.
+            before, after = unit(points[last - 1] - points[last]), unit(points[1] - points[0])
+        else:
+            inward = unit(points[1] - points[0] if vertex == 0 else points[last - 1] - points[last])
+            if inward is None:
+                continue
+            if abs(points[vertex][0]) > axis_tol:
+                graded.append(vertex)               # a free edge of a sheet
+                continue
+            # The axial end meets its own continuation across the axis.
+            before, after = inward, np.array([-inward[0], inward[1]])
+        if before is not None and after is not None and float(np.dot(before, after)) >= sharp:
+            graded.append(vertex)
+    marks: 'Dict[int, set]' = {index: set() for index in range(len(ordered))}
+    for vertex in graded:
+        for chain_index, local in owners[vertex]:
+            marks[chain_index].add(local)
+    for chain_index, chain in enumerate(ordered):
+        chain.graded_vertices = frozenset(marks[chain_index])
+    return len(graded)
+
+
+def _primitive_mesh_plan(chain: '_SegChain', index: 'int', count: 'int', edge_ok: 'bool' = False):
     """Allocation-free subdivision plan shared by counting and meshing."""
-    at_start = chain.grade_start and index == 0
-    at_end = chain.grade_end and index == len(chain.pts) - 2
+    graded = chain.graded_vertices if edge_ok else ()
+    at_start = (chain.grade_start and index == 0) or index in graded
+    at_end = (chain.grade_end and index == len(chain.pts) - 2) or index + 1 in graded
     if count == 1 and at_start and at_end:
         count = 2
     levels = max(0, int(BOR_JUNCTION_GRADING_LEVELS))
     return count, at_start, at_end, levels
 
 
-def _primitive_breaks(chain: '_SegChain', index: 'int', count: 'int') -> 'List[float]':
+def _primitive_breaks(chain: '_SegChain', index: 'int', count: 'int', edge_ok: 'bool' = False) -> 'List[float]':
     """Parametric boundaries; callers admit the element count before allocating."""
-    count, at_start, at_end, levels = _primitive_mesh_plan(chain, index, count)
+    count, at_start, at_end, levels = _primitive_mesh_plan(chain, index, count, edge_ok)
     breaks = [i / count for i in range(count + 1)]
     if not (at_start or at_end):
         return breaks
@@ -392,12 +481,13 @@ def _mesh_generatrix(ordered: 'List[_SegChain]', lam_target: 'float',
     elem_arc: 'List[float]' = []
     for ci, c in enumerate(ordered):
         arc0 = 0.0
+        counts, edge_ok = _chain_mesh_counts(c, lam_target)
         for pi in range(len(c.pts) - 1):
             p0, p1 = c.pts[pi], c.pts[pi + 1]
             plen = c.prim_lengths[pi]
-            cnt = _chain_element_count(c, plen, lam_target)
-            if c.grade_start or c.grade_end:
-                breaks = _primitive_breaks(c, pi, cnt)
+            cnt = counts[pi]
+            if c.grade_start or c.grade_end or c.graded_vertices:
+                breaks = _primitive_breaks(c, pi, cnt, edge_ok[pi])
                 for t0, t1 in zip(breaks[:-1], breaks[1:]):
                     if not points:
                         points.append(tuple(p0 + (p1 - p0) * t0))
@@ -1553,6 +1643,8 @@ def _prepare_bor_groups(chains: 'List[_SegChain]', kind: 'str'):
         )
         if kind != "sheet":
             _preflight_generatrix(ordered, "body", axis_tol)
+        if kind in ("conductor", "sheet"):
+            _mark_edge_vertices(ordered, axis_tol)
         groups = [ordered]
 
     # Run the same material-side check before preview estimates or meshing.
@@ -1594,9 +1686,9 @@ def _run_element_count(run: 'List[_SegChain]', wavelength: 'float') -> 'int':
     # breakpoint list before the configured element limit can reject it.
     total = 0
     for chain in run:
-        for index, length in enumerate(chain.prim_lengths):
-            count, start, end, levels = _primitive_mesh_plan(
-                chain, index, _chain_element_count(chain, float(length), wavelength))
+        counts, edge_ok = _chain_mesh_counts(chain, wavelength)
+        for index, element_count in enumerate(counts):
+            count, start, end, levels = _primitive_mesh_plan(chain, index, element_count, edge_ok[index])
             total += count + levels * (int(start) + int(end))
     return total
 

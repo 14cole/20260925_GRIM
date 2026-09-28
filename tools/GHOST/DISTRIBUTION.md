@@ -71,8 +71,16 @@ The quadrature rescue retains its convergence check; unresolved cases still rais
 an error. BoR impedance grading currently covers closed conductor snapshots,
 with four fixed refinement levels. Partial/banded material junctions and sheets
 retain their existing discretization. The 2-D contrast threshold and added levels
-improve the tested junctions but do not establish accuracy for arbitrary corners,
-open ends or triple junctions. See `NUMERICAL_METHODS.md` and
+improve the tested junctions. Since 27 September the same levels also grade:
+- 2-D free ends, branch points and corners of 150 degrees or less on linear
+  meshes;
+- BoR conductor rims, corners and tips.
+
+Explicit counts and primitives of fewer than eight automatic panels are left
+as drawn.
+
+This lowered the tested errors 13-69x. It does not establish accuracy for
+arbitrary corners, open ends or triple junctions. See `NUMERICAL_METHODS.md` and
 `GEOMETRY_INPUT_CHEATSHEET.md` for the supported inputs and limitations.
 
 GPU support is limited to low-level diagnostics. No real CuPy hardware execution
