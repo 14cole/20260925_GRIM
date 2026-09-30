@@ -83,3 +83,5 @@ class PlotContext:
     last_python_plot_spec: tuple | None = None
     delta_map_controls: Any = None
     isar_advanced: Any = None
+    analysis_controls: Any = None
+    plot_slider: Any = None

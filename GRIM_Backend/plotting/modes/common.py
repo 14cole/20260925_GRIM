@@ -420,15 +420,30 @@ class StreamingEnvelope:
     circular coverage needs the observations: spool them to a temporary file
     and sort bounded column blocks, rather than keep every curve in RAM.
     Equal largest gaps choose the smallest start angle in [-180,180).
+
+    ``percentiles=(low, high)`` replaces min/max with those percentiles of
+    the finite samples at each X (linear interpolation between samples),
+    using the same spooled, column-blocked reduction.
     """
 
     phase_degrees: bool = False
+    percentiles: tuple[float, float] | None = None
     lower: np.ndarray | None = None
     upper: np.ndarray | None = None
     count: np.ndarray | None = None
     _phase_file: object = field(default=None, init=False, repr=False)
     _phase_rows: int = field(default=0, init=False, repr=False)
     _phase_dirty: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self):
+        if self.percentiles is None:
+            return
+        if self.phase_degrees:
+            raise ValueError("phase bands do not support percentiles")
+        low, high = (float(value) for value in self.percentiles)
+        if not (0.0 <= low < high <= 100.0):
+            raise ValueError("percentiles must satisfy 0 <= low < high <= 100")
+        self.percentiles = (low, high)
 
     def update(self, values) -> None:
         values = np.asarray(values, dtype=float)
@@ -441,7 +456,7 @@ class StreamingEnvelope:
             raise ValueError("all envelope series must have the same shape")
 
         assert self.upper is not None and self.count is not None
-        if self.phase_degrees:
+        if self.phase_degrees or self.percentiles is not None:
             if self._phase_file is None:
                 self._phase_file = tempfile.TemporaryFile()
             self._phase_file.seek(0, 2)
@@ -464,6 +479,24 @@ class StreamingEnvelope:
     def result(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.lower is None or self.upper is None or self.count is None:
             raise ValueError("cannot read an empty envelope")
+        if self.percentiles is not None and self._phase_dirty and self.lower.size:
+            self._phase_file.flush()
+            samples = np.memmap(self._phase_file, dtype=np.float64, mode="r",
+                                shape=(self._phase_rows, self.lower.size))
+            block_columns = max(1, REDUCTION_BLOCK_CELLS // self._phase_rows)
+            try:
+                for start in range(0, self.lower.size, block_columns):
+                    stop = min(self.lower.size, start + block_columns)
+                    block = np.array(samples[:, start:stop])
+                    with warnings.catch_warnings():
+                        # All-missing columns stay NaN.
+                        warnings.simplefilter("ignore", category=RuntimeWarning)
+                        low, high = np.nanpercentile(block, self.percentiles, axis=0)
+                    self.lower.flat[start:stop] = low
+                    self.upper.flat[start:stop] = high
+            finally:
+                del samples
+            self._phase_dirty = False
         if self.phase_degrees and self._phase_dirty and self.lower.size:
             self._phase_file.flush()
             samples = np.memmap(self._phase_file, dtype=np.float64, mode="r",
@@ -904,3 +937,127 @@ def common_axis_indices(left, right, *, tolerance=1.0e-6):
         else:
             right_pos += 1
     return np.asarray(left_matches, dtype=int), np.asarray(right_matches, dtype=int)
+
+
+MAX_SECTORS = 720
+
+
+@dataclass(frozen=True)
+class Sector:
+    """One azimuth sector: ``start`` plus a positive ``width``.
+
+    Explicit sectors are ``modular`` so they can wrap through ±180 (or 0/360);
+    tiled sectors are plain intervals so the seam sample is counted once.
+    """
+
+    start: float
+    width: float
+    period: float
+    closed: bool = True
+    modular: bool = True
+    stop_value: float | None = None
+
+    def label(self) -> str:
+        stop = self.start + self.width if self.stop_value is None else self.stop_value
+        return f"{self.start:g} to {stop:g}"
+
+    def contains(self, values) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        eps = 1.0e-9 * self.period
+        if self.modular:
+            if self.width >= self.period - eps:
+                return np.isfinite(values)
+            offset = np.mod(values - self.start + eps, self.period) - eps
+        else:
+            offset = values - self.start
+            offset = np.where(offset >= -eps, offset, np.inf)
+        if self.closed:
+            return offset <= self.width + eps
+        return offset < self.width - eps
+
+    def display_pieces(self, low: float, high: float) -> list[tuple[float, float]]:
+        """Plot-x extents of this sector clipped to the displayed ``[low, high]``."""
+        start = self.start
+        if self.modular:
+            start = low + float(np.mod(self.start - low, self.period))
+        pieces = [(start, start + self.width)]
+        if start + self.width > low + self.period:
+            pieces = [(start, low + self.period), (low, start + self.width - self.period)]
+        clipped = []
+        for first, last in pieces:
+            first, last = max(first, low), min(last, high)
+            if last > first:
+                clipped.append((first, last))
+        return clipped
+
+
+def parse_sectors(text: str, selected, *, period: float = 360.0) -> list[Sector]:
+    """Parse the Sector Stats range text.
+
+    ``"30"`` tiles the selected azimuth span with 30-wide sectors starting at
+    its first value; ``"-180:30:180"`` tiles from -180 to 180 in steps of 30;
+    ``"-45:45, 45:135, 170:-170"`` lists explicit start:stop sectors, which
+    wrap through ±180 (or 0/360) when stop is below start. Explicit sectors
+    include both edges; tiled sectors are half-open except the last one, so
+    each sample is counted once.
+    """
+
+    text = str(text or "").strip()
+    selected = np.asarray(selected, dtype=float)
+    selected = selected[np.isfinite(selected)]
+    if not text:
+        raise ValueError("enter a sector width such as 30, or ranges such as -45:45, 45:135")
+    parts = [part.strip() for part in text.replace(";", ",").split(",") if part.strip()]
+
+    def number(value: str) -> float:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise ValueError(f"{value!r} is not a number") from exc
+        if not np.isfinite(parsed):
+            raise ValueError(f"{value!r} is not finite")
+        return parsed
+
+    def tiles(start: float, step: float, stop: float) -> list[Sector]:
+        if step <= 0.0:
+            raise ValueError("sector width must be positive")
+        if stop <= start:
+            raise ValueError("tiled sectors need a stop above the start")
+        count = int(np.ceil((stop - start) / step - 1.0e-9))
+        if count > MAX_SECTORS:
+            raise ValueError(f"{count} sectors requested (limit {MAX_SECTORS}); use a wider step")
+        sectors = []
+        for index in range(count):
+            first = start + index * step
+            width = min(step, stop - first)
+            sectors.append(Sector(
+                first, width, period, closed=index == count - 1, modular=False,
+            ))
+        return sectors
+
+    if len(parts) == 1 and ":" not in parts[0]:
+        if selected.size == 0:
+            raise ValueError("select azimuths to tile with sectors")
+        low, high = float(selected.min()), float(selected.max())
+        if high <= low:
+            return [Sector(low, number(parts[0]), period, modular=False)]
+        return tiles(low, number(parts[0]), high)
+    if len(parts) == 1 and parts[0].count(":") == 2:
+        start, step, stop = (number(value) for value in parts[0].split(":"))
+        return tiles(start, step, stop)
+
+    sectors = []
+    for part in parts:
+        bounds = part.split(":")
+        if len(bounds) != 2:
+            raise ValueError(f"{part!r} is not a start:stop sector")
+        start, stop = (number(value) for value in bounds)
+        if start == stop:
+            raise ValueError(f"sector {part!r} is empty")
+        width = float(np.mod(stop - start, period))
+        sectors.append(Sector(
+            start, period if width == 0.0 else width, period, stop_value=stop,
+        ))
+    if len(sectors) > MAX_SECTORS:
+        raise ValueError(f"{len(sectors)} sectors requested (limit {MAX_SECTORS})")
+    return sectors

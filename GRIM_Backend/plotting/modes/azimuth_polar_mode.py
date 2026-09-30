@@ -41,6 +41,8 @@ def render(self) -> None:
         self._show_plot_status("No compatible one-to-one coordinates for the selected plot.")
         return
     self._configure_line_budget(sum(len(sel[1]) * len(sel[2]) for _, _, sel in plans))
+    if self._delta_reference(plans, None) is False:
+        return
     angular_unit = self._plot_axis_unit(reference, "azimuth")
     self._polar_display_unit = angular_unit
     if not self._prepare_line_plot_axes(
@@ -48,16 +50,15 @@ def render(self) -> None:
         "polar",
         reference,
         datasets,
-        pbp_active=pbp_active,
     ):
         return
 
     rendered = 0
     omitted = 0
-    envelope = self._new_pbp_envelope() if pbp_active else None
+    bands = self._new_pbp_bands(datasets) if pbp_active else None
     for name, dataset, selection in plans:
         candidates = len(selection[1]) * len(selection[2])
-        if envelope is None and rendered >= common.MAX_LINE_SERIES:
+        if bands is None and rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
             continue
         for candidate_index, (x_values, display, label, trace_key) in enumerate(_series(
@@ -65,8 +66,8 @@ def render(self) -> None:
         )):
             if not np.any(np.isfinite(display)):
                 continue
-            if envelope is not None:
-                envelope.update(display)
+            if bands is not None:
+                bands.update(dataset, display)
                 rendered += 1
             elif rendered < common.MAX_LINE_SERIES:
                 theta = common.convert_axis_values(
@@ -79,13 +80,7 @@ def render(self) -> None:
                     omitted += candidates - candidate_index - 1
                     break
 
-    if envelope is not None and envelope.lower is not None:
-        lower, upper, density = envelope.result()
-        envelope.close()
-        x_values, lower, upper, density = self._bounded_plot_envelope(
-            az_values, lower, upper, density
-        )
-        theta = common.convert_axis_values(x_values, "azimuth", angular_unit, "rad")
+    if bands is not None:
         freq_unit = self._plot_axis_unit(reference, "frequency")
         elev_unit = self._plot_axis_unit(reference, "elevation")
         elev_name = self._plot_axis_name(reference, "elevation")
@@ -99,15 +94,10 @@ def render(self) -> None:
             if elev_values.size > 1
             else f"{elev_values[0]:g} {elev_unit}"
         )
-        label = f"PBP Pol {polarization}, Freq {freq_label}, {elev_name} {elev_label}"
-        self._plot_pbp_fill(theta, lower, upper, label, polar=True, density=density)
-        self._plot_bounded_line(
-            self.plot_ax, theta, lower, color="#8a8a8a", linewidth=1,
-            label="_nolegend_",
-        )
-        self._plot_bounded_line(
-            self.plot_ax, theta, upper, color="#8a8a8a", linewidth=1,
-            label="_nolegend_",
+        bands.draw(
+            az_values, f"Pol {polarization}, Freq {freq_label}, {elev_name} {elev_label}",
+            polar=True,
+            to_plot_x=lambda x: common.convert_axis_values(x, "azimuth", angular_unit, "rad"),
         )
 
     if rendered == 0:

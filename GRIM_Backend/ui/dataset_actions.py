@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from PySide6.QtCore import QItemSelectionModel, QObject, QThread, Qt, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -67,7 +67,9 @@ from GRIM_Backend.datasets.transforms import (
     offset_db,
     regrid_axis,
     shift_dataset,
+    time_gate,
 )
+from GRIM_Backend.plotting.modes import sector_stats_mode
 
 # Compatibility imports retain the established module entrypoints.
 from GRIM_Backend.ui.dataset_dialogs import (
@@ -89,6 +91,7 @@ from GRIM_Backend.ui.dataset_dialogs import (
     StatisticsDialog,
     JoinDialog,
     SupportReferenceDifferenceDialog,
+    TimeGateDialog,
     WedgeConicDialog,
     WrapDialog,
     _COHERENT_METADATA_LABELS,
@@ -198,6 +201,27 @@ _WINDOWS_RESERVED_FILENAMES = frozenset(
 DATASET_ID_ROLE = Qt.UserRole + 32
 DATASET_DIRTY_ROLE = Qt.UserRole + 33
 DATASET_PATH_ROLE = Qt.UserRole + 34
+DATASET_GROUP_COLUMN = 3
+_DELTA_REFERENCE_ICON = None
+
+
+def _delta_reference_icon() -> QIcon:
+    """A small amber Δ marking the picked Δ reference row."""
+
+    global _DELTA_REFERENCE_ICON
+    if _DELTA_REFERENCE_ICON is None:
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        font = painter.font()
+        font.setBold(True)
+        font.setPixelSize(14)
+        painter.setFont(font)
+        painter.setPen(QColor("#f2a33a"))
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "Δ")
+        painter.end()
+        _DELTA_REFERENCE_ICON = QIcon(pixmap)
+    return _DELTA_REFERENCE_ICON
 
 # Explicit output limits keep a typo such as a 1e-9 degree step from allocating
 # an axis (and then a dense four-dimensional result) before the user can react.
@@ -1088,6 +1112,13 @@ class DatasetOpsMixin:
             self.table.setItem(row, 0, name_item)
             self.table.setItem(row, 1, file_item)
             self.table.setItem(row, 2, history_item)
+            if self.table.columnCount() > DATASET_GROUP_COLUMN:
+                group_item = QTableWidgetItem("")
+                group_item.setToolTip(
+                    "PbP group: selected datasets that share a group name form one "
+                    "PbP band. Double-click to edit; leave empty for ungrouped."
+                )
+                self.table.setItem(row, DATASET_GROUP_COLUMN, group_item)
         finally:
             self.table.blockSignals(signals_were_blocked)
         if notify:
@@ -1095,6 +1126,64 @@ class DatasetOpsMixin:
             if callable(catalog_notify):
                 catalog_notify()
         return dataset_id
+
+    def _dataset_plot_group(self, dataset) -> str:
+        """PbP group typed in the dataset table ("" when ungrouped)."""
+
+        for row in range(self.table.rowCount()):
+            name_item = self.table.item(row, 0)
+            if name_item is None or name_item.data(Qt.UserRole) is not dataset:
+                continue
+            group_item = self.table.item(row, DATASET_GROUP_COLUMN)
+            return group_item.text().strip() if group_item is not None else ""
+        return ""
+
+    def _explicit_delta_reference(self):
+        """(name, dataset) picked with Set as Δ reference, while its row exists."""
+
+        reference_id = getattr(self, "_delta_reference_id", None)
+        if not reference_id:
+            return None
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None and item.data(DATASET_ID_ROLE) == reference_id:
+                dataset = item.data(Qt.UserRole)
+                return (item.text(), dataset) if isinstance(dataset, RcsGrid) else None
+        return None
+
+    def _set_delta_reference_row(self, row: int | None) -> None:
+        """Pick (or with None, clear) the dataset every Δ Ref plot subtracts."""
+
+        item = self.table.item(row, 0) if row is not None else None
+        self._delta_reference_id = (
+            str(item.data(DATASET_ID_ROLE) or "") or None if item is not None else None
+        )
+        self._refresh_delta_reference_marker()
+        message = (
+            f"Δ reference set to {item.text()}; Δ Ref plots subtract it even when "
+            "its row is not selected."
+            if item is not None
+            else "Δ reference cleared; Δ Ref subtracts the active row again."
+        )
+        before = self.status.currentMessage()
+        if self._delta_reference_active():
+            self._on_delta_ref_toggled()
+        after = self.status.currentMessage()
+        # Keep the re-plot's own status (or block reason) after the confirmation.
+        self.status.showMessage(message if after == before else f"{message} {after}")
+
+    def _refresh_delta_reference_marker(self) -> None:
+        reference_id = getattr(self, "_delta_reference_id", None)
+        blocked = self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, 0)
+                if item is None:
+                    continue
+                picked = bool(reference_id) and item.data(DATASET_ID_ROLE) == reference_id
+                item.setData(Qt.DecorationRole, _delta_reference_icon() if picked else None)
+        finally:
+            self.table.blockSignals(blocked)
 
     def _python_reference_for_dataset(
         self, dataset: RcsGrid
@@ -1275,6 +1364,7 @@ class DatasetOpsMixin:
                 "btn_slice", "btn_stats", "btn_percentile", "btn_interpolate",
                 "btn_decimate", "btn_mirror", "btn_wrap", "btn_shift",
                 "btn_round", "btn_offset", "btn_medianize", "btn_duplicate",
+                "btn_time_gate",
                 "btn_audit", "btn_provenance",
                 "btn_axis_units", "btn_el_to_az360", "btn_swap_el_az",
                 "btn_sentri_elevation", "btn_extrusion",
@@ -3221,6 +3311,8 @@ class DatasetOpsMixin:
         self.status.showMessage(f"Plot exported: {os.path.basename(path)}")
 
     def _on_plot_context_menu(self, pos) -> None:
+        if self._marker_context_menu(pos):
+            return
         line = self._dataset_line_at_canvas_position(pos)
         if line is not None:
             self._show_dataset_plot_style_menu(line, self.plot_canvas.mapToGlobal(pos))
@@ -3242,7 +3334,40 @@ class DatasetOpsMixin:
         action_pbp_density = pbp_menu.addAction("Heatmap (Overlap Density)")
         action_pbp_density.setCheckable(True)
         action_pbp_density.setChecked(self.pbp_fill_mode == "heatmap_density")
+        controls = getattr(self, "analysis_controls", None)
+        band_actions = {}
+        if controls is not None:
+            band_menu = menu.addMenu("PBP Band")
+            percentiles = controls.pbp_percentiles()
+            low, high = controls.spin_pbp_low.value(), controls.spin_pbp_high.value()
+            for mode, text in (("minmax", "Min–Max"),
+                               ("percentile", f"Percentiles (P{low:g}–P{high:g})")):
+                band_action = band_menu.addAction(text)
+                band_action.setCheckable(True)
+                band_action.setChecked((percentiles is not None) == (mode == "percentile"))
+                band_actions[band_action] = mode
+        action_clear_markers = (
+            menu.addAction("Clear markers") if getattr(self, "_plot_markers", None) else None
+        )
+        sector_table = getattr(self.plot_figure, "_grim_sector_table", None)
+        action_copy_sectors = (
+            menu.addAction("Copy sector table")
+            if self.last_plot_mode == "sector_stats" and sector_table and sector_table["rows"]
+            else None
+        )
         action = menu.exec(self.plot_canvas.mapToGlobal(pos))
+        if action is not None and action in band_actions:
+            controls.set_pbp_band(band_actions[action])
+            return
+        if action is not None and action is action_clear_markers:
+            self._clear_plot_markers()
+            return
+        if action is not None and action is action_copy_sectors:
+            QApplication.clipboard().setText(sector_stats_mode.table_text(sector_table))
+            self.status.showMessage(
+                f"Copied {len(sector_table['rows'])} sector rows as tab-separated text."
+            )
+            return
         if action == action_copy:
             pixmap = self.plot_canvas.grab()
             QApplication.clipboard().setPixmap(pixmap)
@@ -3275,12 +3400,13 @@ class DatasetOpsMixin:
         self.table.selectAll()
 
     def _on_dataset_context_menu(self, pos) -> None:
+        clicked = self.table.indexAt(pos)
         if not self.table.selectionModel().selectedRows():
-            index = self.table.indexAt(pos)
-            if index.isValid():
-                self.table.selectRow(index.row())
+            if clicked.isValid():
+                self.table.selectRow(clicked.row())
             else:
                 return
+        reference_row = clicked.row() if clicked.isValid() else self.table.currentRow()
         menu = QMenu(self)
         action_save = menu.addAction("Save")
         export_menu = menu.addMenu("Export as…")
@@ -3291,7 +3417,19 @@ class DatasetOpsMixin:
         menu.addSeparator()
         action_color = menu.addAction("Text Color…")
         action_reset_color = menu.addAction("Reset Text Color")
+        menu.addSeparator()
+        action_set_reference = menu.addAction("Set as Δ reference")
+        action_set_reference.setEnabled(reference_row >= 0)
+        action_clear_reference = None
+        if self._explicit_delta_reference() is not None:
+            action_clear_reference = menu.addAction("Clear Δ reference")
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if action is not None and action is action_set_reference:
+            self._set_delta_reference_row(reference_row)
+            return
+        if action is not None and action is action_clear_reference:
+            self._set_delta_reference_row(None)
+            return
         if action == action_save:
             self._save_selected_datasets()
         elif action == action_export_pio:
@@ -4453,6 +4591,73 @@ class DatasetOpsMixin:
             operation,
             publish,
             start_message=f"Applying offset to {len(datasets)} dataset(s)...",
+        )
+
+    def _time_gate_selected(self) -> None:
+        datasets = self._selected_datasets_ordered(
+            use_selection_order=True,
+            empty_message="Select one or more datasets to time gate.",
+        )
+        if datasets is None:
+            return
+        preview = next(
+            (dataset for _name, dataset in datasets if dataset is self.active_dataset),
+            datasets[0][1],
+        )
+        elevations = sorted(self._selected_indices(self.list_elev))
+        polarizations = sorted(self._selected_indices(self.list_pol))
+        on_active = preview is self.active_dataset
+        try:
+            dialog = TimeGateDialog(
+                preview,
+                elevation_index=elevations[0] if on_active and elevations else 0,
+                polarization_index=polarizations[0] if on_active and polarizations else 0,
+                parent=self,
+            )
+        except ValueError as exc:
+            self.status.showMessage(f"Time Gate blocked: {exc}.")
+            return
+        if dialog.exec() != QDialog.Accepted:
+            return
+        params = dialog.get_params()
+        source_references = [
+            self._python_reference_for_dataset(dataset) for _name, dataset in datasets
+        ]
+        verb = "Keep" if params["mode"] == "keep" else "Remove"
+        span = f"{params['start_m']:g} to {params['stop_m']:g} m"
+
+        def operation(_index, _name, dataset):
+            return time_gate(dataset, **params)
+
+        def publish(results, skipped) -> None:
+            recorder = getattr(self, "python_recorder", None)
+            for source_index, name, result in results:
+                history = (
+                    f"Time gate ({verb.lower()} {span}, taper "
+                    f"{100.0 * params['taper']:g}%): {name}"
+                )
+                output_name = f"{name} [Gate {verb} {span}]"
+                output_id = self._add_dataset_row(result, output_name, history, file_name="")
+                source_ref = source_references[source_index]
+                if recorder is not None and source_ref is not None:
+                    recorder.record_function(
+                        self._python_output_reference(output_id, output_name),
+                        "time_gate",
+                        [source_ref],
+                        kwargs=dict(params),
+                        comment=f"Time gate {name}: {verb.lower()} {span}",
+                    )
+            message = f"Time gate created {len(results)} dataset(s)."
+            if skipped:
+                message += f" Skipped: {_compact_item_summary(skipped)}"
+            self.status.showMessage(message)
+
+        self._start_dataset_map_job(
+            "Time gate",
+            datasets,
+            operation,
+            publish,
+            start_message=f"Time gating {len(datasets)} dataset(s)...",
         )
 
     def _convert_extrusion_selected(self) -> None:

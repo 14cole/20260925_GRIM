@@ -15,19 +15,28 @@ from PySide6.QtWidgets import (
 )
 
 from GRIM_Backend.datasets.grid import RcsGrid
-from GRIM_Backend.plotting.dataset_style import DatasetPlotStyleMixin
+from GRIM_Backend.plotting.dataset_style import (
+    PBP_BAND_KEY,
+    DatasetPlotStyleMixin,
+    is_pbp_band_key,
+    pbp_band_key,
+)
+from GRIM_Backend.plotting.markers import PlotMarkersMixin
 from GRIM_Backend.plotting.modes import (
     az_vs_range_mode,
     azimuth_polar_mode,
     azimuth_rect_mode,
+    cdf_mode,
     compare_mode,
     delta_map_mode,
     elevation_sweep_mode,
     frequency_mode,
     isar_mode,
+    sector_stats_mode,
     waterfall_mode,
 )
 from GRIM_Backend.plotting.modes import common as plot_common
+from GRIM_Backend.plotting.slider import PlotSliderMixin
 
 
 class _IsarComputeSignals(QObject):
@@ -40,6 +49,114 @@ class _IsarComputeSignals(QObject):
 
 
 _AXIS_AVAILABILITY_WORK_BYTES = 8 * 1024**2
+
+# Translucent fills for PBP by group; one colour per group name.
+PBP_GROUP_COLORS = (
+    "#4c9be8", "#f28e2b", "#59a14f", "#e15759", "#b07aa1",
+    "#76b7b2", "#edc948", "#ff9da7", "#9c755f", "#bab0ac",
+)
+# Line-plot modes that can show each dataset as a difference from the active one.
+DELTA_REFERENCE_MODES = ("azimuth_rect", "frequency", "elevation_sweep")
+
+
+class _PbpBands:
+    """One streaming envelope per PBP group, drawn as separate bands.
+
+    Datasets without a group share the "" group. When every selected dataset
+    is ungrouped this is the classic single gray PBP band.
+    """
+
+    def __init__(self, owner, groups: dict[int, str]):
+        self._owner = owner
+        self._groups = groups
+        self._envelopes: dict[str, plot_common.StreamingEnvelope] = {}
+
+    def update(self, dataset, values) -> None:
+        group = self._groups.get(id(dataset), "")
+        envelope = self._envelopes.get(group)
+        if envelope is None:
+            envelope = self._envelopes[group] = self._owner._new_pbp_envelope()
+        envelope.update(values)
+
+    def draw(self, x_values, description: str, *, polar: bool, to_plot_x=None) -> None:
+        owner = self._owner
+        grouped = any(self._envelopes)
+        if grouped and owner.pbp_fill_mode in ("heatmap_rcs", "heatmap_density"):
+            owner._note_plot_render(
+                "Grouped PBP bands use translucent group colours; heatmap fills "
+                "apply to a single ungrouped band."
+            )
+        for index, group in enumerate(sorted(self._envelopes)):
+            envelope = self._envelopes[group]
+            if envelope.lower is None:
+                envelope.close()
+                continue
+            lower, upper, density = envelope.result()
+            percentiles = envelope.percentiles
+            envelope.close()
+            x_display, lower, upper, density = owner._bounded_plot_envelope(
+                x_values, lower, upper, density
+            )
+            if to_plot_x is not None:
+                x_display = to_plot_x(x_display)
+            prefix = (
+                "PBP" if percentiles is None
+                else f"PBP P{percentiles[0]:g}–P{percentiles[1]:g}"
+            )
+            if grouped:
+                label = f"{prefix} [{group or 'Ungrouped'}] {description}"
+                color = PBP_GROUP_COLORS[index % len(PBP_GROUP_COLORS)]
+            else:
+                label, color = f"{prefix} {description}", None
+            owner._plot_pbp_band(
+                x_display, lower, upper, label, polar, density=density,
+                key=pbp_band_key(group), color=color,
+            )
+
+
+class _DeltaReference:
+    """Turns each dataset's series into its difference from the reference."""
+
+    def __init__(self, name: str, dataset, key, series, *, phase: bool, tolerance: float):
+        self.name = name
+        self.dataset = dataset
+        self.key = key
+        self._series = series
+        self._phase = phase
+        self._tolerance = float(tolerance)
+        self.within = 0
+        self.finite = 0
+
+    def apply(self, name: str, series):
+        for index, (x_values, display, label, trace_key) in enumerate(series):
+            if index >= len(self._series):
+                return
+            reference = self._series[index]
+            display = np.asarray(display, dtype=float)
+            if display.shape != reference.shape:
+                continue
+            difference = display - reference
+            if self._phase:
+                difference = plot_common.wrap_phase_degrees(difference)
+            finite = np.isfinite(difference)
+            self.finite += int(np.count_nonzero(finite))
+            if self._tolerance > 0.0:
+                self.within += int(np.count_nonzero(
+                    np.abs(difference[finite]) <= self._tolerance
+                ))
+            head, _separator, tail = label.partition(" | ")
+            label = f"{head} − {self.name}" + (f" | {tail}" if tail else "")
+            yield x_values, difference, label, ("delta", self.key, trace_key)
+
+    def summary(self) -> str:
+        if self._tolerance <= 0.0 or not self.finite:
+            return ""
+        unit = "deg" if self._phase else "dB"
+        share = 100.0 * self.within / self.finite
+        return (
+            f"{share:.1f}% of compared samples are within ±{self._tolerance:g} {unit} "
+            f"of {self.name}."
+        )
 
 
 def _selected_polarization_axis_availability(
@@ -101,7 +218,7 @@ def _selected_polarization_axis_availability(
     return frequency_available, elevation_available, azimuth_available
 
 
-class PlotOpsMixin(DatasetPlotStyleMixin):
+class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     def _on_param_selection_changed(self) -> None:
         self._invalidate_isar_result()
         self._maybe_autoplot()
@@ -179,24 +296,49 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
     def _do_autoplot(self) -> None:
         if self.last_plot_mode is None:
             return
-        if self.last_plot_mode == "azimuth_rect":
-            self._plot_azimuth_rect()
-        elif self.last_plot_mode == "azimuth_polar":
-            self._plot_azimuth_polar()
-        elif self.last_plot_mode == "frequency":
-            self._plot_frequency()
-        elif self.last_plot_mode == "elevation_sweep":
-            self._plot_elevation_sweep()
-        elif self.last_plot_mode == "waterfall":
-            self._plot_waterfall()
-        elif self.last_plot_mode == "isar_image":
-            self._plot_isar_image()
-        elif self.last_plot_mode == "az_vs_range":
-            self._plot_az_vs_range()
-        elif self.last_plot_mode == "compare":
-            self._plot_compare()
-        elif self.last_plot_mode == "delta_map":
-            self._plot_delta_map()
+        self._render_plot_mode(self.last_plot_mode)
+
+    def _render_plot_mode(self, mode: str | None) -> None:
+        renderer = {
+            "azimuth_rect": self._plot_azimuth_rect,
+            "azimuth_polar": self._plot_azimuth_polar,
+            "frequency": self._plot_frequency,
+            "elevation_sweep": self._plot_elevation_sweep,
+            "waterfall": self._plot_waterfall,
+            "isar_image": self._plot_isar_image,
+            "az_vs_range": self._plot_az_vs_range,
+            "compare": self._plot_compare,
+            "delta_map": self._plot_delta_map,
+            "cdf": self._plot_cdf,
+            "sector_stats": self._plot_sector_stats,
+        }.get(mode)
+        if renderer is not None:
+            renderer()
+
+    def _on_delta_ref_toggled(self, _checked: bool = False) -> None:
+        if self._button_checked(getattr(self, "btn_hold", None)):
+            return
+        if self.last_plot_mode in DELTA_REFERENCE_MODES:
+            self._render_plot_mode(self.last_plot_mode)
+
+    def _on_analysis_setting_changed(self, kind: str) -> None:
+        """Re-render when a Plot Settings analysis option affects this plot."""
+        mode = self.last_plot_mode
+        affected = {
+            "pbp": mode in ("azimuth_rect", "azimuth_polar", "frequency")
+            and self._button_checked(getattr(self, "btn_pbp", None)),
+            "cdf": mode == "cdf",
+            "sector": mode == "sector_stats",
+            "delta": mode in DELTA_REFERENCE_MODES and self._delta_reference_active(),
+        }.get(kind, False)
+        if not affected or getattr(self, "_active_plot_tab", "plotting") != "plotting":
+            return
+        if self._button_checked(getattr(self, "btn_hold", None)):
+            self.status.showMessage(
+                "Setting saved. Hold is on, so plot again to apply it to the held canvas."
+            )
+            return
+        self._render_plot_mode(mode)
 
     def _maybe_autoscale(self) -> None:
         """Auto-fit the view after a render when the Auto Scale toggle is on.
@@ -216,6 +358,10 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
 
     def _on_pbp_toggled(self) -> None:
         if self.last_plot_mode is None:
+            return
+        # As with Auto Plot, a toggle must not append every selected series to
+        # a held canvas; the next explicit plot adds the band or the curves.
+        if self._button_checked(getattr(self, "btn_hold", None)):
             return
         if self.last_plot_mode == "azimuth_rect":
             self._plot_azimuth_rect()
@@ -306,6 +452,12 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             self._fit_y()
         elif self.last_plot_mode == "elevation_sweep":
             self._plot_elevation_sweep()
+            self._fit_y()
+        elif self.last_plot_mode == "cdf":
+            self._plot_cdf()
+            self._fit_both()
+        elif self.last_plot_mode == "sector_stats":
+            self._plot_sector_stats()
             self._fit_y()
         elif self.last_plot_mode == "waterfall":
             self._plot_waterfall()
@@ -419,6 +571,7 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         y_max,
         *,
         density: np.ndarray | None = None,
+        key=PBP_BAND_KEY,
     ) -> None:
         x_values = np.asarray(x_values, dtype=float)
         y_min = np.asarray(y_min, dtype=float)
@@ -452,7 +605,8 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             x_grid = np.tile(x_edges, (samples + 1, 1))
 
             cmap = self._effective_colormap()
-            self.plot_ax.pcolormesh(x_grid, y_edges, values, shading="auto", cmap=cmap)
+            mesh = self.plot_ax.pcolormesh(x_grid, y_edges, values, shading="auto", cmap=cmap)
+            mesh._grim_dataset_key = key
 
         start = None
         for idx, is_valid in enumerate(valid):
@@ -481,19 +635,68 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         polar: bool,
         *,
         density: np.ndarray | None = None,
+        key=PBP_BAND_KEY,
+        color: str | None = None,
     ) -> None:
-        if self.pbp_fill_mode in ("heatmap_rcs", "heatmap_density"):
-            self._plot_pbp_heatmap(x_values, y_min, y_max, density=density)
-            self.plot_ax.plot([], [], color=self.pbp_fill_gray, label=label)
+        if color is None and self.pbp_fill_mode in ("heatmap_rcs", "heatmap_density"):
+            self._plot_pbp_heatmap(x_values, y_min, y_max, density=density, key=key)
+            (proxy,) = self.plot_ax.plot([], [], color=self.pbp_fill_gray, label=label)
+            self._register_plot_line(proxy, key)
             return
-        self.plot_ax.fill_between(
+        fill = self.plot_ax.fill_between(
             x_values,
             y_min,
             y_max,
-            color=self.pbp_fill_gray,
-            alpha=1.0,
+            color=color or self.pbp_fill_gray,
+            alpha=1.0 if color is None else 0.35,
+            linewidth=0,
             label=label,
         )
+        fill._grim_dataset_key = key
+
+    def _plot_pbp_band(
+        self,
+        x_values,
+        lower,
+        upper,
+        label: str,
+        polar: bool,
+        *,
+        density: np.ndarray | None = None,
+        key=PBP_BAND_KEY,
+        color: str | None = None,
+    ) -> None:
+        """Draw one PBP fill and its edges as one selectable plot item.
+
+        A canvas holds one band per group. Under Hold a new band replaces the
+        old band of the same group and keeps the held curves, which draw above
+        the bands either way.
+        """
+        self._remove_plot_item_artists(key)
+        self._plot_pbp_fill(
+            x_values, lower, upper, label, polar, density=density, key=key, color=color
+        )
+        for edge in (lower, upper):
+            for line in self._plot_bounded_line(
+                self.plot_ax, x_values, edge, color=color or "#8a8a8a", linewidth=1,
+                label="_nolegend_", zorder=1.9,
+            ):
+                self._register_plot_line(line, key)
+
+    def _dataset_plot_group(self, dataset) -> str:
+        """PBP group of a dataset; the dataset table overrides this."""
+        return ""
+
+    def _new_pbp_bands(self, datasets) -> _PbpBands:
+        groups = {
+            id(dataset): str(self._dataset_plot_group(dataset) or "").strip()
+            for _name, dataset in datasets
+        }
+        return _PbpBands(self, groups)
+
+    def _pbp_percentiles(self) -> tuple[float, float] | None:
+        controls = getattr(self, "analysis_controls", None)
+        return controls.pbp_percentiles() if controls is not None else None
 
     def _style_axes(self, ax) -> None:
         bg = self._current_plot_bg()
@@ -627,6 +830,9 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         self._style_plot_axes()
 
     def _clear_plot(self) -> None:
+        if getattr(self, "_active_plot_tab", "plotting") == "plotting":
+            # Markers live on the Plotting canvas only.
+            self._clear_plot_markers(redraw=False)
         self._set_compare_sector_controls_visible(False)
         controls = getattr(self, "delta_map_controls", None)
         if controls is not None:
@@ -798,6 +1004,8 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             # Hold compares what is drawn on the axes. Phase provenance is
             # displayed as a warning, not treated as an ordinate incompatibility.
             ordinate = ("phase", "deg")
+        elif mode in DELTA_REFERENCE_MODES and self._delta_reference_active():
+            ordinate = ("difference", "dB")
         else:
             quantity = str(datasets[0][1].linear_quantity()).strip().lower()
             display_unit = (
@@ -806,14 +1014,24 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
                 else str(datasets[0][1].default_log_unit())
             )
             ordinate = (quantity, display_unit)
+        if mode in DELTA_REFERENCE_MODES and self._delta_reference_active():
+            ordinate = (*ordinate, "vs", self._dataset_plot_key(self._delta_reference_target()[0]))
+        if mode == "cdf":
+            controls = getattr(self, "analysis_controls", None)
+            exceedance = bool(controls is not None and controls.cdf_exceedance())
+            return ("cdf", str(projection), ordinate, exceedance)
+        # Sector statistics share the azimuth axis and level ordinate of an
+        # Azimuth (Rect) cut, so Hold can lay sector levels over the cut.
+        signature_mode = "azimuth_rect" if mode == "sector_stats" else str(mode)
         return (
-            str(mode),
+            signature_mode,
             str(projection),
             self._plot_axis_unit(reference, {
                 "azimuth_rect": "azimuth",
                 "azimuth_polar": "azimuth",
                 "frequency": "frequency",
                 "elevation_sweep": "elevation",
+                "sector_stats": "azimuth",
             }[mode]),
             ordinate,
         )
@@ -824,15 +1042,14 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         projection: str,
         reference,
         datasets,
-        *,
-        pbp_active: bool = False,
     ) -> bool:
         """Clear or validate a line canvas before honoring the Hold toggle.
 
-        Hold is an overlay operation, so it may retain only a line plot with
-        the same x-coordinate and ordinate contract.  Images, multi-panel
-        layouts, phase/scale changes, and unlike physical quantities must be
-        cleared rather than silently sharing mislabeled axes.
+        Hold is an overlay operation, so it may retain only a line plot (and
+        its PBP band) with the same x-coordinate and ordinate contract.
+        Images, multi-panel layouts, phase/scale changes, and unlike physical
+        quantities must be cleared rather than silently sharing mislabeled
+        axes.
         """
 
         hold = self._button_checked(self.btn_hold)
@@ -840,17 +1057,14 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         desired_projection = "polar" if projection == "polar" else "rectilinear"
         figure = self.plot_figure
         axes = list(figure.axes)
-        has_images_or_collections = any(ax.images or ax.collections for ax in axes)
-        has_lines = any(ax.lines for ax in axes)
-        has_content = has_images_or_collections or has_lines
+        has_images_or_collections = any(
+            not is_pbp_band_key(getattr(artist, "_grim_dataset_key", None))
+            for ax in axes
+            for artist in (*ax.images, *ax.collections)
+        )
+        has_content = any(ax.images or ax.collections or ax.lines for ax in axes)
         prior_signature = getattr(figure, "_grim_line_plot_signature", None)
 
-        if hold and pbp_active:
-            self.status.showMessage(
-                "Hold blocked: PBP already combines the selected series into one band. "
-                "Turn off Hold before plotting PBP."
-            )
-            return False
         if hold and has_content:
             compatible_layout = (
                 self.plot_axes is None
@@ -923,11 +1137,119 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         return plot_common.circular_median_degrees(phase_degrees, axis=axis)
 
     def _new_pbp_envelope(self):
-        if self._button_checked(self.btn_phase):
+        phase = self._button_checked(self.btn_phase)
+        percentiles = self._pbp_percentiles()
+        if phase:
             self._note_plot_render("Phase bands use the shortest containing arc and may cross ±180°.")
-        return plot_common.StreamingEnvelope(
-            phase_degrees=self._button_checked(self.btn_phase)
+            if percentiles is not None:
+                self._note_plot_render("Percentile PBP bands apply to magnitude; phase uses min–max arcs.")
+                percentiles = None
+        return plot_common.StreamingEnvelope(phase_degrees=phase, percentiles=percentiles)
+
+    # --- difference from the active (reference) dataset -----------------
+
+    def _delta_reference_active(self) -> bool:
+        return self._button_checked(getattr(self, "btn_delta_ref", None))
+
+    def _explicit_delta_reference(self):
+        """(name, dataset) picked with Set as Δ reference; the table overrides this."""
+        return None
+
+    def _delta_reference_target(self):
+        """The dataset Δ Ref subtracts, and its name when it was picked explicitly."""
+        explicit = self._explicit_delta_reference()
+        if explicit is not None:
+            return explicit[1], explicit[0]
+        return self.active_dataset, None
+
+    def _with_delta_reference(self, datasets):
+        """Add a picked Δ reference to the plotted datasets when it is not selected."""
+        if not self._delta_reference_active():
+            return datasets
+        explicit = self._explicit_delta_reference()
+        if explicit is None or any(dataset is explicit[1] for _name, dataset in datasets):
+            return datasets
+        return [*datasets, explicit]
+
+    def _delta_tolerance(self) -> float:
+        controls = getattr(self, "analysis_controls", None)
+        return controls.delta_tolerance() if controls is not None else 0.0
+
+    def _delta_reference(self, plans, series_for):
+        """Return None when Δ Ref is off, False when blocked, else the reference.
+
+        ``plans`` are the renderer's ``(name, dataset, ...)`` tuples and
+        ``series_for(plan)`` yields that plan's ``(x, display, label, key)``
+        series. Every dataset's k-th series is the same requested cut, so
+        differences are taken series by series and sample by sample.
+        """
+        if not self._delta_reference_active():
+            return None
+        if self.last_plot_mode not in DELTA_REFERENCE_MODES:
+            self.status.showMessage(
+                "Δ Ref works on Azimuth (Rect), Frequency, and Elevation Sweep "
+                "plots. Turn off Δ Ref for this plot type."
+            )
+            return False
+        if self._plot_scale_is_linear():
+            self.status.showMessage(
+                "Δ Ref compares levels in dB. Switch Dataset dB unit to the dB "
+                "scale or turn off Δ Ref."
+            )
+            return False
+        target, picked_name = self._delta_reference_target()
+        match = next((plan for plan in plans if plan[1] is target), None)
+        if match is None and picked_name is not None:
+            self.status.showMessage(
+                f"The Δ reference {picked_name} has no data at the selected "
+                "coordinates. Select cuts it covers, or right-click the dataset "
+                "table to pick another Δ reference."
+            )
+            return False
+        if match is None:
+            self.status.showMessage(
+                "Δ Ref subtracts the active dataset (the current table row). "
+                "Select it with the datasets to compare, or right-click a dataset "
+                "and choose Set as Δ reference."
+            )
+            return False
+        if len(plans) < 2:
+            self.status.showMessage(
+                "Δ Ref needs at least one other selected dataset to compare "
+                "with the Δ reference."
+            )
+            return False
+        series = [np.asarray(display, dtype=float) for _x, display, *_ in series_for(match)]
+        return _DeltaReference(
+            match[0], match[1], self._dataset_plot_key(match[1]), series,
+            phase=self._button_checked(self.btn_phase),
+            tolerance=self._delta_tolerance(),
         )
+
+    def _delta_axis_label(self, delta, tag: str = "") -> str:
+        if self._button_checked(self.btn_phase):
+            return f"Phase{tag} difference from {delta.name} (deg)"
+        return f"Level{tag} difference from {delta.name} (dB)"
+
+    def _finish_delta_plot(self, delta) -> None:
+        """Draw the zero line and tolerance band, and report the tolerance share."""
+        ax = self.plot_ax
+        for artist in [*ax.lines, *ax.patches]:
+            if getattr(artist, "_grim_delta_guide", False):
+                artist.remove()
+        zero = ax.axhline(
+            0.0, color=self._current_plot_text(), linewidth=0.8, alpha=0.6,
+            label="_nolegend_", zorder=1.8,
+        )
+        zero._grim_delta_guide = True
+        tolerance = self._delta_tolerance()
+        if tolerance > 0.0:
+            span = ax.axhspan(
+                -tolerance, tolerance, color="#59a14f", alpha=0.15, linewidth=0,
+                label="_nolegend_", zorder=0.8,
+            )
+            span._grim_delta_guide = True
+        self._note_plot_render(delta.summary())
 
     def _configure_line_budget(self, candidate_count):
         """Allocate a display target across this render's visible curves."""
@@ -1099,8 +1421,9 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             self._uncheck_silently(getattr(self, "btn_zoom_box", None))
             self.status.showMessage("Box zoom is available on 2D rectilinear plots.")
             return
-        # Zoom box and pan both claim the left button — one at a time.
+        # Zoom box, pan, and markers all claim the left button — one at a time.
         self._uncheck_silently(getattr(self, "btn_pan", None))
+        self._uncheck_silently(getattr(self, "btn_markers", None))
         self.status.showMessage("Box zoom enabled. Drag left mouse on the plot to zoom.")
 
     def _on_pan_toggled(self, checked: bool) -> None:
@@ -1112,6 +1435,7 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             self.status.showMessage("Pan is available on 2D rectilinear plots.")
             return
         self._uncheck_silently(getattr(self, "btn_zoom_box", None))
+        self._uncheck_silently(getattr(self, "btn_markers", None))
         self._clear_zoom_box_drag()
         self.status.showMessage(
             "Pan enabled. Drag left mouse to move around the plot "
@@ -1224,6 +1548,8 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             return
         if button is not MouseButton.LEFT:
             return
+        if self._on_marker_press(event):
+            return
         if not self._button_checked(getattr(self, "btn_zoom_box", None)):
             ax = getattr(event, "inaxes", None)
             delta = getattr(ax, "_grim_delta_map", None)
@@ -1270,6 +1596,8 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         event.canvas.draw_idle()
 
     def _on_plot_mouse_move(self, event) -> None:
+        if self._on_marker_motion(event):
+            return
         pan_drag = getattr(self, "_pan_drag", None)
         if isinstance(pan_drag, dict) and getattr(event, "canvas", None) is pan_drag.get("canvas"):
             ax = pan_drag.get("ax")
@@ -1319,6 +1647,8 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         event.canvas.draw_idle()
 
     def _on_plot_mouse_release(self, event) -> None:
+        if self._on_marker_release(event):
+            return
         pan_drag = getattr(self, "_pan_drag", None)
         if isinstance(pan_drag, dict) and getattr(event, "canvas", None) is pan_drag.get("canvas"):
             sync = getattr(event, "button", None) in (MouseButton.MIDDLE, 2, MouseButton.LEFT)
@@ -1817,6 +2147,9 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             edges = delta_map_mode.cell_edges(self.plot_ax._grim_delta_map.y)
             ymin, ymax = edges[0], edges[-1]
             self.plot_ax.set_ylim(ymin, ymax)
+        elif self.last_plot_mode == "cdf":
+            # Probabilities always span the full 0-100 % scale.
+            ymin, ymax = 0.0, 100.0
         else:
             self.plot_ax.set_autoscale_on(True)
             self.plot_ax.relim()
@@ -2262,6 +2595,17 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             if emit:
                 recorder.record_unsupported_plot(spec[1], spec[2])
             return
+        if mode in DELTA_REFERENCE_MODES and self._delta_reference_active():
+            spec = (
+                "unsupported",
+                mode,
+                "Δ Ref difference plots do not yet have a matching headless "
+                "implementation",
+            )
+            self.last_python_plot_spec = spec
+            if emit:
+                recorder.record_unsupported_plot(spec[1], spec[2])
+            return
         if mode != "delta_map" and self._button_checked(getattr(self, "btn_hold", None)):
             spec = (
                 "unsupported",
@@ -2389,6 +2733,42 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
             "isar_options": options,
         }
 
+    def _drop_dataset_from_python_plot_spec(self, key) -> None:
+        """Keep the frozen recipe equal to the canvas after a manual removal."""
+
+        spec = getattr(self, "last_python_plot_spec", None)
+        if not spec or spec[0] != "supported":
+            return
+        _status, references, names, mode, parameters = spec
+        index = next(
+            (i for i, ref in enumerate(references) if ref.dataset_id == key), None
+        )
+        if index is None:
+            return
+        recorder = getattr(self, "python_recorder", None)
+        if recorder is not None:
+            recorder.invalidate_current_plot()
+        reference_index = int(parameters.get("reference_index", 0))
+        if index == reference_index:
+            # Selector values are expressed in this dataset's units.
+            self.last_python_plot_spec = (
+                "unsupported",
+                mode,
+                "the dataset that defined the plot selection was removed from "
+                "the canvas; plot again to record this view",
+            )
+            return
+        keep = [i for i in range(len(references)) if i != index]
+        parameters = dict(parameters)
+        parameters["reference_index"] = reference_index - int(index < reference_index)
+        self.last_python_plot_spec = (
+            "supported",
+            tuple(references[i] for i in keep),
+            tuple(names[i] for i in keep),
+            mode,
+            parameters,
+        )
+
     def _emit_last_successful_python_plot(self) -> bool:
         """Emit the frozen spec corresponding to the visible plot canvas."""
 
@@ -2413,24 +2793,28 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         self._set_compare_sector_controls_visible(False)
         azimuth_rect_mode.render(self)
         self._capture_successful_python_plot("azimuth_rect")
+        self._restore_plot_markers()
         self._maybe_autoscale()
 
     def _plot_azimuth_polar(self) -> None:
         self._set_compare_sector_controls_visible(False)
         azimuth_polar_mode.render(self)
         self._capture_successful_python_plot("azimuth_polar")
+        self._restore_plot_markers()
         self._maybe_autoscale()
 
     def _plot_frequency(self) -> None:
         self._set_compare_sector_controls_visible(False)
         frequency_mode.render(self)
         self._capture_successful_python_plot("frequency")
+        self._restore_plot_markers()
         self._maybe_autoscale()
 
     def _plot_elevation_sweep(self) -> None:
         self._set_compare_sector_controls_visible(False)
         elevation_sweep_mode.render(self)
         self._capture_successful_python_plot("elevation_sweep")
+        self._restore_plot_markers()
         self._maybe_autoscale()
 
     def _plot_isar_image(self) -> None:
@@ -2448,11 +2832,27 @@ class PlotOpsMixin(DatasetPlotStyleMixin):
         self._set_compare_sector_controls_visible(False)
         waterfall_mode.render(self)
         self._capture_successful_python_plot("waterfall")
+        self._restore_plot_markers()
         self._maybe_autoscale()
 
     def _plot_compare(self) -> None:
         compare_mode.render(self)
         self._capture_successful_python_plot("compare")
+        self._restore_plot_markers()
+        self._maybe_autoscale()
+
+    def _plot_cdf(self) -> None:
+        self._set_compare_sector_controls_visible(False)
+        cdf_mode.render(self)
+        self._capture_successful_python_plot("cdf")
+        self._restore_plot_markers()
+        self._maybe_autoscale()
+
+    def _plot_sector_stats(self) -> None:
+        self._set_compare_sector_controls_visible(False)
+        sector_stats_mode.render(self)
+        self._capture_successful_python_plot("sector_stats")
+        self._restore_plot_markers()
         self._maybe_autoscale()
 
     def _plot_delta_map(self) -> None:

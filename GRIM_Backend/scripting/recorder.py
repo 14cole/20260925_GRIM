@@ -164,6 +164,7 @@ try:
         save_dataset_batch,
         shift_dataset,
         stitch_datasets,
+        time_gate,
         wedge_to_conic,
         wrap_phase,
     )

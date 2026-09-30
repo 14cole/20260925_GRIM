@@ -104,7 +104,7 @@ def _frequency_series(
 def render(self) -> None:
     self.last_plot_mode = "frequency"
     self._start_plot_render()
-    datasets = self._selected_datasets()
+    datasets = self._with_delta_reference(self._selected_datasets())
     if not datasets:
         self.status.showMessage("Select a dataset before plotting.")
         return
@@ -171,40 +171,51 @@ def render(self) -> None:
     except ValueError as exc:
         self.status.showMessage(f"Plot blocked: {exc}.")
         return
+    def series_for(plan):
+        series = _frequency_series(
+            self,
+            reference,
+            plan[1],
+            plan[0],
+            freq_values,
+            az_values,
+            elev_values,
+            polarization,
+            selection=plan[2],
+        )
+        assert series is not None
+        return series
+
+    delta = self._delta_reference(plans, series_for)
+    if delta is False:
+        return
     if not self._prepare_line_plot_axes(
         "frequency",
         "rectilinear",
         reference,
         datasets,
-        pbp_active=pbp_active,
     ):
         return
 
     rendered = 0
     omitted = 0
-    envelope = self._new_pbp_envelope() if pbp_active else None
-    for name, dataset, selection in plans:
+    bands = self._new_pbp_bands(datasets) if pbp_active else None
+    for plan in plans:
+        name, dataset, selection = plan
+        if delta is not None and dataset is delta.dataset:
+            continue
         candidates = len(selection[2])
-        if envelope is None and rendered >= common.MAX_LINE_SERIES:
+        if bands is None and rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
             continue
-        series = _frequency_series(
-            self,
-            reference,
-            dataset,
-            name,
-            freq_values,
-            az_values,
-            elev_values,
-            polarization,
-            selection=selection,
-        )
-        assert series is not None
+        series = series_for(plan)
+        if delta is not None:
+            series = delta.apply(name, series)
         for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
             if not np.any(np.isfinite(display)):
                 continue
-            if envelope is not None:
-                envelope.update(display)
+            if bands is not None:
+                bands.update(dataset, display)
                 rendered += 1
             elif rendered < common.MAX_LINE_SERIES:
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
@@ -214,12 +225,7 @@ def render(self) -> None:
                     omitted += candidates - candidate_index - 1
                     break
 
-    if envelope is not None and envelope.lower is not None:
-        lower, upper, density = envelope.result()
-        envelope.close()
-        x_values, lower, upper, density = self._bounded_plot_envelope(
-            freq_values, lower, upper, density
-        )
+    if bands is not None:
         elev_name = self._plot_axis_name(reference, "elevation")
         elev_unit = self._plot_axis_unit(reference, "elevation")
         az_name = self._plot_axis_name(reference, "azimuth")
@@ -229,20 +235,11 @@ def render(self) -> None:
             if elev_values.size > 1
             else f"{elev_values[0]:g} {elev_unit}"
         )
-        label = (
-            f"PBP Pol {polarization}, {elev_name} {elev_label}, "
-            f"P50 over {az_name} ({az_values[0]:g},{az_values[-1]:g}) {az_unit}"
-        )
-        self._plot_pbp_fill(
-            x_values, lower, upper, label, polar=False, density=density
-        )
-        self._plot_bounded_line(
-            self.plot_ax, x_values, lower, color="#8a8a8a", linewidth=1,
-            label="_nolegend_",
-        )
-        self._plot_bounded_line(
-            self.plot_ax, x_values, upper, color="#8a8a8a", linewidth=1,
-            label="_nolegend_",
+        bands.draw(
+            freq_values,
+            f"Pol {polarization}, {elev_name} {elev_label}, "
+            f"P50 over {az_name} ({az_values[0]:g},{az_values[-1]:g}) {az_unit}",
+            polar=False,
         )
 
     if rendered == 0:
@@ -259,7 +256,11 @@ def render(self) -> None:
         )
 
     self.plot_ax.set_xlabel(self._plot_axis_label(reference, "frequency"))
-    self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=" P50"))
+    if delta is not None:
+        self.plot_ax.set_ylabel(self._delta_axis_label(delta, tag=" P50"))
+        self._finish_delta_plot(delta)
+    else:
+        self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=" P50"))
     self._update_legend_visibility()
     self.spin_plot_xmin.blockSignals(True)
     self.spin_plot_xmax.blockSignals(True)

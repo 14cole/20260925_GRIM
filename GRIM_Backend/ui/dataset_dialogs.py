@@ -1436,3 +1436,178 @@ class StatisticsDialog(QDialog):
             if chk.isChecked()
         ]
         return statistic, percentile, axes, self.chk_broadcast.isChecked()
+
+
+class TimeGateDialog(QDialog):
+    """Choose a down-range gate with a live preview of the active dataset.
+
+    The preview is the median Hann-windowed down-range profile over azimuth
+    for one elevation and polarization, before (gray) and after (colour)
+    gating, in dB relative to the ungated peak. The gate itself is applied
+    without a window so in-gate responses keep their calibrated level.
+    """
+
+    def __init__(self, dataset: RcsGrid, *, elevation_index: int = 0,
+                 polarization_index: int = 0, parent=None) -> None:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+        from PySide6.QtCore import QTimer
+
+        from GRIM_Backend.datasets.transforms import gate_geometry
+
+        super().__init__(parent)
+        self.setWindowTitle("Time Gate")
+        self._dataset = dataset
+        geometry = gate_geometry(dataset)
+        self._half_range = 0.5 * geometry["unambiguous_m"]
+        resolution = geometry["resolution_m"]
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Keep (or remove) scatterers inside a down-range window, measured in "
+            "metres from the phase reference, positive away from the radar. "
+            f"Resolution {resolution:.4g} m; unambiguous range ±{self._half_range:.4g} m."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        grid = QGridLayout()
+        default = min(self._half_range / 4.0, max(20.0 * resolution, 0.5))
+
+        def metres(value: float) -> QDoubleSpinBox:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(4)
+            spin.setRange(-self._half_range, self._half_range)
+            spin.setSingleStep(max(resolution, 1.0e-4))
+            spin.setSuffix(" m")
+            spin.setValue(value)
+            return spin
+
+        self.spin_start = metres(-default)
+        self.spin_stop = metres(default)
+        self.spin_taper = QDoubleSpinBox()
+        self.spin_taper.setRange(0.0, 100.0)
+        self.spin_taper.setDecimals(1)
+        self.spin_taper.setSuffix(" %")
+        self.spin_taper.setValue(20.0)
+        self.spin_taper.setToolTip("Share of the gate width given to raised-cosine edges.")
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItem("Keep inside gate", "keep")
+        self.combo_mode.addItem("Remove inside gate", "remove")
+        self.chk_compensate = QCheckBox("Compensate band-edge droop")
+        self.chk_compensate.setChecked(True)
+        self.chk_compensate.setToolTip(
+            "Divide out the gate's effect on a point at the gate centre, which "
+            "otherwise lowers the first and last frequencies. Keep mode only."
+        )
+        self.combo_elevation = QComboBox()
+        for value in np.asarray(dataset.elevations):
+            self.combo_elevation.addItem(f"{float(value):g}")
+        self.combo_elevation.setCurrentIndex(int(elevation_index))
+        self.combo_polarization = QComboBox()
+        for value in np.asarray(dataset.polarizations):
+            self.combo_polarization.addItem(str(value))
+        self.combo_polarization.setCurrentIndex(int(polarization_index))
+
+        grid.addWidget(QLabel("Gate start"), 0, 0)
+        grid.addWidget(self.spin_start, 0, 1)
+        grid.addWidget(QLabel("Gate stop"), 0, 2)
+        grid.addWidget(self.spin_stop, 0, 3)
+        grid.addWidget(QLabel("Edge taper"), 1, 0)
+        grid.addWidget(self.spin_taper, 1, 1)
+        grid.addWidget(QLabel("Mode"), 1, 2)
+        grid.addWidget(self.combo_mode, 1, 3)
+        grid.addWidget(self.chk_compensate, 2, 0, 1, 4)
+        grid.addWidget(QLabel("Preview elevation"), 3, 0)
+        grid.addWidget(self.combo_elevation, 3, 1)
+        grid.addWidget(QLabel("Preview polarization"), 3, 2)
+        grid.addWidget(self.combo_polarization, 3, 3)
+        layout.addLayout(grid)
+
+        self._figure = Figure(figsize=(6.4, 3.0))
+        self._canvas = FigureCanvasQTAgg(self._figure)
+        self._canvas.setMinimumHeight(240)
+        self._axes = self._figure.add_subplot(111)
+        layout.addWidget(self._canvas, 1)
+        self.preview_status = QLabel("")
+        self.preview_status.setWordWrap(True)
+        layout.addWidget(self.preview_status)
+
+        self.btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.btn_box.accepted.connect(self.accept)
+        self.btn_box.rejected.connect(self.reject)
+        layout.addWidget(self.btn_box)
+
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(120)
+        self._preview_timer.timeout.connect(self.update_preview)
+        for signal in (
+            self.spin_start.valueChanged, self.spin_stop.valueChanged,
+            self.spin_taper.valueChanged, self.combo_mode.currentIndexChanged,
+            self.chk_compensate.toggled, self.combo_elevation.currentIndexChanged,
+            self.combo_polarization.currentIndexChanged,
+        ):
+            signal.connect(self._preview_timer.start)
+        self.combo_mode.currentIndexChanged.connect(
+            lambda: self.chk_compensate.setEnabled(self.combo_mode.currentData() == "keep")
+        )
+        self.update_preview()
+
+    def get_params(self) -> dict:
+        return {
+            "start_m": float(self.spin_start.value()),
+            "stop_m": float(self.spin_stop.value()),
+            "taper": float(self.spin_taper.value()) / 100.0,
+            "mode": str(self.combo_mode.currentData()),
+            "compensate": bool(self.chk_compensate.isChecked()),
+        }
+
+    def update_preview(self) -> None:
+        from GRIM_Backend.datasets.transforms import _validate_gate, down_range_profile
+
+        params = self.get_params()
+        ax = self._axes
+        ax.clear()
+        ok = self.btn_box.button(QDialogButtonBox.Ok)
+        try:
+            _validate_gate(self._dataset, params["start_m"], params["stop_m"],
+                           params["taper"], params["mode"])
+            gate_error = ""
+        except ValueError as exc:
+            gate_error = str(exc)
+        ok.setEnabled(not gate_error)
+        location = {
+            "elevation_index": self.combo_elevation.currentIndex(),
+            "polarization_index": self.combo_polarization.currentIndex(),
+        }
+        try:
+            ranges, before = down_range_profile(self._dataset, **location)
+            after = None
+            if not gate_error:
+                _ranges, after = down_range_profile(self._dataset, gate=params, **location)
+        except ValueError as exc:
+            self.preview_status.setText(f"No preview: {exc}.")
+            self._canvas.draw_idle()
+            return
+        peak = float(np.nanmax(before)) if np.any(before > 0) else 1.0
+        with np.errstate(divide="ignore"):
+            ax.plot(ranges, 10.0 * np.log10(before / peak), color="#8a8a8a",
+                    linewidth=1.0, label="Before")
+            if after is not None:
+                ax.plot(ranges, 10.0 * np.log10(after / peak), color="#1f77b4",
+                        linewidth=1.2, label="After")
+        ax.axvspan(params["start_m"], params["stop_m"], color="#59a14f", alpha=0.18,
+                   linewidth=0, label="Gate")
+        ax.set_xlim(-self._half_range, self._half_range)
+        ax.set_ylim(-80.0, 5.0)
+        ax.set_xlabel("Down range (m)")
+        ax.set_ylabel("Relative level (dB)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+        self._figure.tight_layout()
+        self.preview_status.setText(
+            gate_error[:1].upper() + gate_error[1:] + "." if gate_error
+            else "Median over azimuth; Hann-windowed for display only."
+        )
+        self._canvas.draw_idle()
