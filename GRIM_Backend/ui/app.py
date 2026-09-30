@@ -114,6 +114,7 @@ PLOT_OPS_SPECS = {
         (
             ("CDF", "cdf"),
             ("Sector Stats", "sector_stats"),
+            ("Range–Freq", "range_freq"),
             ("Δ Ref", "delta_ref"),
             ("Markers", "markers"),
             ("Slider", "slider"),
@@ -510,6 +511,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             ("SENTRi El→GRIM", "btn_sentri_elevation"),
             ("Extrusion…", "btn_extrusion"),
             ("Wedge → Conic", "btn_wedge_to_conic"),
+            ("Phase Centre…", "btn_phase_center"),
         ))
         self.btn_axis_units.setToolTip(
             "Convert stored angle and frequency coordinates between equivalent "
@@ -521,6 +523,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             "top-down, -90° bottom-up). Samples are reordered with the "
             "monotonically increasing elevation axis; no interpolation or "
             "phase change is applied."
+        )
+        self.btn_phase_center.setToolTip(
+            "Move the phase reference to a point (x, y, z) in body axes: exact "
+            "phase ramp per angle and frequency, levels unchanged. Needs phase."
         )
         self.btn_wedge_to_conic.setToolTip(
             "Convert a vertical-turntable/body-y-wedge acquisition into the "
@@ -915,6 +921,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 controls["cdf"].clicked.connect(self._plot_cdf)
             if "sector_stats" in controls:
                 controls["sector_stats"].clicked.connect(self._plot_sector_stats)
+            if "range_freq" in controls:
+                controls["range_freq"].clicked.connect(self._plot_range_freq)
             if "delta_ref" in controls:
                 controls["delta_ref"].toggled.connect(self._on_delta_ref_toggled)
             if "markers" in controls:
@@ -961,6 +969,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 "az_vs_range",
                 "cdf",
                 "sector_stats",
+                "range_freq",
             ):
                 button = controls.get(recorded_mode)
                 if button is not None:
@@ -1009,6 +1018,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         )
         self.btn_extrusion.clicked.connect(self._convert_extrusion_selected)
         self.btn_wedge_to_conic.clicked.connect(self._convert_wedge_to_conic_selected)
+        self.btn_phase_center.clicked.connect(self._phase_center_selected)
         self.btn_dataset_load.clicked.connect(self._load_dataset_files)
         self.btn_dataset_save.clicked.connect(self._save_selected_datasets)
         self.btn_dataset_save_all.clicked.connect(self._save_all_datasets)
@@ -1826,6 +1836,13 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                     "Mean, median, max, min, or a percentile of linear power inside "
                     "each azimuth sector, drawn over the sector. Set the sectors and "
                     "statistic in Plot Settings; right-click to copy the table."
+                ),
+                "range_freq": (
+                    "Down-range profiles over sliding frequency sub-bands, averaged "
+                    "over the selected azimuths and elevations. Point scatterers stay "
+                    "at one range; cavities and travelling waves drift. Needs complex "
+                    "data on uniformly spaced frequencies; set the sub-band in Plot "
+                    "Settings."
                 ),
                 "markers": (
                     "Click near a curve to drop a marker on the nearest data point; "

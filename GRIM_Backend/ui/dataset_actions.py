@@ -68,6 +68,7 @@ from GRIM_Backend.datasets.transforms import (
     regrid_axis,
     shift_dataset,
     time_gate,
+    translate_phase_center,
 )
 from GRIM_Backend.plotting.modes import sector_stats_mode
 
@@ -84,6 +85,7 @@ from GRIM_Backend.ui.dataset_dialogs import (
     ExtrusionConversionDialog,
     InterpolateDialog,
     MedianizeDialog,
+    PhaseCenterDialog,
     RangeCalibrationDialog,
     RegridDialog,
     RoundDialog,
@@ -1368,7 +1370,7 @@ class DatasetOpsMixin:
                 "btn_audit", "btn_provenance",
                 "btn_axis_units", "btn_el_to_az360", "btn_swap_el_az",
                 "btn_sentri_elevation", "btn_extrusion",
-                "btn_wedge_to_conic",
+                "btn_wedge_to_conic", "btn_phase_center",
             ),
             selected_count >= 1,
         )
@@ -4658,6 +4660,55 @@ class DatasetOpsMixin:
             operation,
             publish,
             start_message=f"Time gating {len(datasets)} dataset(s)...",
+        )
+
+    def _phase_center_selected(self) -> None:
+        datasets = self._selected_datasets_ordered(
+            use_selection_order=True,
+            empty_message="Select one or more datasets to move the phase centre.",
+        )
+        if datasets is None:
+            return
+        dialog = PhaseCenterDialog(parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        params = dialog.get_params()
+        offset = {key: float(params[key]) for key in ("x_m", "y_m", "z_m")}
+        entered = ", ".join(f"{value:g}" for value in params["entered"])
+        point = f"({entered}) {params['unit']}"
+        source_references = [
+            self._python_reference_for_dataset(dataset) for _name, dataset in datasets
+        ]
+
+        def operation(_index, _name, dataset):
+            return translate_phase_center(dataset, **offset)
+
+        def publish(results, skipped) -> None:
+            recorder = getattr(self, "python_recorder", None)
+            for source_index, name, result in results:
+                history = f"Phase centre moved to {point} in body axes: {name}"
+                output_name = f"{name} [PC {point}]"
+                output_id = self._add_dataset_row(result, output_name, history, file_name="")
+                source_ref = source_references[source_index]
+                if recorder is not None and source_ref is not None:
+                    recorder.record_function(
+                        self._python_output_reference(output_id, output_name),
+                        "translate_phase_center",
+                        [source_ref],
+                        kwargs=offset,
+                        comment=f"Move the phase centre of {name} to {point}",
+                    )
+            message = f"Phase centre created {len(results)} dataset(s)."
+            if skipped:
+                message += f" Skipped: {_compact_item_summary(skipped)}"
+            self.status.showMessage(message)
+
+        self._start_dataset_map_job(
+            "Phase centre",
+            datasets,
+            operation,
+            publish,
+            start_message=f"Moving the phase centre of {len(datasets)} dataset(s)...",
         )
 
     def _convert_extrusion_selected(self) -> None:

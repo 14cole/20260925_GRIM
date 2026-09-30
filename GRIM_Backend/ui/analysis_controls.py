@@ -82,7 +82,29 @@ class PlotAnalysisControls(QObject):
             "samples inside it. Off at zero."
         )
 
+        self.spin_range_subband = QDoubleSpinBox()
+        self.spin_range_subband.setRange(5.0, 100.0)
+        self.spin_range_subband.setDecimals(0)
+        self.spin_range_subband.setSingleStep(5.0)
+        self.spin_range_subband.setSuffix(" % of band")
+        self.spin_range_subband.setValue(25.0)
+        self.spin_range_subband.setKeyboardTracking(False)
+        self.spin_range_subband.setToolTip(
+            "Width of each sliding sub-band. Narrower sub-bands show more "
+            "frequency detail but coarser down-range resolution."
+        )
+        self.combo_range_window = QComboBox()
+        self.combo_range_window.addItems(
+            ["Hanning", "Hamming", "Blackman", "Blackman-Harris", "Kaiser β=15", "Rectangular"]
+        )
+        self.combo_range_window.setToolTip("Window applied to each sub-band before the inverse FFT.")
+        self.combo_range_unit = QComboBox()
+        self.combo_range_unit.addItems(["m", "cm", "mm", "in", "ft"])
+
         self.combo_pbp_band.currentIndexChanged.connect(self._pbp_band_changed)
+        self.spin_range_subband.valueChanged.connect(lambda: self.changed.emit("range"))
+        self.combo_range_window.currentIndexChanged.connect(lambda: self.changed.emit("range"))
+        self.combo_range_unit.currentIndexChanged.connect(lambda: self.changed.emit("range"))
         self.spin_pbp_low.valueChanged.connect(self._pbp_low_changed)
         self.spin_pbp_high.valueChanged.connect(self._pbp_high_changed)
         self.combo_cdf.currentIndexChanged.connect(lambda: self.changed.emit("cdf"))
@@ -103,6 +125,8 @@ class PlotAnalysisControls(QObject):
             (("Sector Statistic", self.combo_sector_stat),
              ("Percentile", self.spin_sector_percentile)),
             (("Δ Ref Tolerance", self.spin_delta_tolerance),),
+            (("Range–Freq Sub-band", self.spin_range_subband),
+             ("Window", self.combo_range_window), ("Range Unit", self.combo_range_unit)),
         )
         for cells in rows:
             for column, (label, widget) in enumerate(cells):
@@ -138,6 +162,15 @@ class PlotAnalysisControls(QObject):
 
     def delta_tolerance(self) -> float:
         return float(self.spin_delta_tolerance.value())
+
+    def range_subband_percent(self) -> float:
+        return float(self.spin_range_subband.value())
+
+    def range_window(self) -> str:
+        return self.combo_range_window.currentText()
+
+    def range_unit(self) -> str:
+        return self.combo_range_unit.currentText()
 
     # --- keep percentile pairs valid -----------------------------------------
 

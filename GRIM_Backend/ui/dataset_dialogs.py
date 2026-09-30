@@ -1611,3 +1611,62 @@ class TimeGateDialog(QDialog):
             else "Median over azimuth; Hann-windowed for display only."
         )
         self._canvas.draw_idle()
+
+
+class PhaseCenterDialog(QDialog):
+    """Enter the new phase-centre position in the dataset's body axes."""
+
+    UNITS = (("m", 1.0), ("cm", 0.01), ("mm", 0.001), ("in", 0.0254), ("ft", 0.3048))
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Phase Centre")
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Move the phase reference to this point, measured from the current "
+            "phase reference in the dataset's body axes: +x toward azimuth 0°, "
+            "+y toward azimuth +90°, +z toward elevation +90° (top). Levels are "
+            "unchanged; each sample's phase gets the matching two-way ramp. "
+            "A point scatterer at this position ends up at the new origin."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        grid = QGridLayout()
+        self.spins = []
+        for column, axis in enumerate(("x", "y", "z")):
+            spin = QDoubleSpinBox()
+            spin.setDecimals(4)
+            spin.setRange(-1.0e6, 1.0e6)
+            spin.setSingleStep(0.01)
+            grid.addWidget(QLabel(axis), 0, 2 * column)
+            grid.addWidget(spin, 0, 2 * column + 1)
+            self.spins.append(spin)
+        self.combo_unit = QComboBox()
+        for label, _scale in self.UNITS:
+            self.combo_unit.addItem(label)
+        grid.addWidget(QLabel("Unit"), 1, 0)
+        grid.addWidget(self.combo_unit, 1, 1)
+        layout.addLayout(grid)
+        self.btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.btn_box.accepted.connect(self.accept)
+        self.btn_box.rejected.connect(self.reject)
+        layout.addWidget(self.btn_box)
+        for spin in self.spins:
+            spin.valueChanged.connect(self._update_ok)
+        self._update_ok()
+
+    def _update_ok(self) -> None:
+        self.btn_box.button(QDialogButtonBox.Ok).setEnabled(
+            any(spin.value() != 0.0 for spin in self.spins)
+        )
+
+    def get_params(self) -> dict:
+        label, scale = self.UNITS[self.combo_unit.currentIndex()]
+        values = [spin.value() for spin in self.spins]
+        return {
+            "x_m": values[0] * scale,
+            "y_m": values[1] * scale,
+            "z_m": values[2] * scale,
+            "entered": tuple(values),
+            "unit": label,
+        }

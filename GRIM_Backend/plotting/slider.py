@@ -19,6 +19,7 @@ SWEEP_AXIS = {
     "sector_stats": "azimuth",
     "frequency": "frequency",
     "elevation_sweep": "elevation",
+    "range_freq": "frequency",
 }
 
 

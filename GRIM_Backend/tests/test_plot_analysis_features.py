@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import unittest
@@ -19,7 +20,10 @@ import GRIM_Backend.ui.app as grim_cut_gui
 from GRIM_Backend.ui.dataset_actions import DATASET_ID_ROLE, DATASET_PATH_ROLE
 from GRIM_Backend.datasets.constants import C0
 from GRIM_Backend.datasets.grid import RcsGrid
-from GRIM_Backend.datasets.transforms import down_range_profile, gate_geometry, time_gate
+from GRIM_Backend.datasets.transforms import (
+    down_range_profile, gate_geometry, time_gate, translate_phase_center,
+)
+from GRIM_Backend.plotting.modes.range_freq_mode import subband_starts
 from GRIM_Backend.plotting.dataset_style import pbp_band_key
 from GRIM_Backend.plotting.modes import common, sector_stats_mode
 from test_gui_shell import (
@@ -552,6 +556,146 @@ class TimeGateGuiTests(_WindowCase):
         script = window.python_recorder.script
         self.assertIn("time_gate(", script)
         self.assertIn("start_m=-0.3", script)
+
+
+def _point_grid(point, *, azimuths=(0.0, 30.0, 90.0), elevations=(0.0,), units=None, conjugate=False):
+    """A GHOST-law point scatterer: phase exp(+j 2k u.p), coming-from directions."""
+    frequencies = np.linspace(8.0, 12.0, 81)
+    k = 2 * np.pi * frequencies * 1e9 / C0
+    a = np.deg2rad(np.asarray(azimuths))[:, None]
+    e = np.deg2rad(np.asarray(elevations))[None, :]
+    u = np.stack((np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e) + 0 * a), axis=-1)
+    field = np.exp(2j * k[None, None, :] * (u @ np.asarray(point))[..., None])[..., None]
+    grid_units = {"frequency": "GHz"}
+    grid_units.update(units or {})
+    if conjugate:
+        field = np.conj(field)
+    return RcsGrid(np.asarray(azimuths), np.asarray(elevations), frequencies, ["HH"],
+                   rcs=field, units=grid_units)
+
+
+class PhaseCenterTests(unittest.TestCase):
+    def test_point_at_new_origin_has_constant_phase_in_every_convention(self):
+        point = (0.4, -0.25, 0.1)
+        for kwargs in ({}, {"conjugate": True, "units": {"time_convention": "exp(-j omega t)"}}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                grid = _point_grid(point, elevations=(-10.0, 0.0, 20.0), **kwargs)
+                moved = translate_phase_center(grid, x_m=point[0], y_m=point[1], z_m=point[2])
+                np.testing.assert_allclose(moved.rcs_slice((slice(None),) * 4), 1.0, atol=1e-9)
+                np.testing.assert_array_equal(moved.rcs_power, grid.rcs_power)
+        radians = RcsGrid(np.deg2rad([0.0, 30.0, 90.0]), [0.0], np.linspace(8, 12, 81), ["HH"],
+                          rcs=_point_grid(point).rcs_slice((slice(None),) * 4),
+                          units={"frequency": "GHz", "azimuth": "rad", "elevation": "rad"})
+        moved = translate_phase_center(radians, x_m=point[0], y_m=point[1], z_m=point[2])
+        np.testing.assert_allclose(moved.rcs_slice((slice(None),) * 4), 1.0, atol=1e-9)
+
+    def test_moved_point_lands_at_its_new_down_range_and_metadata_accumulates(self):
+        grid = _point_grid((0.0, 0.0, 0.0), units={"phase_reference": "turntable centre"})
+        moved = translate_phase_center(grid, x_m=-0.3, y_m=0.0, z_m=0.0)
+        # The new origin is 0.3 m toward the tail, so nose-on (radar along +x)
+        # the old origin sits 0.3 m nearer the radar: down range -0.3 m.
+        ranges, profile = down_range_profile(moved, elevation_index=0, polarization_index=0,
+                                             max_sweeps=1)
+        self.assertAlmostEqual(ranges[np.argmax(profile)], -0.3, delta=0.02)
+        again = translate_phase_center(moved, x_m=0.1, y_m=0.2, z_m=0.0)
+        record = json.loads(again.extra["phase_center_translation_json"])
+        np.testing.assert_allclose(record["total_offset_m"], [-0.2, 0.2, 0.0])
+        self.assertIn("turntable centre; moved by (-0.3, 0, 0) m", again.units["phase_reference"])
+        with self.assertRaisesRegex(ValueError, "offset is zero"):
+            translate_phase_center(grid, x_m=0.0, y_m=0.0, z_m=0.0)
+        power_only = RcsGrid([0.0], [0.0], [9.0, 10.0], ["HH"], rcs_power=np.ones((1, 1, 2, 1)))
+        with self.assertRaisesRegex(ValueError, "needs complex"):
+            translate_phase_center(power_only, x_m=1.0, y_m=0.0, z_m=0.0)
+
+
+class PhaseCenterGuiTests(_WindowCase):
+    def test_button_creates_translated_rows_and_records_script(self):
+        window = self.window
+        self.assertTrue(window.btn_phase_center.isEnabled())
+        window.table.item(0, 1).setData(DATASET_PATH_ROLE, "C:/data/run1.grim")
+        with mock.patch("GRIM_Backend.ui.dataset_actions.PhaseCenterDialog") as dialog_type:
+            dialog = dialog_type.return_value
+            dialog.exec.return_value = QDialog.Accepted
+            dialog.get_params.return_value = {
+                "x_m": 0.0254, "y_m": 0.0, "z_m": -0.0508,
+                "entered": (1.0, 0.0, -2.0), "unit": "in",
+            }
+            self.select_rows(0)
+            window._phase_center_selected()
+            deadline = time.monotonic() + 10
+            while window._background_job_active() and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.app.processEvents()
+        self.assertIn("Phase centre created 1 dataset(s)", window.status.currentMessage())
+        self.assertEqual(window.table.item(3, 0).text(), "Run 1 [PC (1, 0, -2) in]")
+        result = window.table.item(3, 0).data(Qt.UserRole)
+        np.testing.assert_array_equal(result.rcs_power, self.datasets[0].rcs_power)
+        script = window.python_recorder.script
+        self.assertIn("translate_phase_center(", script)
+        self.assertIn("z_m=-0.0508", script)
+
+
+class RangeFrequencyTests(_WindowCase):
+    def select_new_row(self, grid, name):
+        window = self.window
+        window._add_dataset_row(grid, name, "", file_name="")
+        window.table.clearSelection()
+        window.table.selectRow(window.table.rowCount() - 1)
+        window._on_dataset_selection_changed()
+        for widget in (window.list_az, window.list_elev, window.list_freq):
+            widget.selectAll()
+        window.list_pol.clearSelection()
+        window.list_pol.item(0).setSelected(True)
+
+    def peak_ranges(self):
+        (mesh,) = self.window.plot_ax.collections
+        _x, y_edges, image = mesh._grim_rectilinear_data
+        centres = 0.5 * (y_edges[:-1] + y_edges[1:])
+        return centres[np.nanargmax(image, axis=0)], np.nanmax(image, axis=0)
+
+    def test_point_scatterer_stays_at_its_range_with_its_level(self):
+        window = self.window
+        grid = _point_grid((-0.3, 0.0, 0.0), azimuths=(0.0,))
+        grid = RcsGrid(grid.azimuths, grid.elevations, grid.frequencies, grid.polarizations,
+                       rcs=np.sqrt(2.0) * grid.rcs_slice((slice(None),) * 4), units=grid.units)
+        self.select_new_row(grid, "Point")
+        self.plot("_plot_range_freq")
+        self.assertIn("Range–frequency map updated", window.status.currentMessage())
+        peaks, levels = self.peak_ranges()
+        np.testing.assert_allclose(peaks, 0.3, atol=0.03)
+        np.testing.assert_allclose(levels, 10 * np.log10(2.0), atol=0.1)
+        self.assertEqual(window.plot_ax.get_ylabel(), "Down range (m)")
+        self.assertEqual(window.plot_ax.get_xlabel(), "Sub-band centre frequency (GHz)")
+        self.assertEqual(window.plot_colorbars[0].ax.get_ylabel(), "RCS range profile (dBsm)")
+
+        window.analysis_controls.combo_range_unit.setCurrentText("in")
+        peaks, _levels = self.peak_ranges()
+        np.testing.assert_allclose(peaks, 0.3 / 0.0254, atol=1.2)
+        window.btn_slider.setChecked(True)
+        window.plot_slider.combo_axis.setCurrentIndex(0)
+        window._on_plot_slider_moved(3)
+        self.assertIn("This plot sweeps frequency", window.status.currentMessage())
+
+    def test_blocks_phase_and_skips_unusable_sweeps(self):
+        window = self.window
+        window.btn_phase.setChecked(True)
+        self.plot("_plot_range_freq")
+        self.assertIn("Turn off Phase", window.status.currentMessage())
+        window.btn_phase.setChecked(False)
+        uneven = RcsGrid([0.0], [0.0], np.r_[np.linspace(8, 9, 9), 9.5], ["HH"],
+                         rcs=np.ones((1, 1, 10, 1), complex), units={"frequency": "GHz"})
+        self.select_new_row(uneven, "Uneven")
+        self.plot("_plot_range_freq")
+        self.assertIn("Uneven (needs uniformly spaced selected frequencies)",
+                      window.status.currentMessage())
+
+    def test_subband_starts_are_bounded(self):
+        self.assertEqual(subband_starts(10, 4), [0, 1, 2, 3, 4, 5, 6])
+        starts = subband_starts(2001, 100)
+        self.assertLessEqual(len(starts), 200)
+        self.assertEqual(starts[0], 0)
+        self.assertLessEqual(starts[-1], 2001 - 100)
 
 
 if __name__ == "__main__":

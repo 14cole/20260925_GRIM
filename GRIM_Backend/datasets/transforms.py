@@ -1205,3 +1205,111 @@ def down_range_profile(
     step = float(np.mean(np.diff(frequencies)))
     ranges = np.fft.fftshift(np.fft.fftfreq(size, d=step)) * (C0 / 2.0)
     return ranges, profile
+
+
+# --------------------------------------------------------------------------
+# Phase-centre translation
+# --------------------------------------------------------------------------
+
+
+def _angle_axis_radians(dataset: RcsGrid, axis: str) -> np.ndarray:
+    values = np.asarray(dataset.get_axis(axis), dtype=float)
+    unit = str((dataset.units or {}).get(axis, "deg")).strip().lower()
+    if unit in {"rad", "radian", "radians"}:
+        return values
+    if unit in {"deg", "degree", "degrees"}:
+        return np.deg2rad(values)
+    raise ValueError(f"unsupported {axis} unit {unit!r}; use deg or rad")
+
+
+def translate_phase_center(
+    dataset: RcsGrid,
+    *,
+    x_m: float,
+    y_m: float,
+    z_m: float,
+) -> RcsGrid:
+    """Move the phase reference to body point ``(x, y, z)`` metres.
+
+    GRIM angles are coming-from radar directions
+    ``u = (cos el cos az, cos el sin az, sin el)`` in body axes, and a point
+    scatterer at ``p`` has phase ``exp(+j 2k u.p)`` under exp(+jwt). Referencing
+    the field to ``t`` therefore multiplies every sample by ``exp(-j 2k u.t)``;
+    data declaring exp(-jwt) use the conjugate ramp. Levels are unchanged, and
+    samples without phase stay without phase.
+    """
+
+    from GRIM_Backend.datasets.constants import C0
+
+    offset = np.asarray([x_m, y_m, z_m], dtype=float)
+    if not np.all(np.isfinite(offset)):
+        raise ValueError("the phase-centre offset must be finite")
+    if not np.any(offset):
+        raise ValueError("the phase-centre offset is zero")
+    power = dataset.rcs_power
+    phase_in = _authoritative_response_phase(dataset)
+    if not np.any(np.isfinite(power) & np.isfinite(phase_in)):
+        raise ValueError("moving the phase centre needs complex (phase) data")
+    azimuth = _angle_axis_radians(dataset, "azimuth")
+    elevation = _angle_axis_radians(dataset, "elevation")
+    wavenumber = 2.0 * np.pi * np.asarray(
+        dataset._frequency_value_to_hz(np.asarray(dataset.frequencies, dtype=float)),
+        dtype=float,
+    ) / C0
+    projection = (
+        np.cos(elevation)[None, :] * np.cos(azimuth)[:, None] * offset[0]
+        + np.cos(elevation)[None, :] * np.sin(azimuth)[:, None] * offset[1]
+        + np.sin(elevation)[None, :] * offset[2]
+    )
+    sign = 1.0 if _declared_time_sign(dataset) == "-jwt" else -1.0
+    phase = np.empty(power.shape, dtype=np.float64)
+    rows = max(1, _GATE_WORK_BYTES // max(1, 8 * int(np.prod(power.shape[1:]))))
+    for first in range(0, power.shape[0], rows):
+        block = slice(first, min(power.shape[0], first + rows))
+        ramp = sign * 2.0 * projection[block, :, None] * wavenumber[None, None, :]
+        shifted = np.asarray(phase_in[block], dtype=np.float64) + ramp[..., None] + np.pi
+        phase[block] = np.remainder(shifted, 2.0 * np.pi) - np.pi
+
+    units = dict(dataset.units or {})
+    extra = _derived_response_extra(dataset)
+    previous = np.zeros(3)
+    if "phase_center_translation_json" in extra:
+        try:
+            previous = np.asarray(
+                json.loads(str(extra["phase_center_translation_json"]))["total_offset_m"],
+                dtype=float,
+            )
+        except (ValueError, KeyError, TypeError):
+            previous = np.zeros(3)
+    total = previous + offset
+    extra["phase_center_translation_json"] = json.dumps(
+        {
+            "schema": "grim.phase-center-translation.v1",
+            "last_offset_m": offset.tolist(),
+            "total_offset_m": total.tolist(),
+            "direction_convention": "coming-from radar u=(cos el cos az, cos el sin az, sin el)",
+            "time_convention": "exp(-jwt)" if sign > 0 else "exp(+jwt)",
+        },
+        sort_keys=True,
+    )
+    note = f"moved by ({offset[0]:g}, {offset[1]:g}, {offset[2]:g}) m in body axes"
+    for container in (units, extra):
+        declared = container.get("phase_reference")
+        if declared is None or np.asarray(declared).size != 1:
+            continue
+        text = str(np.asarray(declared).reshape(-1)[0].item()).strip()
+        if text:
+            container["phase_reference"] = f"{text}; {note}"
+    return RcsGrid(
+        dataset.azimuths,
+        dataset.elevations,
+        dataset.frequencies,
+        dataset.polarizations,
+        rcs_power=power,
+        rcs_phase=phase,
+        rcs_domain="complex_amplitude",
+        source_path=dataset.source_path,
+        history=dataset.history,
+        units=units,
+        extra=extra,
+    )

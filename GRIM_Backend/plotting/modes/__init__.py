@@ -7,6 +7,7 @@ from . import delta_map_mode
 from . import elevation_sweep_mode
 from . import frequency_mode
 from . import isar_mode
+from . import range_freq_mode
 from . import sector_stats_mode
 from . import waterfall_mode
 
@@ -20,6 +21,7 @@ __all__ = [
     "elevation_sweep_mode",
     "frequency_mode",
     "isar_mode",
+    "range_freq_mode",
     "sector_stats_mode",
     "waterfall_mode",
 ]

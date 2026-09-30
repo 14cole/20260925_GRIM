@@ -32,6 +32,7 @@ from GRIM_Backend.plotting.modes import (
     elevation_sweep_mode,
     frequency_mode,
     isar_mode,
+    range_freq_mode,
     sector_stats_mode,
     waterfall_mode,
 )
@@ -311,6 +312,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             "delta_map": self._plot_delta_map,
             "cdf": self._plot_cdf,
             "sector_stats": self._plot_sector_stats,
+            "range_freq": self._plot_range_freq,
         }.get(mode)
         if renderer is not None:
             renderer()
@@ -330,6 +332,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             "cdf": mode == "cdf",
             "sector": mode == "sector_stats",
             "delta": mode in DELTA_REFERENCE_MODES and self._delta_reference_active(),
+            "range": mode == "range_freq",
         }.get(kind, False)
         if not affected or getattr(self, "_active_plot_tab", "plotting") != "plotting":
             return
@@ -375,6 +378,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     def _on_waterfall_style_changed(self) -> None:
         if self.last_plot_mode == "delta_map":
             self._plot_delta_map()
+            return
+        if self.last_plot_mode == "range_freq":
+            self._plot_range_freq()
             return
         if self.last_plot_mode not in ("waterfall", "isar_image", "az_vs_range"):
             return
@@ -459,6 +465,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         elif self.last_plot_mode == "sector_stats":
             self._plot_sector_stats()
             self._fit_y()
+        elif self.last_plot_mode == "range_freq":
+            self._plot_range_freq()
         elif self.last_plot_mode == "waterfall":
             self._plot_waterfall()
         elif self.last_plot_mode == "isar_image":
@@ -2846,6 +2854,12 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         cdf_mode.render(self)
         self._capture_successful_python_plot("cdf")
         self._restore_plot_markers()
+        self._maybe_autoscale()
+
+    def _plot_range_freq(self) -> None:
+        self._set_compare_sector_controls_visible(False)
+        range_freq_mode.render(self)
+        self._capture_successful_python_plot("range_freq")
         self._maybe_autoscale()
 
     def _plot_sector_stats(self) -> None:
