@@ -63,9 +63,16 @@ class FrequencyCheckpoints:
         if self.certified and result.get('metadata', {}).get('mesh_convergence_certified') is not True:
             raise ValueError('An uncertified frequency cannot enter a certified checkpoint.')
         rows = result['samples']
-        columns = sorted(set(key for row in rows for key in row))
+        from ghost_backend.twod.samples import sample_columns
+        packed = sample_columns(rows)
+        columns = sorted(packed) if packed is not None else sorted(set(key for row in rows for key in row))
         arrays, encodings = {}, []
         for index,key in enumerate(columns):
+            if packed is not None:
+                arrays['c' + str(index)] = packed[key]
+                arrays['p' + str(index)] = np.ones(len(rows), dtype=bool)
+                encodings.append('scalar')
+                continue
             values = [row.get(key) for row in rows]
             # Store numeric solver fields directly; JSON is only a fallback for
             # heterogeneous extension fields. No object-dtype arrays are used.
@@ -79,6 +86,11 @@ class FrequencyCheckpoints:
         header = {key: value for key,value in result.items() if key not in ('samples', 'co_solved_samples')}
         record = dict(identity=self.identity, frequency=float(frequency), certified=self.certified,
                       columns=columns, encodings=encodings, result=header, co_solved='co_solved_samples' in result)
+        if result.get('solver') == 'bor_mom_rcs' and record['co_solved']:
+            # BoR public per-channel rows omit the combined view's labels.
+            record['channel_labels'] = {pol: [key for key in ('polarization', 'polarization_internal')
+                                               if len(values) and key in values[0]]
+                                        for pol, values in result['co_solved_samples'].items()}
         arrays['header'] = np.frombuffer(_json(record).encode('utf-8'), dtype=np.uint8)
         path = self._path(frequency)
         handle, temporary = tempfile.mkstemp(prefix='frequency-', suffix='.npz', dir=str(self.directory))
@@ -115,8 +127,9 @@ class FrequencyCheckpoints:
                 if (record['identity'] != self.identity or record['frequency'] != float(frequency)
                         or record['certified'] != self.certified):
                     return None
-                rows = None
-                for index,key in enumerate(record['columns']):
+                from ghost_backend.twod.samples import checkpoint_samples, SampleTable, SampleSelection
+                rows = checkpoint_samples(data, record)
+                for index,key in (() if rows is not None else enumerate(record['columns'])):
                     values, present = data['c'+str(index)], data['p'+str(index)]
                     if rows is None:
                         rows = [{} for _ in values]
@@ -129,11 +142,32 @@ class FrequencyCheckpoints:
             result['samples'] = rows or []
             if self.certified and result.get('metadata', {}).get('mesh_convergence_certified') is not True:
                 return None
-            if any(float(row['frequency_ghz']) != float(frequency) for row in result['samples']):
+            if (np.any(rows.data[:len(rows), 0] != float(frequency)) if isinstance(rows, SampleTable)
+                    else any(float(row['frequency_ghz']) != float(frequency) for row in result['samples'])):
                 return None
             if record['co_solved']:
-                result['co_solved_samples'] = {pol: [row for row in result['samples'] if row['polarization'] == pol]
-                                               for pol in ('VV', 'HH')}
+                if isinstance(rows, SampleTable):
+                    labels = rows.labels.get('polarization')
+                    if labels is None:
+                        return None
+                    channel_rows = {}
+                    for pol in ('VV', 'HH'):
+                        table = rows
+                        if 'channel_labels' in record:
+                            allowed = record['channel_labels'][pol]
+                            table = SampleTable(rows.data, len(rows), fields=rows.fields,
+                                labels={key: value for key, value in rows.labels.items() if key in allowed})
+                        channel_rows[pol] = SampleSelection(table, np.flatnonzero(labels == pol))
+                    result['co_solved_samples'] = channel_rows
+                else:
+                    result['co_solved_samples'] = {pol: [row for row in result['samples'] if row['polarization'] == pol]
+                                                   for pol in ('VV', 'HH')}
+                    if 'channel_labels' in record:
+                        for pol, values in result['co_solved_samples'].items():
+                            result['co_solved_samples'][pol] = [
+                                {key: value for key, value in row.items()
+                                 if key not in ('polarization', 'polarization_internal')
+                                 or key in record['channel_labels'][pol]} for row in values]
             return result
         except (OSError, ValueError, KeyError, TypeError, EOFError, zipfile.BadZipFile):
             return None
@@ -191,4 +225,12 @@ def run_checkpointed(solve, arguments, directory, options, precision, certified)
         sampled_peak_process_rss_bytes=max(peaks) if peaks else None,
         stage_semantics='Current execution only; cached stages excluded; nested stages may overlap.',
         memory_semantics='Process samples from frequencies computed in this execution; cached samples excluded.')
+    for key in ('sampled_peak_process_tree_rss_bytes', 'sampled_peak_process_tree_private_bytes'):
+        values = [p[key] for p in profiles if p.get(key) is not None]
+        result['metadata']['runtime_profile'][key] = max(values) if values else None
+    result['metadata']['runtime_profile']['process_tree_incomplete_samples'] = sum(
+        p.get('process_tree_incomplete_samples', 0) for p in profiles)
+    result['metadata']['runtime_profile']['process_tree_memory_semantics'] = (
+        'Parent plus descendant RSS sums from this execution only; cached samples excluded; '
+        'shared pages may be counted more than once. Private bytes are Windows private commit.')
     return result

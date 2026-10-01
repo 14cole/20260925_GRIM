@@ -281,9 +281,10 @@ def _integrate_linear_pairs_box_sk_batched(
         if green is None:
             green = 0.25j * _hankel2_0_array(kr.reshape(-1)).reshape(dist.shape)
         weighted_g = w_outer[None, :, :] * green
-        s_blocks = np.einsum(
-            'pij,ia,jb->pab', weighted_g, phi, phi
-        )
+        # Contract the two quadrature axes separately instead of visiting every
+        # (i, j, a, b) combination in the generic einsum loop. Each pair remains
+        # an independent matrix product, including in threaded batches.
+        s_blocks = phi.T @ weighted_g @ phi
     else:
         s_blocks = zero.copy()
 
@@ -307,9 +308,7 @@ def _integrate_linear_pairs_box_sk_batched(
             ) / dist_safe
             dk_vals = derivative * proj
         dk_vals[dist <= EPS] = 0.0
-        k_blocks = np.einsum(
-            'pij,ia,jb->pab', w_outer[None, :, :] * dk_vals, phi, phi
-        )
+        k_blocks = phi.T @ (w_outer[None, :, :] * dk_vals) @ phi
     else:
         k_blocks = zero.copy()
 
@@ -649,14 +648,14 @@ def _integrate_linear_touching_pairs_sk_batched(pairs, shared, k0,
     s = k = np.zeros((len(pairs), 2, 2), complex)
     green, deriv = _near_kernel_values(k0, safe, compute_single_layer, compute_double_layer, table)
     if compute_single_layer:
-        s = np.einsum('q,pq,pqa,pqb->pab', weights, green, po, ps)
+        s = po.swapaxes(1, 2) @ ((weights[None, :] * green)[:, :, None] * ps)
     if compute_double_layer:
         normals = np.asarray([e.normal for e in (obs if obs_normal_deriv else src)])
         deriv *= np.sum(diff * normals[:, None, :], axis=-1) / safe
         if obs_normal_deriv:
             deriv = -deriv
         deriv[dist <= EPS] = 0
-        k = np.einsum('q,pq,pqa,pqb->pab', weights, deriv, po, ps)
+        k = po.swapaxes(1, 2) @ ((weights[None, :] * deriv)[:, :, None] * ps)
     scale = np.asarray([a.length*b.length for a, b in pairs])[:, None, None]
     return s * scale, k * scale
 
@@ -1229,6 +1228,9 @@ _ASSEMBLY_TILE_TARGET_BYTES = 24 * 1024 * 1024
 _NEAR_BATCH_MAX_SAMPLES = 1_000_000
 # Concurrent near batches keep the former single-batch working set in total.
 _NEAR_BATCH_THREAD_SAMPLES = 250_000
+# Bound the advanced-index copies and Maue blocks used by the final scatter.
+# This does not alter pair order within any destination operator.
+_NEAR_SCATTER_MAX_PAIRS = 16_384
 
 
 def _env_positive_int(name: 'str', default: 'int') -> 'int':
@@ -1850,6 +1852,121 @@ def _maue_blocks(s_blocks, k0, obs_normals, src_normals, obs_lengths, src_length
             + _TANGENT_OUTER[None, :, :] * quotient[:, None, None])
 
 
+
+def _near_pair_blocks(elements, obs_idx, src_idx, k0, obs_normal_deriv, obs_order, src_order,
+                      integrate_s, want_k, p0_arr, seg_arr, centers, lengths, node_ids, far_table,
+                      single_layer_blocks=None, double_layer_blocks=None):
+    """Integrate one bounded set of pairs, using the unchanged quadrature rules."""
+    npairs, width = len(obs_idx), node_ids.shape[1]
+    panel_index = np.asarray([e.panel_index for e in elements], dtype=np.int64)
+    s_near, k_near = single_layer_blocks, double_layer_blocks
+    if integrate_s and s_near is None:
+        s_near = np.zeros((npairs, width, width), dtype=np.complex128)
+    if want_k and k_near is None:
+        k_near = np.zeros((npairs, width, width), dtype=np.complex128)
+    done = np.zeros(npairs, dtype=bool)
+
+
+    fixed_positions_by_order = _near_fixed_order_positions(
+        panel_index, obs_idx, src_idx, p0_arr, p0_arr + seg_arr, centers, lengths,
+        obs_order, src_order, node_ids=node_ids,
+    )
+
+    batches = []
+    for tensor_order, positions in fixed_positions_by_order.items():
+        # Batch boundaries do not depend on the thread count, so threaded and
+        # serial assembly integrate identical batches.
+        batch_pairs = max(1, _NEAR_BATCH_THREAD_SAMPLES // max(1, tensor_order * tensor_order))
+        for start in range(0, len(positions), batch_pairs):
+            batches.append((tensor_order, positions[start:start + batch_pairs]))
+
+    def _fixed_batch(batch):
+        tensor_order, selected = batch
+        selected_arr = np.asarray(selected, dtype=np.int64)
+        return _integrate_linear_pairs_box_sk_batched(
+            elements,
+            obs_idx[selected_arr],
+            src_idx[selected_arr],
+            k0,
+            obs_normal_deriv,
+            tensor_order,
+            compute_single_layer=integrate_s,
+            compute_double_layer=want_k,
+        )
+
+    from ghost_backend.twod.polynomial_quadrature import map_checked, solve_checkpoint
+    near_workers = min(get_assembly_threads(), len(batches),
+                       max(1, _NEAR_BATCH_MAX_SAMPLES // _NEAR_BATCH_THREAD_SAMPLES))
+    batch_results = map_checked(_fixed_batch, batches, near_workers, solve_checkpoint())
+    for (_, selected), (s_batch, k_batch) in zip(batches, batch_results):
+        if s_near is not None:
+            s_near[selected] = s_batch
+        if k_near is not None:
+            k_near[selected] = k_batch
+        done[selected] = True
+    batch_results = None
+
+    p1_arr = p0_arr + seg_arr
+    if width == 2:
+        candidates = np.flatnonzero(~done & (panel_index[obs_idx] != panel_index[src_idx]))
+        touching, obs_start, src_start = _shared_endpoints(
+            p0_arr, p1_arr, node_ids, obs_idx[candidates], src_idx[candidates])
+        touching_pos = candidates[touching]
+        endpoints = np.column_stack((obs_start[touching], src_start[touching]))
+        order = max(6, max(int(obs_order), int(src_order)) + 1)
+        samples = 2 * _touching_order(order) ** 2
+        per_batch = max(1, _NEAR_BATCH_THREAD_SAMPLES // samples)
+        jobs = [(touching_pos[start:start+per_batch], endpoints[start:start+per_batch])
+                for start in range(0, len(touching_pos), per_batch)]
+        def integrate_touching(job):
+            positions, shared = job
+            pairs = [(elements[int(obs_idx[p])], elements[int(src_idx[p])]) for p in positions]
+            return _integrate_linear_touching_pairs_sk_batched(pairs, shared, k0,
+                obs_normal_deriv, order, integrate_s, want_k, table=far_table)
+        near_workers = min(get_assembly_threads(), len(jobs),
+                           max(1, _NEAR_BATCH_MAX_SAMPLES // _NEAR_BATCH_THREAD_SAMPLES))
+        results = map_checked(integrate_touching, jobs, near_workers, solve_checkpoint())
+        for (positions, _), (sb, kb) in zip(jobs, results):
+            if s_near is not None:
+                s_near[positions] = sb
+            if k_near is not None:
+                k_near[positions] = kb
+            done[positions] = True
+        results = None
+
+    if width > 2:
+        # Polynomial self, touching and adaptive pairs share batched stages.
+        from ghost_backend.twod.polynomial_quadrature import near_blocks
+        remaining = np.flatnonzero(~done)
+        blocks = near_blocks([(elements[int(obs_idx[pos])], elements[int(src_idx[pos])]) for pos in remaining],
+                             k0, obs_normal_deriv)
+        for pos, (s_blk, k_blk) in zip(remaining, blocks):
+            if integrate_s:
+                s_near[pos] = s_blk
+            if want_k:
+                k_near[pos] = k_blk
+        done[remaining] = True
+        blocks = None
+
+    # Self and adaptive linear pairs, one at a time (O(N) self terms plus the
+    # few close pairs whose rule adapts).
+    for pos in np.flatnonzero(~done):
+        s_blk, k_blk = _sk_blocks_near_linear(
+            obs_elem=elements[int(obs_idx[pos])],
+            src_elem=elements[int(src_idx[pos])],
+            k0=k0,
+            obs_normal_deriv=obs_normal_deriv,
+            obs_order=obs_order,
+            src_order=src_order,
+            compute_single_layer=integrate_s,
+            compute_double_layer=want_k,
+        )
+        if s_near is not None:
+            s_near[pos] = s_blk
+        if k_near is not None:
+            k_near[pos] = k_blk
+    return s_near, k_near
+
 def _assemble_multi(
     mesh, k0, obs_normal_deriv, source_element_masks, obs_order=8, src_order=8,
     far_ratio=3.0, compute_single_layer=True, compute_double_layer=True,
@@ -2178,12 +2295,17 @@ def _assemble_multi(
             np.where(any_far, centre_dist / scale, np.inf)
         )) if any_far.any() else float("inf")
         kl_max = abs_k * float(max(obs_len.max(), src_len.max()))
-        tile_order = max(int(minimum_far_order), width + 2 if width > 2 else 2,
-                         _graded_far_order(kl_max, ratio_min, far_obs_order, width - 1, attenuating))
+        rule_floor = max(int(minimum_far_order), width + 2 if width > 2 else 2)
+        tile_obs_order = max(rule_floor,
+            _graded_far_order(kl_max, ratio_min, far_obs_order, width - 1, attenuating))
+        tile_src_order = max(rule_floor,
+            _graded_far_order(kl_max, ratio_min, far_src_order, width - 1, attenuating))
         if want_w:
-            tile_order = max(tile_order, w_far_floor, int(obs_order), int(src_order))
-        t_obs_f, qw_obs, phi_obs_arr = _rule(tile_order)
-        t_src_f, qw_src, phi_src_arr = _rule(tile_order)
+            # Preserve W's independently qualified rule on both axes.
+            tile_obs_order = tile_src_order = max(tile_obs_order, tile_src_order,
+                w_far_floor, int(obs_order), int(src_order))
+        t_obs_f, qw_obs, phi_obs_arr = _rule(tile_obs_order)
+        t_src_f, qw_src, phi_src_arr = _rule(tile_src_order)
 
         obs_pts = (obs_p0[:, None, :]
                    + t_obs_f[None, :, None] * obs_seg[:, None, :])
@@ -2191,7 +2313,9 @@ def _assemble_multi(
         src_seg = seg_arr[src_global]
         src_pts = src_p0[:, None, :] + t_src_f[None, :, None] * src_seg[:, None, :]
         native = None
-        if native_far:
+        # The native ABI currently takes one quadrature rule for both axes.
+        # Unequal rules use the exact same kernels in the two-rule NumPy path.
+        if native_far and tile_obs_order == tile_src_order:
             from ghost_backend.twod.assembly.native.far import far_block
             native = far_block(far_table, k0, obs_pts, src_pts, qw_obs, phi_obs_arr,
                                obs_norm, src_norm, any_far, obs_normal_deriv,
@@ -2270,160 +2394,84 @@ def _assemble_multi(
     npairs = int(obs_idx.size)
     if not npairs:
         return list(zip(s_mats, k_mats))
-    panel_index = np.asarray([e.panel_index for e in elements], dtype=np.int64)
-    s_near = np.zeros((npairs, width, width), dtype=np.complex128)
-    k_near = np.zeros((npairs, width, width), dtype=np.complex128)
-    done = np.zeros(npairs, dtype=bool)
+    from ghost_backend.twod.assembly.near_store import NearStore, NEAR_INTEGRATION_PAIRS
+    from ghost_backend.twod.polynomial_quadrature import solve_checkpoint
+    kinds = (['S'] if integrate_s else []) + (['K'] if want_k else []) + (['D'] if want_d else [])
+    with NearStore(npairs, width, kinds, solve_checkpoint()) as near:
+        for start in range(0, npairs, NEAR_INTEGRATION_PAIRS):
+            stop = min(start + NEAR_INTEGRATION_PAIRS, npairs)
+            sb, kb = _near_pair_blocks(elements, obs_idx[start:stop], src_idx[start:stop],
+                k0, obs_normal_deriv, obs_order, src_order, integrate_s, want_k,
+                p0_arr, seg_arr, centers, lengths, node_ids, far_table,
+                single_layer_blocks=near.arrays['S'][start:stop] if 'S' in near.arrays else None,
+                double_layer_blocks=near.arrays['K'][start:stop] if 'K' in near.arrays else None)
+            if sb is not None:
+                near.write('S', start, sb)
+            if kb is not None:
+                near.write('K', start, kb)
+            sb = kb = None
 
+        # D(x,y) = K'(y,x). Retain the same reverse-pair reuse, but read only
+        # a bounded batch of records; missing reverse pairs keep their own rule.
+        if want_d:
+            keys = obs_idx.astype(np.int64) * nelems + src_idx
+            for start in range(0, npairs, NEAR_INTEGRATION_PAIRS):
+                stop = min(start + NEAR_INTEGRATION_PAIRS, npairs)
+                oi, si = obs_idx[start:stop], src_idx[start:stop]
+                needs = np.zeros(stop-start, bool)
+                for mi in active:
+                    if want_d_masks[mi]:
+                        needs |= src_masks[mi][si] & obs_masks[mi][oi]
+                reverse_keys = si.astype(np.int64)*nelems + oi
+                location = np.minimum(np.searchsorted(keys, reverse_keys), npairs-1)
+                present = needs & (keys[location] == reverse_keys)
+                values = np.zeros((stop-start, width, width), complex)
+                values[present] = near.read('K', location[present]).transpose(0, 2, 1)
+                missing = np.flatnonzero(needs & ~present)
+                if width > 2 and len(missing):
+                    from ghost_backend.twod.polynomial_quadrature import near_blocks
+                    for pos, (_, block) in zip(missing, near_blocks(
+                            [(elements[int(oi[p])], elements[int(si[p])]) for p in missing], k0, False)):
+                        values[pos] = block
+                else:
+                    for pos in missing:
+                        values[pos] = _sk_blocks_near_linear(elements[int(oi[pos])], elements[int(si[pos])],
+                            k0, False, obs_order, src_order, compute_single_layer=False, compute_double_layer=True)[1]
+                near.write('D', start, values)
+                values = None
+            keys = None
 
-    fixed_positions_by_order = _near_fixed_order_positions(
-        panel_index, obs_idx, src_idx, p0_arr, p0_arr + seg_arr, centers, lengths,
-        obs_order, src_order, node_ids=node_ids,
-    )
+        # Keep the previous destination -> S/K'/D/W -> ascending pair order.
+        # Interleaving operators by chunk could change a fused matrix's sums.
+        def scatter_chunks(pairs):
+            for start in range(0, len(pairs), _NEAR_SCATTER_MAX_PAIRS):
+                selected = pairs[start:start + _NEAR_SCATTER_MAX_PAIRS]
+                yield selected, node_ids[obs_idx[selected]], node_ids[src_idx[selected]]
 
-    batches = []
-    for tensor_order, positions in fixed_positions_by_order.items():
-        # Batch boundaries do not depend on the thread count, so threaded and
-        # serial assembly integrate identical batches.
-        batch_pairs = max(1, _NEAR_BATCH_THREAD_SAMPLES // max(1, tensor_order * tensor_order))
-        for start in range(0, len(positions), batch_pairs):
-            batches.append((tensor_order, positions[start:start + batch_pairs]))
-
-    def _fixed_batch(batch):
-        tensor_order, selected = batch
-        selected_arr = np.asarray(selected, dtype=np.int64)
-        return _integrate_linear_pairs_box_sk_batched(
-            elements,
-            obs_idx[selected_arr],
-            src_idx[selected_arr],
-            k0,
-            obs_normal_deriv,
-            tensor_order,
-            compute_single_layer=integrate_s,
-            compute_double_layer=want_k,
-        )
-
-    from ghost_backend.twod.polynomial_quadrature import map_checked, solve_checkpoint
-    near_workers = min(get_assembly_threads(), len(batches),
-                       max(1, _NEAR_BATCH_MAX_SAMPLES // _NEAR_BATCH_THREAD_SAMPLES))
-    batch_results = map_checked(_fixed_batch, batches, near_workers, solve_checkpoint())
-    for (_, selected), (s_batch, k_batch) in zip(batches, batch_results):
-        s_near[selected] = s_batch
-        k_near[selected] = k_batch
-        done[selected] = True
-    batch_results = None
-
-    p1_arr = p0_arr + seg_arr
-    if width == 2:
-        candidates = np.flatnonzero(~done & (panel_index[obs_idx] != panel_index[src_idx]))
-        touching, obs_start, src_start = _shared_endpoints(
-            p0_arr, p1_arr, node_ids, obs_idx[candidates], src_idx[candidates])
-        touching_pos = candidates[touching]
-        endpoints = np.column_stack((obs_start[touching], src_start[touching]))
-        order = max(6, max(int(obs_order), int(src_order)) + 1)
-        samples = 2 * _touching_order(order) ** 2
-        per_batch = max(1, _NEAR_BATCH_THREAD_SAMPLES // samples)
-        jobs = [(touching_pos[start:start+per_batch], endpoints[start:start+per_batch])
-                for start in range(0, len(touching_pos), per_batch)]
-        def integrate_touching(job):
-            positions, shared = job
-            pairs = [(elements[int(obs_idx[p])], elements[int(src_idx[p])]) for p in positions]
-            return _integrate_linear_touching_pairs_sk_batched(pairs, shared, k0,
-                obs_normal_deriv, order, integrate_s, want_k, table=far_table)
-        near_workers = min(get_assembly_threads(), len(jobs),
-                           max(1, _NEAR_BATCH_MAX_SAMPLES // _NEAR_BATCH_THREAD_SAMPLES))
-        results = map_checked(integrate_touching, jobs, near_workers, solve_checkpoint())
-        for (positions, _), (sb, kb) in zip(jobs, results):
-            s_near[positions] = sb
-            k_near[positions] = kb
-            done[positions] = True
-        results = None
-
-    if width > 2:
-        # Polynomial self, touching and adaptive pairs share batched stages.
-        from ghost_backend.twod.polynomial_quadrature import near_blocks
-        remaining = np.flatnonzero(~done)
-        blocks = near_blocks([(elements[int(obs_idx[pos])], elements[int(src_idx[pos])]) for pos in remaining],
-                             k0, obs_normal_deriv)
-        for pos, (s_blk, k_blk) in zip(remaining, blocks):
-            if integrate_s:
-                s_near[pos] = s_blk
-            if want_k:
-                k_near[pos] = k_blk
-        done[remaining] = True
-        blocks = None
-
-    # Self and adaptive linear pairs, one at a time (O(N) self terms plus the
-    # few close pairs whose rule adapts).
-    for pos in np.flatnonzero(~done):
-        s_blk, k_blk = _sk_blocks_near_linear(
-            obs_elem=elements[int(obs_idx[pos])],
-            src_elem=elements[int(src_idx[pos])],
-            k0=k0,
-            obs_normal_deriv=obs_normal_deriv,
-            obs_order=obs_order,
-            src_order=src_order,
-            compute_single_layer=integrate_s,
-            compute_double_layer=want_k,
-        )
-        s_near[pos] = s_blk
-        k_near[pos] = k_blk
-    done[:] = True
-
-    # D(x,y) = K'(y,x). Use the already integrated reverse near pair where
-    # present; only genuinely missing pairs require another derivative query.
-    d_near = None
-    if want_d:
-        needs_d = np.zeros(npairs, dtype=bool)
         for mi in active:
-            if want_d_masks[mi]:
-                needs_d |= src_masks[mi][src_idx] & obs_masks[mi][obs_idx]
-        keys = obs_idx.astype(np.int64) * nelems + src_idx
-        reverse_keys = src_idx.astype(np.int64) * nelems + obs_idx
-        location = np.minimum(np.searchsorted(keys, reverse_keys), npairs - 1)
-        found = keys[location] == reverse_keys
-        d_near = np.zeros_like(k_near)
-        present = needs_d & found
-        d_near[present] = k_near[location[present]].transpose(0, 2, 1)
-        missing = np.flatnonzero(needs_d & ~found)
-        if width > 2 and len(missing):
-            from ghost_backend.twod.polynomial_quadrature import near_blocks
-            for pos, (_, block) in zip(missing, near_blocks(
-                    [(elements[int(obs_idx[p])], elements[int(src_idx[p])]) for p in missing], k0, False)):
-                d_near[pos] = block
-        else:
-            for pos in missing:
-                d_near[pos] = _sk_blocks_near_linear(
-                    elements[int(obs_idx[pos])], elements[int(src_idx[pos])], k0, False,
-                    obs_order, src_order, compute_single_layer=False, compute_double_layer=True)[1]
-
-    # One ordered scatter per requested output. Entries receive the near blocks
-    # in pair order, as the former per-pair scatter did.
-    obs_rows = node_ids[obs_idx]
-    src_columns = node_ids[src_idx]
-    w_near = None
-    if want_w:
-        w_near = _maue_blocks(s_near, k0, normals_arr[obs_idx], normals_arr[src_idx],
-                              lengths[obs_idx], lengths[src_idx])
-    for mi in active:
-        pairs = np.flatnonzero(src_masks[mi][src_idx] & obs_masks[mi][obs_idx])
-        if not len(pairs):
-            continue
-        rows, columns = obs_rows[pairs], src_columns[pairs]
-        if s_out[mi] is not None:
-            slp_obs_coeff = slp_obs_coeffs[mi]
-            values = s_near[pairs]
-            if slp_obs_coeff is not None:
-                values = slp_obs_coeff[obs_idx[pairs]][:, None, None] * values
-            s_out[mi].scatter_pairs(rows, columns, values)
-        if k_out[mi] is not None:
-            k_out[mi].scatter_pairs(rows, columns, k_near[pairs])
-        if d_out[mi] is not None:
-            d_out[mi].scatter_pairs(rows, columns, d_near[pairs])
-        if w_out[mi] is not None:
-            w_out[mi].scatter_pairs(rows, columns, w_near[pairs])
+            pairs = np.flatnonzero(src_masks[mi][src_idx] & obs_masks[mi][obs_idx])
+            if not len(pairs):
+                continue
+            if s_out[mi] is not None:
+                slp_obs_coeff = slp_obs_coeffs[mi]
+                for selected, rows, columns in scatter_chunks(pairs):
+                    values = near.read('S', selected)
+                    if slp_obs_coeff is not None:
+                        np.multiply(slp_obs_coeff[obs_idx[selected]][:, None, None], values, out=values)
+                    s_out[mi].scatter_pairs(rows, columns, values)
+            if k_out[mi] is not None:
+                for selected, rows, columns in scatter_chunks(pairs):
+                    k_out[mi].scatter_pairs(rows, columns, near.read('K', selected))
+            if d_out[mi] is not None:
+                for selected, rows, columns in scatter_chunks(pairs):
+                    d_out[mi].scatter_pairs(rows, columns, near.read('D', selected))
+            if w_out[mi] is not None:
+                for selected, rows, columns in scatter_chunks(pairs):
+                    oi, si = obs_idx[selected], src_idx[selected]
+                    values = _maue_blocks(near.read('S', selected), k0, normals_arr[oi], normals_arr[si],
+                                         lengths[oi], lengths[si])
+                    w_out[mi].scatter_pairs(rows, columns, values)
     return list(zip(s_mats, k_mats))
-
 
 def _far_tile_numpy(far_green, far_hankel, k0, real_k, obs_pts, src_pts, qw_obs, qw_src,
                     phi_obs_arr, phi_src_arr, obs_norm, src_norm, obs_normal_deriv, dgreen_sign,
@@ -2750,6 +2798,7 @@ def _farfield_linear_density_many(
     order: 'int' = 8,
     element_mask: 'Optional[np.ndarray]' = None,
     projection: 'str' = "matched",
+    prepared_projection=None,
 ) -> 'np.ndarray':
     """Vectorized SLP/DLP far field for matched or rectangular projections.
 
@@ -2762,10 +2811,12 @@ def _farfield_linear_density_many(
     """
     if mesh_degree(mesh) > 1:
         from ghost_backend.twod.assembly.kernels import farfield
-        return farfield(mesh, density, k_air, observation_angles_deg, potential, order, element_mask, projection)
+        return farfield(mesh, density, k_air, observation_angles_deg, potential, order, element_mask, projection,
+                        prepared_projection=prepared_projection)
     if current_state() is not None:
         from ghost_backend.twod.assembly.kernels import farfield
-        return farfield(mesh, density, k_air, observation_angles_deg, potential, order, element_mask, projection)
+        return farfield(mesh, density, k_air, observation_angles_deg, potential, order, element_mask, projection,
+                        prepared_projection=prepared_projection)
 
     obs = np.asarray(observation_angles_deg, dtype=float).reshape(-1)
     rho = np.asarray(density, dtype=np.complex128)

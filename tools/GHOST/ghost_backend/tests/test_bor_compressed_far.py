@@ -145,7 +145,21 @@ class CompressedBlockTests(unittest.TestCase):
         with leaf, aca:
             double = cf.CompressedFarBlocks(solver, 5, efie=True, mfie=True)
             single = cf.CompressedFarBlocks(solver, 5, efie=True, mfie=True, dtype=np.complex64)
-        self.assertAlmostEqual(single.memory_gb() / double.memory_gb(), 0.5, places=6)
+        # Single retains the original expanded-factor rounding. Double may
+        # now share Q across slices, so half of its *expanded* payload is the
+        # correct single-precision expectation.
+        expected = 0
+        for store in double._blocks.values():
+            for kind, payload in store.values():
+                if kind == 'dense':
+                    expected += payload.nbytes // 2
+                elif kind == 'shared':
+                    basis, rows = payload
+                    expected += sum(8*basis.shape[0]*left.shape[1]+right.nbytes//2
+                                    for row in rows for left,right in row)
+                else:
+                    expected += sum((left.nbytes+right.nbytes)//2 for row in payload for left,right in row)
+        self.assertAlmostEqual(single.memory_gb(), expected/1e9, places=12)
         self.assertLess(_relative(single.efie_blocks(3), double.efie_blocks(3)), 1e-6)
 
 

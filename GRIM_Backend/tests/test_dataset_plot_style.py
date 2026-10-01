@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from matplotlib.backend_bases import MouseButton, MouseEvent
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu
@@ -194,6 +194,178 @@ class DatasetPlotStyleTest(unittest.TestCase):
                 self.assertTrue(self.lines(self.keys[0]), self.window.status.currentMessage())
                 self.assertTrue(all(line.get_marker() == "^" and line.get_linestyle() == "None" for line in self.lines(self.keys[0])))
                 self.assertTrue(all(line.get_linewidth() == 4 and line.get_linestyle() == ":" for line in self.lines(self.keys[1])))
+
+    def band_artists(self):
+        return self.window._plot_item_artists(dataset_plot_style.PBP_BAND_KEY)
+
+    def select_rows(self, *rows):
+        window = self.window
+        window.table.clearSelection()
+        for row in rows:
+            window.table.selectionModel().select(
+                window.table.model().index(row, 0),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+        # A new active row repopulates the axis lists; restore the setUp cuts.
+        window.list_az.selectAll()
+        window.list_elev.selectAll()
+        window.list_freq.clearSelection()
+        window.list_freq.item(0).setSelected(True)
+        window.list_freq.item(1).setSelected(True)
+        window.list_pol.clearSelection()
+        window.list_pol.item(0).setSelected(True)
+
+    def legend_labels(self):
+        legend = self.window.plot_ax.get_legend()
+        return [text.get_text() for text in legend.get_texts()] if legend else []
+
+    def run_context_menu(self, pos, action_text):
+        # QMenu.exec is modal and cannot be patched on PySide types, so route
+        # the right-click as the GUI does and build the menu it would show.
+        with mock.patch.object(self.window, "_show_dataset_plot_style_menu") as show:
+            self.window._on_plot_context_menu(pos)
+        self.menu = self.window._dataset_plot_menu(show.call_args.args[0])
+        return self.action(self.menu, action_text)
+
+    def test_hold_overlays_curves_on_pbp_band_in_either_order(self):
+        window = self.window
+        window.btn_pbp.setChecked(True)
+        self.render()
+        self.assertEqual(len(window.plot_ax.collections), 1)
+        self.assertEqual(len(self.band_artists()), 3)  # the fill and its two edges
+        self.assertEqual(self.lines(self.keys[0]), [])
+
+        window.btn_hold.setChecked(True)
+        window.btn_pbp.setChecked(False)  # Hold: the toggle must not append curves.
+        self.assertEqual(self.lines(self.keys[0]), [])
+        self.select_rows(0)
+        window.list_freq.item(1).setSelected(False)
+        self.render()
+        self.assertNotIn("blocked", window.status.currentMessage().lower())
+        self.assertEqual(len(self.lines(self.keys[0])), 1)
+        self.assertEqual(len(window.plot_ax.collections), 1)
+        self.assertTrue(self.legend_labels()[0].startswith("PBP"))
+        self.assertTrue(self.legend_labels()[1].startswith("Shared name |"))
+        curve = self.lines(self.keys[0])[0]
+        self.assertTrue(all(curve.get_zorder() > edge.get_zorder()
+                            for edge in window.plot_ax.lines if edge in self.band_artists()))
+
+        # A new band under Hold replaces the old one and keeps the held curve.
+        window.btn_pbp.setChecked(True)
+        self.select_rows(0, 1)
+        window.list_freq.item(1).setSelected(True)
+        self.render()
+        self.assertNotIn("blocked", window.status.currentMessage().lower())
+        self.assertEqual(len(window.plot_ax.collections), 1)
+        self.assertEqual(len(self.band_artists()), 3)
+        self.assertEqual(len(self.lines(self.keys[0])), 1)
+        self.assertEqual(len(self.legend_labels()), 2)
+
+        # Curves first, then a band added under Hold.
+        window.btn_hold.setChecked(False)
+        window.btn_pbp.setChecked(False)
+        self.render()
+        window.btn_hold.setChecked(True)
+        window.btn_pbp.setChecked(True)
+        self.render()
+        self.assertEqual(len(window.plot_ax.collections), 1)
+        self.assertEqual(len(self.lines(self.keys[0])), 2)
+        self.assertEqual(len(self.lines(self.keys[1])), 2)
+
+        # Hold still refuses image content and mismatched axes.
+        window.btn_pbp.setChecked(False)
+        window._plot_waterfall()
+        self.render()
+        self.assertIn("hold blocked", window.status.currentMessage().lower())
+
+    def test_heatmap_band_is_one_removable_item(self):
+        window = self.window
+        window.pbp_fill_mode = "heatmap_rcs"
+        window.btn_pbp.setChecked(True)
+        self.render()
+        self.assertTrue(window.plot_ax.collections)
+        window.btn_hold.setChecked(True)
+        window.btn_pbp.setChecked(False)
+        self.select_rows(0)
+        self.render()
+        self.assertEqual(len(self.lines(self.keys[0])), 2)
+        self.assertTrue(window._remove_plot_dataset(dataset_plot_style.PBP_BAND_KEY))
+        self.assertEqual(len(window.plot_ax.collections), 0)
+        self.assertEqual(self.band_artists(), [])
+        self.assertEqual(len(self.lines(self.keys[0])), 2)
+        self.assertTrue(all(label.startswith("Shared name |") for label in self.legend_labels()))
+
+    def test_delete_key_removes_selected_dataset_but_keeps_table_rows(self):
+        window = self.window
+        self.assertEqual(window.plot_canvas.focusPolicy(), Qt.ClickFocus)
+        QTest.mouseClick(window.plot_canvas, Qt.LeftButton, pos=self.line_pos(self.keys[0]))
+        self.assertEqual(window._highlighted_plot_datasets, {self.keys[0]})
+        QTest.keyClick(window.plot_canvas, Qt.Key_Delete)
+        self.assertEqual(self.lines(self.keys[0]), [])
+        self.assertEqual(len(self.lines(self.keys[1])), 2)
+        self.assertEqual(len(self.legend_labels()), 2)
+        self.assertEqual(window._highlighted_plot_datasets, set())
+        self.assertIn("Removed Shared name from the plot", window.status.currentMessage())
+        self.assertEqual(window.table.rowCount(), 2)
+        self.assertEqual(len(window.table.selectionModel().selectedRows()), 2)
+        QTest.keyClick(window.plot_canvas, Qt.Key_Delete)
+        self.assertIn("Click a curve or legend entry", window.status.currentMessage())
+        self.assertEqual(len(self.lines(self.keys[1])), 2)
+        self.render()  # Plotting again restores what the table selects.
+        self.assertEqual(len(self.lines(self.keys[0])), 2)
+
+    def test_context_menu_removes_curve_or_legend_entry_including_pbp_band(self):
+        window = self.window
+        self.run_context_menu(self.legend_pos(2), "Remove from plot\tDel").trigger()
+        self.assertEqual(self.lines(self.keys[1]), [])
+        self.assertEqual(len(self.lines(self.keys[0])), 2)
+
+        window.btn_pbp.setChecked(True)
+        self.render()
+        window.btn_hold.setChecked(True)
+        window.btn_pbp.setChecked(False)
+        self.select_rows(1)
+        self.render()
+        self.assertEqual(len(self.legend_labels()), 3)
+        remove = self.run_context_menu(self.legend_pos(0), "Remove from plot\tDel")
+        menu_titles = [action.text() for action in remove.parent().actions()]
+        self.assertTrue(menu_titles[0].startswith("PBP Pol"))
+        self.assertNotIn("Color…", menu_titles)
+        remove.trigger()
+        self.assertEqual(self.band_artists(), [])
+        self.assertEqual(len(self.lines(self.keys[1])), 2)
+        self.assertTrue(all(label.startswith("Shared name |") for label in self.legend_labels()))
+        remove = self.run_context_menu(self.line_pos(self.keys[1]), "Remove from plot\tDel")
+        remove.trigger()
+        self.assertEqual(len(window.plot_ax.lines), 0)
+        self.assertFalse(window.plot_ax.get_legend() and window.plot_ax.get_legend().get_visible())
+
+    def test_removal_narrows_python_plot_recipe(self):
+        window = self.window
+        window._record_python_plot("azimuth_rect", emit=False)
+        spec = window.last_python_plot_spec
+        self.assertEqual(spec[0], "supported")
+        reference_index = spec[4]["reference_index"]
+        reference_key = spec[1][reference_index].dataset_id
+        other_key = next(key for key in self.keys if key != reference_key)
+        self.assertTrue(window._remove_plot_dataset(other_key))
+        spec = window.last_python_plot_spec
+        self.assertEqual([ref.dataset_id for ref in spec[1]], [reference_key])
+        self.assertEqual(spec[4]["reference_index"], 0)
+        self.assertEqual(len(spec[2]), 1)
+        self.assertTrue(window._remove_plot_dataset(reference_key))
+        self.assertEqual(window.last_python_plot_spec[0], "unsupported")
+
+    def test_compare_curves_cannot_be_removed_individually(self):
+        window = self.window
+        window.list_freq.item(1).setSelected(False)
+        self.render(compare_mode)
+        before = len(self.lines(self.keys[0]))
+        self.assertFalse(window._remove_plot_dataset(self.keys[0]))
+        self.assertIn("RF Compare", window.status.currentMessage())
+        self.assertEqual(len(self.lines(self.keys[0])), before)
+        remove = self.run_context_menu(self.line_pos(self.keys[0]), "Remove from plot\tDel")
+        self.assertFalse(remove.isEnabled())
 
     def test_pan_zoom_and_isar_do_not_select_plot_datasets(self):
         window = self.window

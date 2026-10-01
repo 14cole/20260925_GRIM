@@ -102,18 +102,9 @@ def pin_blas_threads(count: 'int') -> 'None':
 
 
 def detect_cores() -> 'int':
-    """Cores actually allocated to this process (SLURM first, then affinity)."""
-
-    for name in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
-        raw = os.environ.get(name, "").strip()
-        if raw.isdigit() and int(raw) > 0:
-            return int(raw)
-    if hasattr(os, "sched_getaffinity"):
-        try:
-            return max(1, len(os.sched_getaffinity(0)))
-        except OSError:
-            pass
-    return max(1, os.cpu_count() or 1)
+    """CPUs usable by this process, respecting both SLURM and affinity."""
+    from ghost_backend.execution.options import _usable_logical_cpus
+    return _usable_logical_cpus()
 
 
 # The scheduler's memory unit.  Every budget and every reservation handed to
@@ -216,7 +207,15 @@ def detect_memory_gb() -> 'float':
         return float(int(raw)) / 1024.0
     raw = os.environ.get("SLURM_MEM_PER_CPU", "").strip()
     if raw.isdigit() and int(raw) > 0:
-        return float(int(raw)) * float(detect_cores()) / 1024.0
+        # Memory belongs to the full SLURM allocation even when process
+        # affinity narrows the CPUs used for computation.
+        cpus = detect_cores()
+        for name in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+            allocated = os.environ.get(name, "").strip()
+            if allocated.isdigit() and int(allocated) > 0:
+                cpus = int(allocated)
+                break
+        return float(int(raw)) * float(cpus) / 1024.0
     for path, scale in (
         ("/sys/fs/cgroup/memory.max", 1.0),
         ("/sys/fs/cgroup/memory/memory.limit_in_bytes", 1.0),
@@ -311,8 +310,8 @@ def cpu_allocation_scope(cpus: 'Optional[int]'):
     import ghost_backend.execution.options as execution_options
     public = getattr(execution_options, "cpu_allocation_scope", None)
     if callable(public):
-        with public(count):
-            yield count
+        with public(count) as allocated:
+            yield allocated
         return
     allocation = getattr(execution_options, "_ASSEMBLY_ALLOCATION", None)
     if allocation is None:

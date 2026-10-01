@@ -1,7 +1,7 @@
 """One-pass tile assembly and compressed operator storage."""
 import collections
 import contextvars
-import os
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from ghost_backend.twod.assembly.compact import CompactOperator
@@ -9,10 +9,30 @@ import scipy.linalg as la
 from ghost_backend.linalg.sweep import _qr_basis
 from ghost_backend.linalg.hierarchical import spatial_order
 
-# Multi-column tile products run per output group on a few threads; more would
-# oversubscribe the BLAS threads that solves already widen.
-MATMUL_WORKERS=min(4,os.cpu_count() or 1)
+# A ceiling, resolved against the active allocation at each operation.
+MATMUL_WORKERS=4
 MATMUL_THREADED_COLUMNS=8
+
+
+def _thread_budget():
+    from ghost_backend.execution.options import allocated_cpu_budget, effective_assembly_threads
+    return effective_assembly_threads(allocated_cpu_budget())
+
+
+def _run_groups(groups, operation, workers):
+    """Disjoint output groups; each retains its original tile summation order."""
+    workers = min(max(1, int(workers)), _thread_budget(), len(groups))
+    if workers < 2:
+        for group in groups:
+            operation(group)
+        return
+    from ghost_backend.execution.options import single_thread_blas
+    # The outer team owns the cores. In particular, do not keep the widened
+    # BLAS team from solve_fields inside each concurrent tile product.
+    with single_thread_blas(), ThreadPoolExecutor(max_workers=workers, thread_name_prefix='ghost-groups') as pool:
+        futures = [pool.submit(contextvars.copy_context().run, operation, group) for group in groups]
+        for future in futures:
+            future.result()
 
 
 def tile_payload(raw, tail, tolerance, method, probe=True):
@@ -69,17 +89,35 @@ class TileWriter:
     the context waits for the workers, so owners may close spools afterwards.
     """
     def __init__(self, workers=2, depth=4):
-        self.workers, self.depth, self.pending, self.pool = workers, depth, collections.deque(), None
+        # The caller is assembling the next tile while compression runs.
+        # Reserve its CPU too; a one-CPU solve stays entirely inline.
+        self.budget = _thread_budget()
+        self.workers = min(max(0, int(workers)), max(0, self.budget-1))
+        self.depth, self.pending, self.pool = max(1, int(depth)), collections.deque(), None
+        self._scope = ExitStack()
 
     def __enter__(self):
-        self.pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix='ghost-tiles')
+        if self.workers:
+            from ghost_backend.execution.options import single_thread_blas, cpu_allocation_scope
+            try:
+                self._scope.enter_context(single_thread_blas())
+                # The caller's native far-assembly team must share the same
+                # reservation with compression, rather than use every CPU.
+                self._scope.enter_context(cpu_allocation_scope(self.budget-self.workers))
+                self.pool = self._scope.enter_context(ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix='ghost-tiles'))
+            except BaseException:
+                self._scope.close()
+                raise
         return self
 
     def submit(self, compress, store, *args):
+        if self.pool is None:
+            store(compress(*args))
+            return
+        while self.pending and (len(self.pending) >= self.depth or self.pending[0][0].done()):
+            future, previous_store = self.pending.popleft()
+            previous_store(future.result())
         self.pending.append((self.pool.submit(contextvars.copy_context().run, compress, *args), store))
-        while self.pending and (len(self.pending) > self.depth or self.pending[0][0].done()):
-            future, store = self.pending.popleft()
-            store(future.result())
 
     def __exit__(self, kind, value, traceback):
         try:
@@ -90,7 +128,7 @@ class TileWriter:
             for future, _ in self.pending:
                 future.cancel()
             self.pending.clear()
-            self.pool.shutdown(wait=True)
+            self._scope.close()
         return False
 
 
@@ -112,6 +150,7 @@ class StreamedOperator:
         self.column_error=np.zeros(self.n);self.column_norm=np.zeros(self.n)
         self.row_max=np.zeros(self.n)
         order=spatial_order(coordinates,np.arange(self.n),tile)
+        self.order=order
 
         pending=[order];self.groups=[]
         while pending:
@@ -122,6 +161,8 @@ class StreamedOperator:
                                         for ids in self.groups])
         self.group_id=np.empty(self.n,int);self.local_id=np.empty(self.n,int)
         for i,ids in enumerate(self.groups):self.group_id[ids]=i;self.local_id[ids]=np.arange(len(ids))
+        ends=np.cumsum([len(ids) for ids in self.groups])
+        self.group_slices=tuple(slice(int(stop-len(ids)),int(stop)) for ids,stop in zip(self.groups,ends))
         self.bytes=sum(a.nbytes for a in (order,self.group_id,self.local_id,self.row_error,self.row_norm,
                                         self.column_error,self.column_norm,self.row_max,self.coordinates,self.group_bounds))
         if self.bytes>budget:raise MemoryError('Compressed operator exceeded its retained-storage cap.')
@@ -227,13 +268,9 @@ class StreamedOperator:
                 magnitude=abs(left if right is None else left@right)/row[self.groups[i],None]
                 largest=np.maximum(largest,np.max(magnitude,axis=0))
                 total+=np.sum(magnitude,axis=0)
-            return cols,largest,total
-        with ThreadPoolExecutor(max_workers=MATMUL_WORKERS,thread_name_prefix='ghost-equilibrate') as pool:
-            futures=[pool.submit(contextvars.copy_context().run,group,j) for j in by_column]
-            for future in futures:
-                cols,largest,total=future.result()
-                column[cols]=np.maximum(column[cols],largest)
-                sums[cols]+=total
+            column[cols]=largest
+            sums[cols]=total
+        _run_groups(by_column, group, MATMUL_WORKERS)
         column=np.where(column>0,column,1.)
         return row,column,float(np.max(sums/column))
 
@@ -289,34 +326,36 @@ class StreamedOperator:
         if vector:b=b[:,None]
         if b.ndim!=2 or b.shape[0]!=self.n or not b.shape[1] or not np.all(np.isfinite(b)):
             raise ValueError('Invalid operator RHS.')
-        result=np.zeros_like(b,dtype=complex)
+        # Gather each RHS once, then use contiguous group views for every
+        # product. Repeated b[group] indexing used to copy each tile's RHS.
+        rhs=b[self.order]
+        ordered=np.zeros_like(rhs,dtype=complex)
+        slices=self.group_slices
         def adj(a):return a.T if trans==1 else a.conj().T
-        if b.shape[1]<MATMUL_THREADED_COLUMNS or MATMUL_WORKERS<2:
+        workers=min(MATMUL_WORKERS,_thread_budget()) if b.shape[1]>=MATMUL_THREADED_COLUMNS else 1
+        if workers<2:
             for (i,j),(left,right) in self.tiles.items():
                 self.checkpoint()
-                rows,cols=self.groups[i],self.groups[j]
                 if trans==0:
-                    result[rows]+=left@b[cols] if right is None else left@(right@b[cols])
+                    ordered[slices[i]]+=left@rhs[slices[j]] if right is None else left@(right@rhs[slices[j]])
                 else:
-                    result[cols]+=adj(left)@b[rows] if right is None else adj(right)@(adj(left)@b[rows])
-            return result[:,0] if vector else result
-        # Each output group sums its tiles in the serial order, so results are identical.
-        outputs={}
-        for i,j in self.tiles:outputs.setdefault(i if trans==0 else j,[]).append((i,j))
-        def group(keys):
-            first=keys[0][0] if trans==0 else keys[0][1]
-            value=np.zeros((len(self.groups[first]),b.shape[1]),complex)
-            for i,j in keys:
-                self.checkpoint()
-                left,right=self.tiles[i,j]
-                if trans==0:
-                    value+=left@b[self.groups[j]] if right is None else left@(right@b[self.groups[j]])
-                else:
-                    value+=adj(left)@b[self.groups[i]] if right is None else adj(right)@(adj(left)@b[self.groups[i]])
-            return first,value
-        with ThreadPoolExecutor(max_workers=MATMUL_WORKERS,thread_name_prefix='ghost-matmul') as pool:
-            futures=[pool.submit(contextvars.copy_context().run,group,keys) for keys in outputs.values()]
-            for future in futures:
-                index,value=future.result()
-                result[self.groups[index]]+=value
+                    ordered[slices[j]]+=adj(left)@rhs[slices[i]] if right is None else adj(right)@(adj(left)@rhs[slices[i]])
+        else:
+            outputs={}
+            for i,j in self.tiles:outputs.setdefault(i if trans==0 else j,[]).append((i,j))
+            def group(first):
+                value=ordered[slices[first]]
+                for i,j in outputs[first]:
+                    self.checkpoint()
+                    left,right=self.tiles[i,j]
+                    if trans==0:
+                        value+=left@rhs[slices[j]] if right is None else left@(right@rhs[slices[j]])
+                    else:
+                        value+=adj(left)@rhs[slices[i]] if right is None else adj(right)@(adj(left)@rhs[slices[i]])
+            # Futures return no array: finished groups live only in ordered.
+            _run_groups(outputs,group,workers)
+        # Reuse the private gathered RHS buffer when its dtype permits, so the
+        # common complex128 solve needs only two full RHS-sized work buffers.
+        result=rhs if rhs.dtype==ordered.dtype else np.empty_like(ordered)
+        result[self.order]=ordered
         return result[:,0] if vector else result

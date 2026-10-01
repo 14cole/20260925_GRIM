@@ -17,6 +17,8 @@ from GRIM_Backend.datasets.transforms import (
     regrid_axis,
     shift_dataset,
     stitch_datasets,
+    time_gate,
+    translate_phase_center,
     wedge_to_conic,
     wrap_phase,
 )
@@ -59,6 +61,8 @@ __all__ = [
     'save_dataset_batch',
     'shift_dataset',
     'stitch_datasets',
+    'time_gate',
+    'translate_phase_center',
     'wedge_to_conic',
     'wrap_phase',
 ]

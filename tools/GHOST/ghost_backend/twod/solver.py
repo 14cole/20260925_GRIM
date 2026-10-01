@@ -1512,7 +1512,8 @@ def _estimate_memory_gb(
             state.memory_estimates.append(plan)
         return plan['peak_bytes']/1024**3
 
-    solve = 2*matrix + 16*12*d*batch + 64*1024**2
+    from ghost_backend.twod.assembly.kernels import PROJECTION_CACHE_BYTES
+    solve = 2*matrix + 16*12*d*batch + 64*1024**2 + PROJECTION_CACHE_BYTES
     from ghost_backend.linalg.hierarchical import automatic_hierarchical
     # A large dense system is factored hierarchically by default: priced as the
     # matrix and a factor within its storage budget (an LU fallback that finds
@@ -1523,7 +1524,7 @@ def _estimate_memory_gb(
 
 
         from ghost_backend.linalg.hierarchical import factor_storage_budget
-        solve = matrix + factor_storage_budget(matrix) + 16*12*d*max(256,batch) + 64*1024**2
+        solve = matrix + factor_storage_budget(matrix) + 16*12*d*max(256,batch) + 64*1024**2 + PROJECTION_CACHE_BYTES
     workspace = (64 + 128*get_assembly_threads()) * 1024**2 + 16*512*n
     if kind == 'multi_region' and 'operator_entries' in resources:
         assembly = matrix + 16*resources.get('assembly_operator_entries', resources['operator_entries']) + resources['operator_map_bytes']
@@ -1536,6 +1537,8 @@ def _estimate_memory_gb(
         assembly = matrix + 16*slots*n*n + workspace
 
     extra = CACHE_BYTES + TABLE_BYTES if solver_method == EXPERIMENTAL_METHOD or current_state() is not None else 0
+    from ghost_backend.twod.polynomial_quadrature import MOMENT_CACHE_BYTES
+    extra += resources.get('moment_cache_bytes', MOMENT_CACHE_BYTES if resources.get('basis_width', 2) > 2 else 0)
     return (max(assembly, solve) + extra + count*4096) / 1024**3
 
 
@@ -2093,7 +2096,8 @@ def solve_monostatic_rcs_2d_single_polarization(
         notices.warn_once(str(_msg))
     _warn_far_quadrature_override(notices)
 
-    samples: 'List[Dict[str, Any]]' = []
+    from ghost_backend.twod.samples import sample_buffer
+    samples = sample_buffer(len(frequencies) * len(elevations))
     total_steps = len(frequencies) * (len(elevations) + 1)
     done_steps = 0
 
@@ -2778,6 +2782,7 @@ def _finite_metadata_max(
 
 def _merge_co_polarized_2d_results(
     channel_results: 'Dict[str, Dict[str, Any]]',
+    _take_ownership=False,
 ) -> 'Dict[str, Any]':
     """Merge exact TE/TM solves without inventing a selected polarization.
 
@@ -2801,17 +2806,22 @@ def _merge_co_polarized_2d_results(
     solver_names: 'Set[str]' = set()
     amplitude_conventions: 'Set[str]' = set()
 
+    from ghost_backend.twod.samples import SampleTable, merge_tables
+    packed = all(isinstance(channel_results[pol].get('samples'), SampleTable) for pol in expected_channels)
+    if packed:
+        co_solved_samples, flattened = merge_tables(channel_results)
+
     for export_pol, internal_pol in _CO_POLARIZED_2D_CHANNELS:
         result = channel_results[export_pol]
-        raw_samples = list(result.get("samples", []) or [])
+        raw_samples = result.get("samples", []) or []
         if not raw_samples:
             raise ValueError(
                 f"The co-polarized 2-D solve returned no {export_pol} samples."
             )
         labeled_samples = []
         keys: 'Set[Tuple[float, float, float]]' = set()
-        for row in raw_samples:
-            copied = dict(row)
+        for row in (() if packed else raw_samples):
+            copied = row if _take_ownership else dict(row)
             copied["polarization"] = export_pol
             copied["polarization_internal"] = internal_pol
             key = (
@@ -2825,7 +2835,9 @@ def _merge_co_polarized_2d_results(
                 )
             keys.add(key)
             labeled_samples.append(copied)
-        if channel_keys is None:
+        if packed:
+            pass  # Numeric coordinates were validated by merge_tables.
+        elif channel_keys is None:
             channel_keys = keys
         elif keys != channel_keys:
             missing = sorted(channel_keys - keys)
@@ -2834,7 +2846,8 @@ def _merge_co_polarized_2d_results(
                 "TE/TM 2-D solves did not return the same physical grid "
                 f"(first missing={missing[:1]}, first extra={extra[:1]})."
             )
-        co_solved_samples[export_pol] = labeled_samples
+        if not packed:
+            co_solved_samples[export_pol] = labeled_samples
         channel_metadata[export_pol] = dict(result.get("metadata", {}) or {})
         scattering_modes.add(str(result.get("scattering_mode", "")))
         solver_names.add(str(result.get("solver", "")))
@@ -2851,12 +2864,13 @@ def _merge_co_polarized_2d_results(
         return (float(row["frequency_ghz"]), float(row["theta_inc_deg"]),
                 float(row["theta_scat_deg"]))
 
-    partners = {
-        sample_key(row): row for row in co_solved_samples[expected_channels[1]]
-    }
-    for row in co_solved_samples[expected_channels[0]]:
-        flattened.append(row)
-        flattened.append(partners[sample_key(row)])
+    if not packed:
+        partners = {
+            sample_key(row): row for row in co_solved_samples[expected_channels[1]]
+        }
+        for row in co_solved_samples[expected_channels[0]]:
+            flattened.append(row)
+            flattened.append(partners[sample_key(row)])
 
     warnings = []
     information = []
@@ -3110,12 +3124,13 @@ def _merge_frequency_results(results, frequencies):
     entry once.
     """
     import json
+    from ghost_backend.twod.samples import frequency_buffer
     result, records = None, []
     for value in results:
         if result is None:
             result = {key: entry for key,entry in value.items() if key not in ('samples', 'co_solved_samples', 'metadata')}
-            result['samples'] = []
-            result['co_solved_samples'] = {pol: [] for pol in ('VV', 'HH')}
+            result['samples'] = frequency_buffer()
+            result['co_solved_samples'] = {pol: frequency_buffer() for pol in ('VV', 'HH')}
         result['samples'].extend(value['samples'])
         for pol in ('VV', 'HH'):
             result['co_solved_samples'][pol].extend(value['co_solved_samples'][pol])
@@ -3242,7 +3257,7 @@ def solve_monostatic_rcs_2d(
             solver_method=solver_method,
             _shared_discretization_cache=shared_cache,
         )
-    return _merge_co_polarized_2d_results(channel_results)
+    return _merge_co_polarized_2d_results(channel_results, _take_ownership=True)
 
 
 @prepared_execution
@@ -3266,6 +3281,7 @@ def solve_bistatic_rcs_2d_single_polarization(
     cfie_alpha: 'float' = CFIE_ALPHA_DEFAULT,
     abort_event: 'Optional[threading.Event]' = None,
     solver_method: 'str' = "auto",
+    _shared_discretization_cache: 'Optional[Dict[str, Any]]' = None,
 ) -> 'Dict[str, Any]':
     """
     Explicit single-polarization bistatic 2-D RCS diagnostic.
@@ -3316,18 +3332,20 @@ def solve_bistatic_rcs_2d_single_polarization(
     ):
         raise ValueError("mesh_reference_ghz must be a positive finite GHz value.")
 
-    preflight_report = validate_geometry_snapshot_for_solver(geometry_snapshot, base_dir=base_dir, meters_scale=unit_scale)
-    materials = MaterialLibrary.from_entries(
-        geometry_snapshot.get("ibcs", []) or [],
-        geometry_snapshot.get("dielectrics", []) or [],
-        base_dir=base_dir,
-    )
+    base_dir, preflight_report, materials, unit_scale = prepare_geometry(
+        geometry_snapshot, material_base_dir, geometry_units)
+    shared_cache = _shared_discretization_cache
+    if shared_cache is not None and any(int(s.get('seg_type', 0)) == 1
+                                       for s in geometry_snapshot.get('segments', [])):
+        # Sheet continuity differs between TE and TM, just as in monostatic.
+        shared_cache = shared_cache.setdefault(('sheet_polarization', pol), {})
     notices = _SolveNotices(materials)
     for _msg in list(preflight_report.get("warnings", []) or []):
         notices.warn_once(str(_msg))
     _warn_far_quadrature_override(notices)
 
-    samples: 'List[Dict[str, Any]]' = []
+    from ghost_backend.twod.samples import sample_buffer
+    samples = sample_buffer(len(frequencies) * len(inc_angles) * len(obs_angles))
     residual_values: 'List[float]' = []
     cond_values: 'List[float]' = []
     total_steps = len(frequencies) * len(inc_angles)
@@ -3381,11 +3399,18 @@ def solve_bistatic_rcs_2d_single_polarization(
         mesh_max_index_values.append(float(mesh_max_index))
         mesh_material_flags_used.update(int(flag) for flag in mesh_material_flags)
 
-        panels = _build_panels(geometry_snapshot, unit_scale, lambda_min, max_panels=max_panels, materials=materials,
-            frequencies_ghz=[mesh_freq_ghz] if mesh_ref_ghz is None else set(frequencies) | {mesh_ref_ghz},
-            **_panel_notice_kwargs(notices))
-        preview_infos = _build_coupled_panel_info(panels, materials, freq_ghz, pol, k0)
-        mesh, _ = _build_linear_mesh_interface_aware(panels, preview_infos, polarization=pol)
+        mesh_key = (float(lambda_min), int(max_panels))
+        cached_mesh = shared_cache.get('mesh') if shared_cache is not None else None
+        if cached_mesh is not None and cached_mesh[0] == mesh_key:
+            panels, mesh = cached_mesh[1:]
+        else:
+            panels = _build_panels(geometry_snapshot, unit_scale, lambda_min, max_panels=max_panels, materials=materials,
+                frequencies_ghz=[mesh_freq_ghz] if mesh_ref_ghz is None else set(frequencies) | {mesh_ref_ghz},
+                **_panel_notice_kwargs(notices))
+            preview_infos = _build_coupled_panel_info(panels, materials, freq_ghz, pol, k0)
+            mesh, _ = _build_linear_mesh_interface_aware(panels, preview_infos, polarization=pol)
+            if shared_cache is not None:
+                shared_cache['mesh'] = (mesh_key, panels, mesh)
         coupled_infos = _build_linear_coupled_infos(mesh, materials, freq_ghz, pol, k0)
         _assert_no_type1_sheet_for_mixed(coupled_infos)
         _assert_air_exterior(coupled_infos)
@@ -3420,6 +3445,9 @@ def solve_bistatic_rcs_2d_single_polarization(
         est_gb += (len(inc_angles) * len(obs_angles) *
                    (1024 * len(frequencies) + 64)) / (1024 ** 3)
         memory_limit_gb = _solve_memory_limit_gb()
+        from ghost_backend.twod.assembly.session import plan_paired_assembly
+        if plan_paired_assembly(pol, resources['formulation'], resources['system_dofs'], est_gb, memory_limit_gb):
+            est_gb += 16.0 * resources['system_dofs'] ** 2 / 1024**3
         if est_gb > memory_limit_gb:
             raise MemoryError(
                 _memory_gate_message(
@@ -3600,6 +3628,11 @@ def solve_bistatic_rcs_2d(
 
     if len(frequencies_ghz) > 1:
         return _frequency_local_co_solve(solve_bistatic_rcs_2d, locals())
+    shared_cache = {}
+    from ghost_backend.twod.assembly.session import current_session
+    assembly_session = current_session()
+    if assembly_session is not None:
+        assembly_session.copolarized = True
     channel_results = {}
     for index, (export_pol, internal_pol) in enumerate(
         _CO_POLARIZED_2D_CHANNELS
@@ -3623,11 +3656,12 @@ def solve_bistatic_rcs_2d(
             cfie_alpha=0.0,
             abort_event=abort_event,
             solver_method="direct",
+            _shared_discretization_cache=shared_cache,
         )
-    merged = _merge_co_polarized_2d_results(channel_results)
+    merged = _merge_co_polarized_2d_results(channel_results, _take_ownership=True)
 
 
-    merged["metadata"]["co_solve_shared_discretization"] = False
+    merged["metadata"]["co_solve_shared_discretization"] = True
     return merged
 
 

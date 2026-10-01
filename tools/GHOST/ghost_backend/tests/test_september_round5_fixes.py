@@ -256,12 +256,15 @@ class BorPlanningTests(unittest.TestCase):
                                                  n_modes=20, gauss_order=4, workers=1, assembly='auto')
                     # An explicit factorization keeps its rejection.
                     if planning_limit == limit == 2.9:
-                        # 3.01 GB: the near scratch of the preparation phase is
-                        # the larger phase; it no longer adds the mode workspace.
-                        with self.assertRaisesRegex(MemoryError, '3.01 GB'):
+                        # The near-preparation phase remains larger than this
+                        # limit. Check the model's own reported requirement;
+                        # removing unused dense bases changes its rounded GB.
+                        with self.assertRaises(bor.BorAdmissionError) as rejected:
                             bor.solve_bor_coated_pec(outer, core, frequency, [0., 60., 120.], 2.56-.1j, 1.,
                                                      n_modes=20, gauss_order=4, workers=1, assembly='tables',
                                                      bor_options=dict(factorization='dense'))
+                        self.assertGreater(rejected.exception.required_gb, limit)
+                        self.assertIn(f'{rejected.exception.required_gb:.2f} GB', str(rejected.exception))
                 self.assertEqual(gated[:len(gates)], gates)
                 self.assertEqual(started[0], gates[-1])  # every rejection preceded preparation
 

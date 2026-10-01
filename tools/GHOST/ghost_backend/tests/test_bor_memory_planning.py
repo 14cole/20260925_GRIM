@@ -42,18 +42,31 @@ class NearStorageTests(unittest.TestCase):
         kinds = ('efie', 'mfie', 'ibc')
         for kind in kinds:
             solver._prepare_near_contractions(kind, pairs, mm, workers=2)
-        for pi, (e, f) in enumerate(pairs):
-            for kind in kinds:
+        for kind in kinds:
+            originals = []
+            for e, f in pairs:
                 # The same rule the solver applies to this pair and kernel kind.
                 points = bor._same_surface_points(solver.gen, e, f, (kind,), 1)
                 original = bor._contract_near_points(solver.gen, e, solver.gen, f,
                     solver.k, mm, (kind,), points)
-                values = solver._near_contractions[(kind, mm)]['values']
-                self.assertEqual(values.shape, (4, mm+1, 4*len(pairs)))
-                for m in range(-mm, mm+1):
-                    actual = mode_blocks(values, m)[:, 4*pi:4*pi+4].reshape(4, 2, 2)
-                    np.testing.assert_allclose(actual, original[kind][:, m+mm],
-                        rtol=2e-13, atol=2e-13*np.max(abs(original[kind])))
+                originals.append(original[kind])
+            record = solver._near_contractions[(kind, mm)]
+            values = record['values']
+            self.assertEqual(values.shape[:2], (4, mm+1))
+            self.assertLess(values.shape[2], 4*len(pairs))
+            weights = np.linspace(1., 2., solver.gen.n_elems) * (1.+.2j)
+            for m in range(-mm, mm+1):
+                actual = np.zeros((4, solver.Nn, solver.Nn), complex)
+                expected = np.zeros_like(actual)
+                weight = weights[record['source_elems']] if kind == 'ibc' else 1.
+                for uv, component in enumerate(mode_blocks(values, m)):
+                    np.add.at(actual[uv], (record['rows'], record['cols']), component*weight)
+                for (e, f), block in zip(pairs, originals):
+                    weight = weights[f] if kind == 'ibc' else 1.
+                    for uv in range(4):
+                        expected[uv][np.ix_([e,e+1],[f,f+1])] += block[uv,m+mm]*weight
+                np.testing.assert_allclose(actual, expected,
+                    rtol=2e-13, atol=2e-13*np.max(abs(expected)))
 
     def test_cross_cache_owns_only_half_and_preserves_both_signs(self):
         sp = bor.BorPecSolver(np.array([[.025, .01], [.025, 0.]]), 1e9,

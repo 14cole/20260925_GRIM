@@ -1321,6 +1321,40 @@ def surface_of_revolution_distance(generatrix: 'np.ndarray',
                           axis=1))
 
 
+def _bodies_from_bor_columns(channels):
+    """Keep compact solver output compact while building reusable body arrays."""
+    from ghost_backend.twod.samples import sample_column
+    keys = ('frequency_ghz', 'theta_inc_deg', 'rcs_amp_real', 'rcs_amp_imag')
+    columns = {pol: [sample_column(channels[pol], key) for key in keys] for pol in ('VV', 'HH')}
+    if any(value is None for values in columns.values() for value in values):
+        return None
+    grouped = {}
+    for pol, (frequency, angle, real, imag) in columns.items():
+        if not len(frequency):
+            raise ValueError(f"BoR result has no {pol} samples.")
+        if not all(np.all(np.isfinite(value)) for value in (frequency, angle, real, imag)) or np.any(frequency <= 0.):
+            raise ValueError(f"BoR {pol} samples must have finite frequency, aspect, and complex amplitude.")
+        order = np.lexsort((angle, frequency))
+        ordered_frequency = frequency[order]
+        values, starts, counts = np.unique(ordered_frequency, return_index=True, return_counts=True)
+        grouped[pol] = {}
+        for value, start, count in zip(values, starts, counts):
+            indices = order[start:start+count]
+            aspects = angle[indices]
+            if np.any(aspects[1:] == aspects[:-1]):
+                raise ValueError(f"BoR {pol} has duplicate aspect samples at {value:g} GHz.")
+            grouped[pol][float(value)] = (aspects, real[indices] + 1j*imag[indices])
+    if set(grouped['VV']) != set(grouped['HH']):
+        raise ValueError('Co-solved BoR VV/HH frequency axes differ.')
+    result = {}
+    for frequency, (aspects, vv) in grouped['VV'].items():
+        hh_aspects, hh = grouped['HH'][frequency]
+        if not np.array_equal(aspects, hh_aspects):
+            raise ValueError(f"Co-solved BoR VV/HH aspect axes differ at {frequency:g} GHz.")
+        result[frequency] = dict(theta_deg=aspects, amp_vv=vv, amp_hh=hh)
+    return result
+
+
 def bodies_from_bor_solver_result(
     result: 'Dict[str, Any]',
 ) -> 'Dict[float, Dict[str, np.ndarray]]':
@@ -1331,10 +1365,13 @@ def bodies_from_bor_solver_result(
         raise ValueError(
             "BoR result must contain exactly the co-solved VV and HH fields."
         )
+    compact = _bodies_from_bor_columns(channels)
+    if compact is not None:
+        return compact
     grouped = {}  # type: Dict[str, Dict[float, List[Dict[str, Any]]]]
     for polarization in ("VV", "HH"):
         by_frequency = {}  # type: Dict[float, List[Dict[str, Any]]]
-        for row in list(channels[polarization] or []):
+        for row in channels[polarization] or []:
             frequency = float(row.get("frequency_ghz", math.nan))
             angle = float(row.get("theta_inc_deg", math.nan))
             real = float(row.get("rcs_amp_real", math.nan))

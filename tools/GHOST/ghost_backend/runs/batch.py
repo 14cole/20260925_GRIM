@@ -27,9 +27,21 @@ def combine_channels(plans, n_angles, fine_factor):
     return result
 
 
-def _simulate(records, choices, cores, workers, budget, options):
-    """Match the driver's expensive-first, CPU/memory backfill dispatch."""
+def _thread_reservations(records, cores, workers, budget, options):
+    """Resolve each candidate once for this planning call, never across runs."""
     from ghost_backend.hpc.scheduler import assembly_threads_for_unit
+    blas_threads = blas_thread_reservation(options)
+    return {record['unit']: {
+        mode: max(blas_threads, assembly_threads_for_unit(
+            cores, workers, budget, candidate['peak_gb'], options['assembly_threads']))
+        for mode, candidate in record['backend_candidates'].items()}
+        for record in records}
+
+
+def _simulate(records, choices, cores, workers, budget, options, thread_reservations=None):
+    """Match the driver's expensive-first, CPU/memory backfill dispatch."""
+    if thread_reservations is None:
+        thread_reservations = _thread_reservations(records, cores, workers, budget, options)
     pending = sorted(records, key=lambda r: (-r['backend_candidates'][choices[r['unit']]]['cost'], r['unit']))
     running = []
     clock = 0.
@@ -40,8 +52,7 @@ def _simulate(records, choices, cores, workers, budget, options):
         for record in pending:
             candidate = record['backend_candidates'][choices[record['unit']]]
             ram = candidate['peak_gb']
-            threads = max(blas_thread_reservation(options), assembly_threads_for_unit(
-                cores, workers, budget, ram, options['assembly_threads']))
+            threads = thread_reservations[record['unit']][choices[record['unit']]]
             if len(running) < workers and (not running or
                     (used_ram+ram <= budget and used_cpu+threads <= cores)):
                 running.append((clock+candidate['cost'], ram, threads))
@@ -112,7 +123,13 @@ def select_batch_backends(records, cores, workers, budget_gb, options):
             choice = dict(dense_first)
             choice.update(zip(names, modes))
             proposals.append(choice)
-    scores = [_simulate(records, c, cores, workers, budget_gb, options) for c in proposals]
+    # CPU affinity/allocation is live at the start of each planning call.
+    # It is constant throughout these hypothetical schedules; probing it per
+    # pending unit repeats expensive optional-import/OS work hundreds of
+    # thousands of times for the bounded exhaustive search.
+    thread_reservations = _thread_reservations(records, cores, workers, budget_gb, options)
+    scores = [_simulate(records, c, cores, workers, budget_gb, options, thread_reservations)
+              for c in proposals]
     best_index = min(range(len(scores)), key=lambda i: scores[i])
     best, best_score = proposals[best_index], scores[best_index]
     # Refine small batches (the common 1-geometry frequency sweep) per unit.
@@ -121,7 +138,8 @@ def select_batch_backends(records, cores, workers, budget_gb, options):
             name = r['unit']
             for mode in allowed[name]:
                 choice=dict(best);choice[name]=mode
-                score = _simulate(records, choice, cores, workers, budget_gb, options)
+                score = _simulate(records, choice, cores, workers, budget_gb, options,
+                                  thread_reservations)
                 if score < best_score:
                     best, best_score = choice, score
     summary = dict(objective='predicted_batch_completion', model=MODEL,

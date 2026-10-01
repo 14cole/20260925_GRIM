@@ -64,7 +64,7 @@ def _plan_series(self, reference, datasets, az_values, elev_values, freq_values,
 def render(self) -> None:
     self.last_plot_mode = "azimuth_rect"
     self._start_plot_render()
-    datasets = self._selected_datasets()
+    datasets = self._with_delta_reference(self._selected_datasets())
     if not datasets:
         self.status.showMessage("Select a dataset before plotting.")
         return
@@ -96,30 +96,37 @@ def render(self) -> None:
         self._show_plot_status("No compatible one-to-one coordinates for the selected plot.")
         return
     self._configure_line_budget(sum(len(sel[1]) * len(sel[2]) for _, _, sel in plans))
+    delta = self._delta_reference(
+        plans, lambda plan: _series(self, reference, plan[1], plan[0], plan[2], polarization)
+    )
+    if delta is False:
+        return
     if not self._prepare_line_plot_axes(
         "azimuth_rect",
         "rectilinear",
         reference,
         datasets,
-        pbp_active=pbp_active,
     ):
         return
 
     rendered = 0
     omitted = 0
-    envelope = self._new_pbp_envelope() if pbp_active else None
+    bands = self._new_pbp_bands(datasets) if pbp_active else None
     for name, dataset, selection in plans:
+        if delta is not None and dataset is delta.dataset:
+            continue
         candidates = len(selection[1]) * len(selection[2])
-        if envelope is None and rendered >= common.MAX_LINE_SERIES:
+        if bands is None and rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
             continue
-        for candidate_index, (x_values, display, label, trace_key) in enumerate(_series(
-            self, reference, dataset, name, selection, polarization
-        )):
+        series = _series(self, reference, dataset, name, selection, polarization)
+        if delta is not None:
+            series = delta.apply(name, series)
+        for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
             if not np.any(np.isfinite(display)):
                 continue
-            if envelope is not None:
-                envelope.update(display)
+            if bands is not None:
+                bands.update(dataset, display)
                 rendered += 1
             elif rendered < common.MAX_LINE_SERIES:
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
@@ -129,12 +136,7 @@ def render(self) -> None:
                     omitted += candidates - candidate_index - 1
                     break
 
-    if envelope is not None and envelope.lower is not None:
-        lower, upper, density = envelope.result()
-        envelope.close()
-        x_values, lower, upper, density = self._bounded_plot_envelope(
-            az_values, lower, upper, density
-        )
+    if bands is not None:
         freq_unit = self._plot_axis_unit(reference, "frequency")
         elev_unit = self._plot_axis_unit(reference, "elevation")
         elev_name = self._plot_axis_name(reference, "elevation")
@@ -148,17 +150,9 @@ def render(self) -> None:
             if elev_values.size > 1
             else f"{elev_values[0]:g} {elev_unit}"
         )
-        label = f"PBP Pol {polarization}, Freq {freq_label}, {elev_name} {elev_label}"
-        self._plot_pbp_fill(
-            x_values, lower, upper, label, polar=False, density=density
-        )
-        self._plot_bounded_line(
-            self.plot_ax, x_values, lower, color="#8a8a8a", linewidth=1,
-            label="_nolegend_",
-        )
-        self._plot_bounded_line(
-            self.plot_ax, x_values, upper, color="#8a8a8a", linewidth=1,
-            label="_nolegend_",
+        bands.draw(
+            az_values, f"Pol {polarization}, Freq {freq_label}, {elev_name} {elev_label}",
+            polar=False,
         )
 
     if rendered == 0:
@@ -175,7 +169,11 @@ def render(self) -> None:
         )
 
     self.plot_ax.set_xlabel(self._plot_axis_label(reference, "azimuth"))
-    self.plot_ax.set_ylabel(self._display_axis_label(datasets))
+    if delta is not None:
+        self.plot_ax.set_ylabel(self._delta_axis_label(delta))
+        self._finish_delta_plot(delta)
+    else:
+        self.plot_ax.set_ylabel(self._display_axis_label(datasets))
     self._update_legend_visibility()
     self._apply_plot_limits()
     status = "Azimuth/Aspect (Rect) plot updated."

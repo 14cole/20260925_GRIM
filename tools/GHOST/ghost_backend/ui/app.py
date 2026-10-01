@@ -25,6 +25,7 @@ except ImportError:
     )
 
 from ghost_backend.ui.geometry import GeometryTab
+from ghost_backend.ui.line_expansion import LineExpansionTab
 from ghost_backend.ui.solver import SolverTab
 
 
@@ -40,15 +41,21 @@ class GhostWorkspace(QTabWidget):
         self.geometry_tab = GeometryTab(self)
         self.solver_tab = SolverTab(self.geometry_tab, self)
         self.addTab(self.geometry_tab, "Geometry")
+        self.line_expansion_tab = LineExpansionTab(self)
         self.addTab(self.solver_tab, "Solver")
+        self.addTab(self.line_expansion_tab, "Line Expansion")
         self.setTabToolTip(
             0, "Load, edit, visualize, validate, and save 2-D geometry."
         )
         self.setTabToolTip(
             1, "Solve the current Geometry tab or an explicitly selected .geo file."
         )
+        self.setTabToolTip(
+            2, "Expand saved 2-D section .geo files along straight lines into one 3-D response."
+        )
         self.geometry_tab.dirty_changed.connect(self._sync_geometry_tab_title)
         self.solver_tab.files_exported.connect(self.files_exported.emit)
+        self.line_expansion_tab.files_exported.connect(self.files_exported.emit)
 
     def _sync_geometry_tab_title(self, dirty: bool) -> None:
         index = self.indexOf(self.geometry_tab)
@@ -58,7 +65,10 @@ class GhostWorkspace(QTabWidget):
     def solve_is_running(self) -> bool:
 
 
-        return bool(self.solver_tab.job_is_running())
+        return bool(
+            self.solver_tab.job_is_running()
+            or self.line_expansion_tab.job_is_running()
+        )
 
     def attach_material_artifact(
         self, artifact_kind: str, csv_path: str
@@ -106,10 +116,14 @@ class GhostMainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Solver Task Still Running",
-                "A solver task is still running. Click Cancel in the Solver tab, "
+                "A solver task is still running. Click Cancel in its tab, "
                 "wait for cancellation to finish, and then close GHOST.",
             )
-            self.tabs.setCurrentWidget(self.solver_tab)
+            self.tabs.setCurrentWidget(
+                self.solver_tab
+                if self.solver_tab.job_is_running()
+                else self.workspace.line_expansion_tab
+            )
             event.ignore()
             return
         if not self.workspace.request_close(self):

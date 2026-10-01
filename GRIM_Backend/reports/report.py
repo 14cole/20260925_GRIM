@@ -13,12 +13,14 @@ it when needed.  It closes only the temporary report presentation it creates.
 from __future__ import annotations
 
 import math
+import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Protocol, Sequence
 
@@ -1584,6 +1586,142 @@ def export_powerpoint_report(
     return output
 
 
+def _image_export_name(value: str, *, limit: int = 64) -> str:
+    """A short Windows-safe component; numbering supplies collision identity."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', ' ', str(value))
+    name = re.sub(r'\s+', ' ', name).strip(' .')[:limit].rstrip(' .')
+    if not name:
+        return 'Untitled'
+    # Device names stay reserved with an extension, including superscript digits.
+    if re.fullmatch(r'CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³]',
+                    name.split('.')[0], flags=re.IGNORECASE):
+        name = '_' + name
+    return name[:limit].rstrip(' .')
+
+
+def _check_image_export_destination(output: Path) -> None:
+    """Never follow a destination link or replace a user directory."""
+    if output.is_symlink() or getattr(output, 'is_junction', lambda: False)():
+        raise ValueError('Choose a new image folder, not a link to another folder.')
+    if output.exists():
+        raise FileExistsError(f'Image export destination must be a new folder: {output}')
+
+
+def _check_image_export_path_lengths(paths: Iterable[Path]) -> None:
+    """Support Windows installations without long-path filesystem opt-in."""
+    if sys.platform == 'win32' and any(len(str(path).encode('utf-16-le')) // 2 >= 260 for path in paths):
+        raise ValueError('Image export paths are too long for Windows. Choose a shorter destination path.')
+
+
+def export_report_images(
+    plan: PresentationPlan,
+    destination: str | os.PathLike[str],
+    *,
+    dpi: int = 160,
+    style: PlotRenderStyle = PlotRenderStyle(),
+    renderer: Callable[..., Path] = render_plot_png,
+    legend_renderer: Callable[..., Path] = render_master_legend_png,
+) -> Path:
+    """Publish the same plot/legend PNGs as PowerPoint, without PowerPoint.
+
+    Numbered slide folders preserve report order and the JSON manifest preserves
+    the full, unsanitized captions and units. Rendering and organization finish
+    in a sibling temporary directory before the complete folder is renamed into
+    place. The destination must be new; existing folders/files are never replaced.
+    These assets include plot/shared-legend images, not template/master artwork.
+    """
+    if isinstance(dpi, bool) or not isinstance(dpi, int) or dpi < 72:
+        raise ValueError('Image rendering DPI must be an integer of at least 72.')
+    requested = Path(os.path.abspath(Path(destination).expanduser()))
+    # Resolve parents without following the destination itself: a symlink must
+    # be rejected rather than silently exporting over its target.
+    output = requested.parent.resolve() / requested.name
+    _check_image_export_destination(output)
+    kinds = {'azimuth_rect': 'Azimuth rectangular', 'azimuth_polar': 'Azimuth polar',
+             'elevation': 'Elevation', 'frequency': 'Frequency'}
+    folders = [f'{index + 1:03d} {_image_export_name(slide.title, limit=36)}'
+               for index, slide in enumerate(plan.slides)]
+    names = [[f'{index + 1:02d} {kinds[placement.plot.kind]} - '
+              f'{_image_export_name(placement.plot.title, limit=48)}.png'
+              for index, placement in enumerate(slide.plots)] for slide in plan.slides]
+    _check_image_export_path_lengths([output / 'manifest.json'] + [output / folder / name
+        for folder, files in zip(folders, names) for name in files + ['legend.png']])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, Any] = {
+        'schema': 'grim.report_images.v1', 'dpi': dpi,
+        'slide_count': len(plan.slides), 'plot_count': plan.plot_count,
+        'style': asdict(style), 'slides': [],
+    }
+    with tempfile.TemporaryDirectory(prefix='.grim-images-', dir=output.parent) as temporary:
+        staging = Path(temporary)
+        with tempfile.TemporaryDirectory(prefix='.render-', dir=staging) as render_directory:
+            # The shared renderer uses stable plot IDs in its temporary names;
+            # those can be longer than the friendly published captions.
+            _check_image_export_path_lengths(Path(render_directory) / name for name in
+                [f'slide_{index + 1:03d}_slot_{placement.slot_index + 1}_'
+                 f'{_safe_asset_name(placement.plot.plot_id)}.png'
+                 for index, slide in enumerate(plan.slides) for placement in slide.plots] +
+                [f'slide_{index + 1:03d}_master_legend.png' for index, slide in enumerate(plan.slides)
+                 if slide.master_legend])
+            rendered = render_plan_images(plan, render_directory, dpi=dpi, style=style,
+                                          renderer=renderer, legend_renderer=legend_renderer)
+
+            def copy_asset(key: RenderedImageKey, target: Path) -> None:
+                source = rendered[key]
+                if not source.is_file() or source.stat().st_size <= 0:
+                    raise RuntimeError(f'Renderer did not create a nonempty image: {source}')
+                # Custom renderers may return a preexisting asset elsewhere. Copy
+                # rather than move so exporting never consumes their source file.
+                shutil.copyfile(source, target)
+
+            for slide_index, slide in enumerate(plan.slides):
+                folder = folders[slide_index]
+                slide_directory = staging / folder
+                slide_directory.mkdir()
+                slide_record: dict[str, Any] = {
+                    'slide_number': slide_index + 1, 'folder': folder, 'title': slide.title,
+                    'footer': slide.footer, 'layout': slide.layout, 'plots': [],
+                }
+                for plot_index, placement in enumerate(slide.plots):
+                    plot = placement.plot
+                    name = names[slide_index][plot_index]
+                    copy_asset((slide_index, plot_index), slide_directory / name)
+                    units = {}
+                    for axis, label in (('x', plot.x_label), ('y', plot.y_label)):
+                        match = re.search(r'\(([^()]*)\)\s*$', label)
+                        units[axis] = match.group(1) if match else None
+                    plot_record: dict[str, Any] = {
+                        'plot_number': plot_index + 1, 'slot_number': placement.slot_index + 1,
+                        'file': name, 'relative_path': (Path(folder) / name).as_posix(),
+                        'plot_id': plot.plot_id, 'type': plot.kind, 'title': plot.title,
+                        'selection_caption': plot.title,
+                        'selection_captions': [caption.strip() for caption in plot.title.split('|') if caption.strip()],
+                        'axis_labels': {'x': plot.x_label, 'y': plot.y_label}, 'units': units,
+                        'series_labels': [series.label for series in plot.series],
+                    }
+                    # Current PlotSpec carries dataset labels but no source path.
+                    # Preserve explicit provenance if a caller supplies an enriched spec.
+                    for key in ('source', 'source_path'):
+                        value = getattr(plot, key, None)
+                        if value is not None:
+                            plot_record[key] = str(value)
+                    slide_record['plots'].append(plot_record)
+                if slide.master_legend:
+                    copy_asset((slide_index, MASTER_LEGEND_IMAGE_INDEX), slide_directory / 'legend.png')
+                    slide_record['legend'] = {
+                        'file': 'legend.png', 'relative_path': (Path(folder) / 'legend.png').as_posix(),
+                        'series_labels': [entry.label for entry in slide.master_legend],
+                    }
+                manifest['slides'].append(slide_record)
+        (staging / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+        # Recheck after rendering: another export or the user may have created
+        # content while images were being generated. On Windows rename also
+        # refuses an existing destination atomically at the publication step.
+        _check_image_export_destination(output)
+        os.rename(staging, output)
+    return output
+
+
 __all__ = [
     "LayoutKind",
     "DEFAULT_AZIMUTH_TEMPLATE_LAYOUT",
@@ -1609,6 +1747,7 @@ __all__ = [
     "azimuth_3x2_geometry",
     "combine_plans",
     "export_powerpoint_report",
+    "export_report_images",
     "frequency_single_geometry",
     "geometry_for_layout",
     "plan_azimuth_slides",

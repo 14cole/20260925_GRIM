@@ -1614,6 +1614,35 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
 
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_recipe_controls_open_nonmodal_without_expanding_main_form(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        panel = FeatureAssemblyPanel(service=_FakeWorkflow())
+        try:
+            panel.show()
+            self.app.processEvents()
+            before_size = panel.size()
+            before_minimum = panel.minimumSizeHint()
+            self.assertFalse(panel.recipe_dialog.isVisible())
+            panel.recipe_button.click()
+            self.app.processEvents()
+            self.assertTrue(panel.recipe_dialog.isVisible())
+            self.assertEqual(panel.recipe_dialog.windowModality(), Qt.NonModal)
+            self.assertEqual(panel.size(), before_size)
+            self.assertEqual(panel.minimumSizeHint(), before_minimum)
+            for control in (
+                panel.recipe_name_edit, panel.recipe_variant_edit,
+                panel.load_recipe_button, panel.save_recipe_button,
+                panel.save_recipe_as_button, panel.create_variant_button,
+            ):
+                self.assertTrue(panel.recipe_dialog.isAncestorOf(control))
+                self.assertTrue(control.isVisible())
+            panel.recipe_dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Close).click()
+            self.assertFalse(panel.recipe_dialog.isVisible())
+        finally:
+            _close_panel_without_prompt(panel)
+
     def test_input_tabs_and_review_checklist_track_body_file_changes(self):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder) / "body.grim"
@@ -1624,9 +1653,15 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
                     [
                         panel.workflow_tabs.tabText(index)
                         for index in range(panel.workflow_tabs.count())
+                        if panel.workflow_tabs.isTabVisible(index)
                     ],
-                    ["Body", "Point Features", "Line Features", "Review"],
+                    ["Body", "Points", "Line features", "Build"],
                 )
+                panel.more_tools_button.menu().actions()[0].trigger()
+                self.assertTrue(panel.workflow_tabs.isTabVisible(4))
+                self.assertIs(panel.workflow_tabs.currentWidget(), panel.wing_step_page)
+                panel.workflow_tabs.setCurrentWidget(panel.body_step_page)
+                self.assertFalse(panel.workflow_tabs.isTabVisible(4))
 
                 def checklist_status(requirement):
                     tree = panel.readiness_checklist
@@ -1958,7 +1993,6 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
                     point_locations_csv=str(points),
                     point_datasets={"fastener": str(response)},
                     excluded_point_placement_ids={"bolt_002"},
-                    host_minimum_radius_m=.254,
                     shadow_bias_m=.0000254,
                 ),
                 root / "vehicle",
@@ -1975,12 +2009,10 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
                 )
                 self.assertFalse(panel._recipe_dirty)
                 self.assertAlmostEqual(panel.skin_tol.value(), 1.0 / 25.4)
-                self.assertAlmostEqual(float(panel.host_radius.text()), 10.)
                 self.assertAlmostEqual(float(panel.shadow_bias.text()), .001)
                 panel._pull_values()
                 self.assertEqual(panel.model.values.coordinate_units, "meters")
                 self.assertAlmostEqual(panel.model.values.skin_tol_m, .001, places=12)
-                self.assertAlmostEqual(panel.model.values.host_minimum_radius_m, .254, places=15)
                 self.assertAlmostEqual(panel.model.values.shadow_bias_m, .0000254, places=15)
                 self.assertFalse(hasattr(panel, "expected_host_material"))
                 self.assertIn("saved", panel.recipe_status_label.text())
@@ -2103,7 +2135,7 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
         self.assertIn(",".join(LINE_PLACEMENT_COLUMNS), panel.line_schema_label.text())
         self.assertEqual(panel.input_preview_button.text(), "Preview geometry")
         self.assertEqual(panel.preview_button.text(), "Validate placements")
-        self.assertIn("No Assembly operation", panel.status_label.text())
+        self.assertEqual(panel.status_label.text(), "Choose a body response to begin.")
         self.assertFalse(panel.advanced_section.header.isChecked())
         self.assertTrue(panel.skin_tol.isEnabled())
         self.assertEqual(panel.validation_profile.currentData()[0], "advisory")
@@ -2131,17 +2163,14 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
     def test_inch_controls_convert_to_recipe_meters(self):
         panel = FeatureAssemblyPanel(service=_FakeWorkflow())
         try:
-            panel.host_radius.setText("10")
             panel.shadow_bias.setText(".001")
             panel.skin_tol.setValue(.01)
             panel._pull_values()
-            self.assertAlmostEqual(panel.model.values.host_minimum_radius_m, .254)
             self.assertAlmostEqual(panel.model.values.shadow_bias_m, .0000254)
             self.assertAlmostEqual(panel.model.values.skin_tol_m, .000254)
             with tempfile.TemporaryDirectory() as folder:
                 path = write_feature_assembly_recipe(panel.model.values, Path(folder) / "inch-controls", name="Inch controls", variant="Test")
                 restored = read_feature_assembly_recipe(path).values
-                self.assertAlmostEqual(restored.host_minimum_radius_m, .254)
                 self.assertAlmostEqual(restored.shadow_bias_m, .0000254)
                 self.assertAlmostEqual(restored.skin_tol_m, .000254)
             panel.skin_tol.setValue(panel.skin_tol.maximum())
@@ -2922,7 +2951,7 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
 
             self.assertFalse(panel.preview_button.isEnabled())
             self.assertFalse(panel.build_button.isEnabled())
-            self.assertIn("existing .grim", panel.next_step_label.text())
+            self.assertIn("missing feature response files", panel.next_step_label.text())
             _close_panel_without_prompt(panel)
 
     def test_loaded_catalog_selects_only_saved_grim_artifacts(self):

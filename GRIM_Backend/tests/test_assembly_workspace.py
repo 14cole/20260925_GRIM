@@ -722,6 +722,62 @@ class AssemblyGuiTests(unittest.TestCase):
         self.assertIs(workspace.left_tabs.currentWidget(), controls.body_step_page)
         workspace.preview_layers_dialog.close()
 
+    def test_vehicle_stages_keep_primary_actions_visible_in_compact_workspace(self):
+        from PySide6.QtCore import QPoint, QRect, QSize
+        from PySide6.QtGui import QFont, QFontDatabase
+        from PySide6.QtWidgets import QScrollArea
+        from GRIM_Backend.assembly.panel import FeatureAssemblyPanel
+        from GRIM_Backend.ui.palette import APPLICATION_PALETTES
+        from GRIM_Backend.ui.theme import build_qss
+
+        previous_font = self.app.font()
+        font_path = Path("C:/Windows/Fonts/segoeui.ttf")
+        if font_path.exists():
+            font_id = QFontDatabase.addApplicationFont(str(font_path))
+            families = QFontDatabase.applicationFontFamilies(font_id)
+            if families:
+                self.app.setFont(QFont(families[0], 9))
+        workspace = None
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+            os.environ, {"GRIM_ASSEMBLY_DRAFT_DIR": folder}
+        ):
+            try:
+                workspace = AssemblyWorkspace()
+                panel = FeatureAssemblyPanel(workspace)
+                workspace.set_feature_controls(panel)
+                palette = APPLICATION_PALETTES["Neutral Dark"]
+                workspace.setStyleSheet(build_qss(palette))
+                workspace.apply_application_palette(palette)
+                for size in (QSize(1200, 680), QSize(1280, 720)):
+                    for stage in range(4):
+                        with self.subTest(size=size, stage=stage):
+                            panel.workflow_tabs.setCurrentIndex(stage)
+                            workspace.resize(size)
+                            workspace.show()
+                            self.app.processEvents()
+                            self.assertEqual(workspace.size(), size)
+                            page = panel.workflow_tabs.currentWidget()
+                            scroll = page.findChild(QScrollArea)
+                            self.assertIsNotNone(scroll)
+                            self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+                            for value in (
+                                scroll.verticalScrollBar().minimum(),
+                                scroll.verticalScrollBar().maximum(),
+                            ):
+                                scroll.verticalScrollBar().setValue(value)
+                                self.app.processEvents()
+                                for control in (panel.output_picker, panel.build_button):
+                                    self.assertTrue(control.isVisible())
+                                    self.assertFalse(scroll.isAncestorOf(control))
+                                    bounds = QRect(control.mapTo(workspace, QPoint()), control.size())
+                                    self.assertTrue(workspace.rect().contains(bounds))
+            finally:
+                if workspace is not None:
+                    panel._recipe_dirty = False
+                    workspace.close()
+                    workspace.deleteLater()
+                self.app.setFont(previous_font)
+
     @staticmethod
     def _feature_plan():
         return SimpleNamespace(

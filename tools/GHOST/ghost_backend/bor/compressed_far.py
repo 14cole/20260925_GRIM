@@ -338,7 +338,7 @@ def _cross(tiles, family, I, J, weights, tolerance, rng, max_rank=None):
     return U[:, :rank], V[:rank]
 
 
-def _slices(U, V, nm, s, weights, tolerance):
+def _slices(U, V, nm, s, weights, tolerance, shared=False):
     """Per-(mode, uv) factors ``[[(P, W) x 4] x modes]`` of a joint approximation.
 
     ``U [p, r]`` and the weighted ``V [r, 4 * modes * s]`` share one skeleton
@@ -352,24 +352,35 @@ def _slices(U, V, nm, s, weights, tolerance):
     p = U.shape[0]
     empty = (np.zeros((p, 0), complex), np.zeros((0, s), complex))
     if U.shape[1] == 0:
-        return [[empty] * 4 for _ in range(nm)]
+        result = [[empty] * 4 for _ in range(nm)]
+        return ("slices", result) if shared else result
     Q, R = la.qr(U, mode='economic', check_finite=False)
     coefficients = (R @ V).reshape(-1, 4, nm, s).transpose(2, 1, 0, 3)
     u, sv, vh = np.linalg.svd(coefficients, full_matrices=False)
     tails = np.sqrt(np.cumsum((sv ** 2)[..., ::-1], axis=-1))[..., ::-1]
     ranks = np.count_nonzero(tails > tolerance / math.sqrt(4 * nm), axis=-1)
+    # Keep the small coefficients first. A shared Q is worthwhile only when
+    # its retained bytes beat all expanded left factors; no rank/tolerance
+    # changes or additional approximations are involved.
     out = []
     for m in range(nm):
         row = []
         for uv in range(4):
             k = int(ranks[m, uv])
             if not k:
-                row.append(empty)
+                row.append((np.zeros((Q.shape[1], 0), complex), empty[1]))
                 continue
-            left = Q @ (u[m, uv, :, :k] * (sv[m, uv, :k] / weights[m]))
-            row.append((np.ascontiguousarray(left), np.ascontiguousarray(vh[m, uv, :k])))
+            small = u[m, uv, :, :k] * (sv[m, uv, :k] / weights[m])
+            row.append((np.ascontiguousarray(small), np.ascontiguousarray(vh[m, uv, :k])))
         out.append(row)
-    return out
+    small_bytes = Q.nbytes + sum(left.nbytes + right.nbytes for row in out for left, right in row)
+    expanded_bytes = sum((p * left.shape[1] * 16) + right.nbytes for row in out for left, right in row)
+    if shared and small_bytes < expanded_bytes:
+        Q = np.ascontiguousarray(Q)
+        Q.setflags(write=False)
+        return ("shared", (Q, out))
+    expanded = [[(np.ascontiguousarray(Q @ left), right) for left, right in row] for row in out]
+    return ("slices", expanded) if shared else expanded
 
 
 def _tile_job(tiles, family, I, J, weights, tolerance):
@@ -383,7 +394,7 @@ def _tile_job(tiles, family, I, J, weights, tolerance):
     factors = _lowrank(stack, tolerance)
     if factors is None:
         return ("dense", np.ascontiguousarray(block.transpose(1, 0, 2, 3)))
-    return ("slices", _slices(factors[0], factors[1], nm, s, weights, tolerance))
+    return _slices(factors[0], factors[1], nm, s, weights, tolerance, shared=True)
 
 
 def _cross_job(tiles, family, I, J, weights, tolerance, rng):
@@ -391,7 +402,7 @@ def _cross_job(tiles, family, I, J, weights, tolerance, rng):
     if factors is None:
         return _tile_job(tiles, family, I, J, weights, tolerance)
     s = J[1] - J[0]
-    return ("slices", _slices(factors[0], factors[1], len(weights), s, weights, tolerance))
+    return _slices(factors[0], factors[1], len(weights), s, weights, tolerance, shared=True)
 
 
 def _run_job(tiles, job, scales, eps, n_nodes):
@@ -669,13 +680,18 @@ class CompressedFarBlocks:
             executor.close()
         for (family, I, J), entry in entries.items():
             if self.dtype != np.complex128:
+                if entry[0] == "shared":
+                    # Preserve the prior single-table rounding: form each left
+                    # factor in double precision before casting it once.
+                    basis, rows = entry[1]
+                    entry = ("slices", [[(basis @ small, right) for small, right in row] for row in rows])
                 entry = (("dense", entry[1].astype(self.dtype)) if entry[0] == "dense" else
                          ("slices", [[(left.astype(self.dtype), right.astype(self.dtype))
                                       for left, right in row] for row in entry[1]]))
             self._blocks[family][(I, J)] = entry
-        ranks = [max(left.shape[1] for row in entry[1] for left, _ in row)
+        ranks = [max(left.shape[1] for row in (entry[1][1] if entry[0] == "shared" else entry[1]) for left, _ in row)
                  for store in self._blocks.values() for entry in store.values()
-                 if entry[0] == "slices"]
+                 if entry[0] in ("slices", "shared")]
         self.evidence.update(
             lowrank_blocks=len(ranks), max_rank=max(ranks, default=0),
             mean_rank=float(np.mean(ranks)) if ranks else 0.0,
@@ -696,6 +712,9 @@ class CompressedFarBlocks:
         """The four ``[p, s]`` blocks of one stored block for mode index ``mi``."""
         if entry[0] == "dense":
             return entry[1][mi]
+        if entry[0] == "shared":
+            basis, rows = entry[1]
+            return [(basis @ small) @ right for small, right in rows[mi]]
         return [left @ right if left.shape[1] else
                 np.zeros((left.shape[0], right.shape[1]), left.dtype)
                 for left, right in entry[1][mi]]
@@ -773,6 +792,9 @@ class CompressedFarBlocks:
             for entry in store.values():
                 if entry[0] == "dense":
                     total += entry[1].nbytes
+                elif entry[0] == "shared":
+                    basis, rows = entry[1]
+                    total += basis.nbytes + sum(left.nbytes + right.nbytes for row in rows for left, right in row)
                 else:
                     total += sum(left.nbytes + right.nbytes for row in entry[1] for left, right in row)
         return total / 1e9

@@ -100,11 +100,75 @@ class NativeOracle:
             if node>=self.nn and node-self.nn in self.endpoints:result[node,i]=1
         self.cached_columns=cols;self.cached=result
 
+    def _dielectric_tile(self, rows, cols):
+        """Fused exterior S/K'/D/W and interior S/K' into one bounded tile.
+
+        The bottom-right transmission factor is applied after sharing, so a
+        paired TE/TM query can consume the same unweighted coefficients. No
+        global primitive matrix is allocated. Unequal quadrature rules retain
+        the independent primitive path below: its discrete transposes differ.
+        """
+        from ghost_backend.twod.assembly.scatter import SystemScatter
+        if not len(rows) or not len(cols):
+            return np.zeros((len(rows), len(cols)), complex)
+        key = ('dielectric_fused', complex(self.k0), complex(self.k1),
+               self.obs_order, self.src_order, rows.tobytes(), cols.tobytes())
+        shared = self.query_cache
+        value = None if shared is None else shared.get(key)
+        if value is None:
+            n = self.nn
+            value = np.zeros((len(rows), len(cols)), complex)
+            row_maps, column_maps = [], []
+            for block in (0, 1):
+                rr, cc = np.full(n, -1, int), np.full(n, -1, int)
+                ri, ci = np.flatnonzero(rows//n == block), np.flatnonzero(cols//n == block)
+                rr[rows[ri] % n], cc[cols[ci] % n] = ri, ci
+                row_maps.append(rr)
+                column_maps.append(cc)
+            def output(row, column, weight):
+                rr, cc = row_maps[row], column_maps[column]
+                return SystemScatter(value, n, np.flatnonzero(rr >= 0), np.flatnonzero(cc >= 0),
+                                     [(rr, cc, np.full(n, weight, complex))])
+            exterior = (output(0, 0, 1j*self.k0), output(1, 0, -1j*self.k0))
+            additional = (output(0, 0, 1.), output(1, 0, 1.))
+            if np.any(column_maps[0] >= 0):
+                rcs._assemble_linear_operator_matrices_multi(self.mesh, self.k0, True, [None],
+                    obs_order=self.obs_order, src_order=self.src_order,
+                    compute_single_layer=bool(len(exterior[0].row_ids)),
+                    compute_double_layer=bool(len(exterior[1].row_ids)),
+                    output_node_ids_many=[(exterior[0].row_ids, exterior[0].column_ids)],
+                    operator_outputs=[exterior], additional_operator_outputs=[additional],
+                    prepared_geometry=self.geometry)
+            interior = (output(0, 1, -1.), output(1, 1, 1.))
+            if np.any(column_maps[1] >= 0):
+                rcs._assemble_linear_operator_matrices_multi(self.mesh, self.k1, True, [None],
+                    obs_order=self.obs_order, src_order=self.src_order,
+                    compute_single_layer=bool(len(interior[0].row_ids)),
+                    compute_double_layer=bool(len(interior[1].row_ids)),
+                    output_node_ids_many=[(interior[0].row_ids, interior[0].column_ids)],
+                    operator_outputs=[interior], prepared_geometry=self.geometry)
+            for rb, cb, weight in ((0, 0, .5), (1, 0, .5j*self.k0), (1, 1, .5)):
+                ri, ci = np.flatnonzero(rows//n == rb), np.flatnonzero(cols//n == cb)
+                if len(ri) and len(ci):
+                    value[np.ix_(ri, ci)] += weight*self.mass[rows[ri] % n, :][:, cols[ci] % n].toarray()
+            if shared is not None:
+                value.flags.writeable = False
+                shared[key] = value
+        result = value.copy() if shared is not None else value
+        ri, ci = np.flatnonzero(rows//self.nn == 1), np.flatnonzero(cols//self.nn == 1)
+        if len(ri) and len(ci):
+            result[np.ix_(ri, ci)] *= self.factor
+        return result
+
     def get_with_error(self,rows,cols):
         rows,cols=CompactOperator._ids(rows,self.n),CompactOperator._ids(cols,self.n)
         if len(rows)*len(cols)*24>16*1024**2:raise MemoryError('Native tile exceeds workspace cap.')
+        entries = len(rows)*len(cols)
+        self.entries+=entries;self.calls+=1;self.max_entries=max(self.max_entries,entries)
+        if self.kind == 'dielectric' and self.obs_order == self.src_order:
+            result = self._dielectric_tile(rows, cols)
+            return result, np.zeros(result.shape)
         result=np.zeros((len(rows),len(cols)),complex)
-        self.entries+=result.size;self.calls+=1;self.max_entries=max(self.max_entries,result.size)
         if self.kind=='thin' and self.B!=0:
             if self.cached_columns is None or not np.array_equal(cols,self.cached_columns):self.prepare_columns(cols)
             result[:]=self.cached[rows]

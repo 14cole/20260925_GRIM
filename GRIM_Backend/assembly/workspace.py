@@ -1892,6 +1892,7 @@ if GUI_AVAILABLE:
             self._tree_visibility_signal = None
             self._tree_clearing_signal = None
             self._tree_preview_removing_signal = None
+            self._assembly_cleared_signal = None
             self._feature_preview_group_ids: set[str] = set()
             self._feature_instance_geometry: dict[tuple[str, str], np.ndarray] = {}
             self._feature_instance_groups = {}
@@ -1917,10 +1918,8 @@ if GUI_AVAILABLE:
             )
             self.lbl_legend = QLabel(self._legend_html("#94a3b8"))
             self.lbl_status = QLabel(
-                "Preview is empty. Choose an optional STL/facet or BoR body, then "
-                "add point or line placements. The tree Show boxes control only the "
-                "3-D display, including orientation arrows; they do not change "
-                "the assembled RCS."
+                "Choose a body response, then add point or line features. "
+                "The preview updates as you work. Layers controls display visibility."
             )
             self.lbl_status.setWordWrap(True)
             toolbar.addStretch(1)
@@ -2093,7 +2092,7 @@ if GUI_AVAILABLE:
             self.feature_controls_host.setVisible(False)
             left_layout.addWidget(self.feature_controls_host, 1)
 
-            # Feature Assembly owns Body / Point Features / Line Features / Review
+            # Feature Assembly owns Body / Points / Line features / Build
             # tabs. Keep advanced whole-response arithmetic available from the
             # toolbar without competing with that primary workflow.
             self.preview_layers_dialog = QDialog(self)
@@ -2107,8 +2106,8 @@ if GUI_AVAILABLE:
             combine_layout.setSpacing(6)
             combine_help = QLabel(
                 "Advanced: combine complete GRIM responses or change which layers "
-                "are visible in the 3-D preview. This does not replace the Body, "
-                "Point Features, Line Features, and Review workflow.",
+                "are visible in the 3-D preview. Author vehicle features using "
+                "Body, Points, Line features, and Build.",
                 self.preview_layers_dialog,
             )
             combine_help.setWordWrap(True)
@@ -2503,6 +2502,19 @@ if GUI_AVAILABLE:
             finally:
                 self.scene_canvas.end_scene_updates()
             self._update_body_detail_label()
+
+        def clear_vehicle_workspace(self) -> None:
+            """Reset the current vehicle while retaining unrelated dataset layers."""
+
+            self.clear_feature_preview()
+            self.scene_canvas.refresh_scene_feedback()
+            self.response_comparison.clear_outputs()
+            self.interference_inspector.clear_results()
+            self.viewer_tabs.setCurrentWidget(self.scene_canvas)
+            self.lbl_status.setText(
+                "Assembly cleared. Choose a body response, then import point "
+                "or line features."
+            )
 
         @staticmethod
         def _feature_plan_geometry(plan: object):
@@ -3064,6 +3076,16 @@ if GUI_AVAILABLE:
         def set_feature_controls(self, widget: QWidget | None) -> None:
             """Install or clear the controller-owned feature workflow."""
 
+            if self._assembly_cleared_signal is not None:
+                try:
+                    self._assembly_cleared_signal.disconnect(self.clear_vehicle_workspace)
+                except (RuntimeError, TypeError):
+                    pass  # The previous controller may already have been deleted.
+                self._assembly_cleared_signal = None
+            cleared = getattr(widget, "assembly_cleared", None)
+            if cleared is not None and callable(getattr(cleared, "connect", None)):
+                cleared.connect(self.clear_vehicle_workspace)
+                self._assembly_cleared_signal = cleared
             self.interference_inspector.plan_provider = lambda: getattr(getattr(widget, "model", None), "prepared_plan", None)
             while self.feature_controls_layout.count():
                 entry = self.feature_controls_layout.takeAt(0)

@@ -76,6 +76,9 @@ def _solve_fields(mesh, matrix, k0, angles, rhs_builder, diagnostics, label,
         )
         sweep_basis = (SweepBasis(batch_size) if factor is not None and len(angles) >= 32
                        and compression_mode() != 'off' else None)
+        from ghost_backend.twod.assembly.kernels import GridProjection
+        projection_plan = (GridProjection(mesh, k0, observations)
+                           if project and observation_angles is not None else None)
         for start in range(0, len(angles), batch_size):
             if checkpoint is not None:
                 checkpoint()
@@ -86,7 +89,8 @@ def _solve_fields(mesh, matrix, k0, angles, rhs_builder, diagnostics, label,
                 solution = rcs._solve_dense_system(matrix, rhs, diagnostics, label, residual_diagnostics=evidence)
                 relative = evidence['relative_residual']
             else:
-                solution = solve_sweep(factor, rhs, sweep_basis)
+                solution = solve_sweep(factor, rhs, sweep_basis,
+                    hint=session.compression_hint if session is not None else None)
                 relative = factor.relative_residual
             max_residual = max(max_residual, float(np.max(relative)))
             density = solution[:len(mesh.nodes)] if density_builder is None else density_builder(solution)
@@ -98,12 +102,14 @@ def _solve_fields(mesh, matrix, k0, angles, rhs_builder, diagnostics, label,
                 obs = angles[start:stop] if observation_angles is None else observations
                 projection = 'matched' if observation_angles is None else 'grid'
                 field = rcs._farfield_linear_density_many(mesh, density, k0, obs, potential,
-                    element_mask=element_mask, projection=projection, order=order)
+                    element_mask=element_mask, projection=projection, order=order,
+                    prepared_projection=projection_plan)
                 if second_potential is not None:
                     second_density=(solution[len(mesh.nodes):] if second_density_builder is None
                                     else second_density_builder(solution))
                     field += rcs._farfield_linear_density_many(mesh, second_density, k0, obs,
-                        second_potential, projection=projection, order=order, element_mask=second_element_mask)
+                        second_potential, projection=projection, order=order, element_mask=second_element_mask,
+                        prepared_projection=projection_plan)
                 amplitude[start:stop] = field
             if loads is not None:
                 loads.pop('latest', None)

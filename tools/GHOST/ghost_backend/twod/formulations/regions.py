@@ -168,7 +168,15 @@ def storage_resources(mesh, layout):
 
     near_batch_samples = min(ops._NEAR_BATCH_MAX_SAMPLES, near_pairs * 16 * 16)
     near_batch_bytes = near_batch_samples * 256
-    assembly_workspace = 256*width*width * near_pairs + max(tile_bytes, near_batch_bytes)
+    from ghost_backend.twod.assembly.near_store import NEAR_STORAGE_BYTES
+    from ghost_backend.twod.polynomial_quadrature import MOMENT_CACHE_BYTES
+    # Coefficients spill above their fixed cap. Integer pair plans/sorting still
+    # scale with the geometric pair count; polynomial moment reuse has its own
+    # run-scoped cap and may survive into a subsequent assembly.
+    near_storage = min(NEAR_STORAGE_BYTES, 3*16*width*width*near_pairs)
+    near_metadata = 64*near_pairs
+    moment_cache = MOMENT_CACHE_BYTES if width > 2 else 0
+    assembly_workspace = near_storage + near_metadata + max(tile_bytes, near_batch_bytes)
 
 
     return dict(operator_matrices=matrices, operator_entries=entries,
@@ -176,6 +184,7 @@ def storage_resources(mesh, layout):
                 assembly_operator_entries=0,
                 operator_map_bytes=map_bytes, mass_workspace_bytes=mass_bytes,
                 block_workspace_bytes=block_bytes,
+                moment_cache_bytes=moment_cache,
                 assembly_workspace_bytes=assembly_workspace)
 
 

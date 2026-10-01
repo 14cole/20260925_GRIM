@@ -18,11 +18,13 @@ NumPy, SciPy and psutil are required. Their supported version ranges are declare
 in the wheel. Qt and matplotlib are optional desktop dependencies; install the
 `gui` extra when using the desktop interface. Configured solves use the CPU.
 
-The wheel is platform-independent and contains no prebuilt native binaries.
-Both solvers have NumPy fallbacks. The optional BoR and 2-D C sources and build
-scripts are included, together with example geometries and placement templates.
-Build native acceleration on the destination machine using the README's compiler
-instructions. Existing binaries in a development checkout are not redistributed.
+The default wheel is platform-independent and contains no prebuilt native
+binaries. Both solvers have NumPy fallbacks. The optional BoR and 2-D C sources
+and build scripts are included, together with example geometries and placement
+templates. A separate native wheel can include these accelerators for Windows
+or Linux; installing that wheel requires no compiler on the recipient machine
+and adds no Python dependencies. Existing binaries in a development checkout
+are never redistributed by the release builder.
 
 ## Source and tests
 
@@ -59,10 +61,48 @@ Rebuild the artifacts with an environment containing `setuptools>=68` and `wheel
 python scripts/build_distribution.py --output ../distributions
 ```
 
-The build emits a wheel, standard source distribution, source/test ZIP, and a
-SHA-256 manifest. It checks required wheel resources and excludes platform
-binaries and generated data. The ZIP has stable member metadata for reproducible
-source checksums.
+The default build emits a portable wheel, standard source distribution,
+source/test ZIP, and a SHA-256 manifest. It checks required wheel resources and
+excludes platform binaries and generated data. The ZIP has stable member
+metadata for reproducible source checksums.
+
+## Optional native releases
+
+On a release machine with a C99 compiler, use:
+
+```console
+python scripts/build_distribution.py --native --output ../native-distributions
+```
+
+This compiles the 2-D table and far-field kernels and the BoR streaming kernel
+from the staged sources. Each library must load and export every required
+entry point in a fresh Python process before it is packaged. The manifest
+records library checksums and exports. Library rebuilds use temporary files
+and only replace an existing library after this check succeeds.
+
+Use `--compiler /path/to/gcc` to select a compiler, or let the builders use
+`CC`, PATH, or the standard Windows MSYS2 UCRT64 installation. Compiler and
+OpenMP runtimes are linked statically on Windows. `--no-openmp` builds the BoR
+kernel without OpenMP; this reduces its internal parallelism but can simplify
+Linux deployment where an OpenMP runtime is unavailable. The 2-D native kernels
+keep their existing Python-managed threading.
+
+Build separately on Windows and Linux, using the target Python architecture.
+For example, a 64-bit Windows release emits
+`ghost_em2d-0.1.1-py3-none-win_amd64.whl`, while an x86-64 Linux release emits
+`ghost_em2d-0.1.1-py3-none-linux_x86_64.whl`. These ctypes libraries have no
+CPython extension ABI dependency. The native wheel is marked as platform
+specific and retains the package's Python version requirement. Its source ZIP
+and standard source distribution remain free of binaries.
+
+Linux wheels use a conservative platform tag, not a `manylinux` compatibility
+claim. Build on the oldest supported target system and validate its system C
+and, when enabled, OpenMP runtime requirements on the recipient baseline.
+Use the installed wheel's environment to run `scripts/check_installation.py`
+from an unrelated directory before distributing it. Separate platform builds
+and recipient smoke checks are necessary; a successful Windows build does not
+validate a Linux binary. Recipients can install the native wheel offline with
+the same approved NumPy, SciPy and psutil wheels used by the portable release.
 
 ## Numerical scope
 
@@ -76,5 +116,5 @@ open ends or triple junctions. See `NUMERICAL_METHODS.md` and
 `GEOMETRY_INPUT_CHEATSHEET.md` for the supported inputs and limitations.
 
 GPU support is limited to low-level diagnostics. No real CuPy hardware execution
-is claimed by this release. Cross-platform wheel tagging reflects the portable
-Python/NumPy implementation; validation for this release was performed on Windows.
+is claimed by this release. Validation for this release was performed on Windows;
+Linux native compilation and numerical smoke checks require a Linux release host.

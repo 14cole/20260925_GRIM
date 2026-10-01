@@ -1,7 +1,8 @@
 """Immutable-input preparation shared for the lifetime of a 2-D run.
 
-Material tables are captured once per run. No matrices, factors, or meshes are
-retained here, and nothing is reused across independent runs.
+Material tables are captured once per run. Small resource forecasts are also
+shared; no matrices, factors, or meshes are retained here, and nothing is
+reused across independent runs.
 
 The shared ``MaterialLibrary`` also accumulates the run-level union of
 warnings and information.  Each solve reports (and quality-gates) only the
@@ -24,7 +25,7 @@ def preparation_scope():
     if _ACTIVE.get() is not None:
         yield _ACTIVE.get()
         return
-    with _ACTIVE.override({'materials': {}, 'geometry': {}, 'fingerprints': {}, 'hits': 0}):
+    with _ACTIVE.override({'materials': {}, 'geometry': {}, 'fingerprints': {}, 'forecasts': {}, 'hits': 0}):
         yield _ACTIVE.get()
 
 
@@ -34,6 +35,12 @@ def prepared_execution(function):
         with preparation_scope():
             return function(*args, **kwargs)
     return call
+
+
+def forecast_cache():
+    """Run-owned forecast records; admission against free RAM is never cached."""
+    state = _ACTIVE.get()
+    return state['forecasts'] if state is not None else None
 
 
 def material_fingerprints(snapshot, base_dir):

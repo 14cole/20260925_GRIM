@@ -51,7 +51,6 @@ import sys
 import time
 import traceback
 from datetime import datetime
-from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -115,8 +114,7 @@ _GEOMETRY_EXTS = (".geo",)
 MANIFEST_SCHEMA = "ghost.local.2d-run.v3"
 OUTPUT_POLARIZATIONS = ("VV", "HH")
 
-# Parsed geometry snapshots, filled in the parent before the pool forks so
-# workers inherit them instead of unpickling one per unit.
+# Parsed geometry snapshots reused by successive units in each spawned worker.
 _SNAPSHOT_CACHE = {}  # type: Dict[str, Tuple[Dict[str, Any], str]]
 
 
@@ -278,7 +276,8 @@ def _solve_and_export(
     )
     # Select precision inside each worker; context variables are process-local.
     from ghost_backend.linalg.refined_lu import linear_precision
-    with linear_precision(context.get("lu_precision", "double")):
+    from ghost_backend.twod.samples import compact_samples
+    with compact_samples(), linear_precision(context.get("lu_precision", "double")):
         if context["mesh_certification"]:
             from ghost_backend.twod.solver import solve_monostatic_rcs_2d_certified
             result = solve_monostatic_rcs_2d_certified(
@@ -569,15 +568,6 @@ def main() -> 'None':
         print("  user owns the mesh-resolution decision.")
     print("=" * 70, flush=True)
 
-    # Parse each distinct geometry once, before the pool forks, so workers
-    # inherit the snapshots instead of unpickling one per unit. Import the
-    # solver here for the same reason: replacing a worker then costs a fork
-    # rather than a re-import of numpy, SciPy, and the solver module.
-    for unit in ordered:
-        _load_snapshot(str(unit["geometry"]))
-    import ghost_backend.twod.solver as rcs_solver
-    import ghost_backend.io.grim as grim_io
-
     counters = {"written": 0, "skipped": 0, "failed": 0}
     started = time.time()
     total = len(ordered)
@@ -614,12 +604,16 @@ def main() -> 'None':
         print(f"  [{_finished():4d}/{total}] FAILED (dispatch) {name}: {exc!r}",
               flush=True)
 
+    # Ordinary spawned workers can run compressed tile processes; unlike a
+    # daemon Pool they also report native worker death to the dispatcher.
+    # Import after the launch environment has pinned native thread pools.
+    from ghost_backend.hpc.common import ExecutorPool
     try:
-        with Pool(
+        with ExecutorPool(
             processes=pool_size,
             initializer=_pool_initializer,
             initargs=(blas_threads,),
-            maxtasksperchild=_TASKS_PER_CHILD,
+            max_tasks_per_child=_TASKS_PER_CHILD,
         ) as pool:
             dispatcher = hpc_scheduler.MemoryAwareDispatcher(
                 pool, budget_gb=budget_gb, max_concurrent=pool_size,

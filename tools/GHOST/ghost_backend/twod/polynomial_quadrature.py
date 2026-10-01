@@ -179,6 +179,8 @@ _MOMENT_DEGREE = 3
 # About 200 bytes of working storage per sample. Concurrent chunks stay within
 # the near-batch workspace that dense resource forecasts already reserve.
 _CHUNK_SAMPLES = 1 << 17
+_ACTIVE_TASKS = 512
+MOMENT_CACHE_BYTES = 256 * 1024**2
 _MOMENT_CACHE = ScopedValue('ghost_polynomial_near_moments', None)
 
 
@@ -190,7 +192,7 @@ class MomentCache:
     # Near-batch kernel tables of this scope share the CPU table budget's size.
     TABLE_BUDGET = 32 * 1024**2
 
-    def __init__(self, budget_bytes=256 * 1024**2):
+    def __init__(self, budget_bytes=MOMENT_CACHE_BYTES):
         self.budget = int(budget_bytes)
         self.values = {}
         self.hits = self.stores = self.evictions = 0
@@ -228,7 +230,7 @@ class MomentCache:
 
 
 @contextmanager
-def moment_cache_scope(budget_bytes=256 * 1024**2):
+def moment_cache_scope(budget_bytes=MOMENT_CACHE_BYTES):
     """Share near-pair moments across nested solves; reuse an enclosing cache."""
     existing = _MOMENT_CACHE.get()
     if existing is not None:
@@ -248,28 +250,40 @@ def solve_checkpoint():
 
 
 def map_checked(function, jobs, workers, checkpoint=None):
-    """Ordered map over threads, checking for cancellation as each job finishes.
+    """Yield ordered results with at most twice the worker count in flight.
 
-    Queued jobs are cancelled when the checkpoint or a job raises, so an abort
-    waits for at most the jobs already running.
+    Consumers can copy each result into its final destination immediately;
+    completed results do not accumulate until every job has finished. Queued
+    jobs are cancelled on failure, cancellation, or explicit iterator close.
     """
     if workers <= 1 or len(jobs) <= 1:
-        results = []
         for job in jobs:
-            results.append(function(job))
             if checkpoint is not None:
                 checkpoint()
-        return results
+            result = function(job)
+            if checkpoint is not None:
+                checkpoint()
+            yield result
+            result = None
+        return
+    from collections import deque
     from concurrent.futures import ThreadPoolExecutor
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
-        futures = [pool.submit(function, job) for job in jobs]
-        results = []
-        for future in futures:
-            results.append(future.result())
+        pending = deque()
+        submitted = 0
+        while submitted < len(jobs) and len(pending) < 2 * workers:
+            pending.append(pool.submit(function, jobs[submitted]))
+            submitted += 1
+        while pending:
+            result = pending.popleft().result()
             if checkpoint is not None:
                 checkpoint()
-        return results
+            yield result
+            result = None
+            if submitted < len(jobs):
+                pending.append(pool.submit(function, jobs[submitted]))
+                submitted += 1
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
 
@@ -551,24 +565,42 @@ def near_blocks(pairs, k, obs_derivative=True, threads=None):
     cache = _MOMENT_CACHE.get()
     rtol = NEAR_PAIR_QUADRATURE_RTOL
     table = _table_for(k, pairs)
-    values, children = {}, {}
+    values, parents = {}, {}
     pending = [_Task(i, i, 0, ((0., 1.), (0., 1.))) for i in range(len(pairs))]
     next_node = len(pairs)
+
+    def accept(node, value):
+        # Fold siblings as soon as both converge. Their left + right order is
+        # exactly the former recursive total(), without retaining every leaf.
+        values[node] = value
+        while node in parents:
+            parent, first, second = parents[node]
+            if first not in values or second not in values:
+                break
+            a, b = values.pop(first), values.pop(second)
+            del parents[first], parents[second]
+            node = parent
+            values[node] = tuple(x+y for x, y in zip(a, b))
+
     while pending:
         if checkpoint is not None:
             checkpoint()
-        for task in pending:
+        # Work depth first in bounded batches. Breadth-first refinement could
+        # retain exponentially many low/high moments for a difficult close pair.
+        active = pending[-_ACTIVE_TASKS:]
+        del pending[-len(active):]
+        for task in active:
             _classify(task, *pairs[task.pair])
-        lows = _moments(pending, pairs, k, obs_derivative, 20, cache, threads, checkpoint, table)
-        highs = _moments(pending, pairs, k, obs_derivative, 36, cache, threads, checkpoint, table)
+        lows = _moments(active, pairs, k, obs_derivative, 20, cache, threads, checkpoint, table)
+        highs = _moments(active, pairs, k, obs_derivative, 36, cache, threads, checkpoint, table)
         refine, following = [], []
-        for task, low_moment, high_moment in zip(pending, lows, highs):
+        for task, low_moment, high_moment in zip(active, lows, highs):
             obs, src = pairs[task.pair]
             low, high = _project(low_moment, obs, src), _project(high_moment, obs, src)
             scale = max(np.max(abs(high[0])), np.max(abs(high[1])), obs.length * src.length * 1e-10)
             error = max(np.max(abs(a-b)) for a, b in zip(low, high))
             if error <= rtol * scale:
-                values[task.node] = high
+                accept(task.node, high)
             elif obs.panel_index == src.panel_index or task.depth >= 2*NEAR_PAIR_QUADRATURE_MAX_DEPTH:
                 refine.append((task, high, scale))
             else:
@@ -579,7 +611,7 @@ def near_blocks(pairs, k, obs_derivative=True, threads=None):
                 else:
                     mid = sum(si) / 2
                     split = [(oi, (si[0], mid)), (oi, (mid, si[1]))]
-                children[task.node] = (next_node, next_node + 1)
+                parents[next_node] = parents[next_node+1] = (task.node, next_node, next_node+1)
                 following.extend(_Task(next_node + j, task.pair, task.depth + 1, interval)
                                  for j, interval in enumerate(split))
                 next_node += 2
@@ -593,7 +625,7 @@ def near_blocks(pairs, k, obs_derivative=True, threads=None):
                 if max(np.max(abs(a-b)) for a, b in zip(high, finest)) > rtol * scale:
                     unresolved.append((task, finest, scale))
                 else:
-                    values[task.node] = finest
+                    accept(task.node, finest)
             if unresolved:
                 extra_moments = _moments([u[0] for u in unresolved], pairs, k, obs_derivative, 144,
                                          cache, threads, checkpoint, table)
@@ -605,12 +637,7 @@ def near_blocks(pairs, k, obs_derivative=True, threads=None):
                         raise ValueError('Polynomial near quadrature did not converge; refine the mesh. '
                                          'Panels {} / {}, k={}, intervals={}, relative change={:.3g}.'.format(
                                              obs.panel_index, src.panel_index, k, task.intervals, error/scale))
-                    values[task.node] = extra
-        pending = following
+                    accept(task.node, extra)
+        pending.extend(following)
 
-    def total(node):
-        if node not in children:
-            return values[node]
-        first, second = (total(child) for child in children[node])
-        return tuple(a + b for a, b in zip(first, second))
-    return [total(index) for index in range(len(pairs))]
+    return [values[index] for index in range(len(pairs))]

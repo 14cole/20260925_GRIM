@@ -61,6 +61,9 @@ def spatial_order(coordinates, ids, leaf=128):
 
 # A block gathers on one thread per this many entries (up to the dense-algebra threads).
 GATHER_ENTRIES_PER_THREAD = 1 << 18
+# Sampled compression retains factors, never a complete off-diagonal block.
+# Each product gathers at most this much original-matrix data at a time.
+PRODUCT_PANEL_BYTES = 16 * 1024**2
 
 
 def _runs(ids):
@@ -116,6 +119,31 @@ class Block:
 
     def col(self, j):
         return self.a[self.rows, self.cols[j]].copy()
+
+    def matmul(self, rhs):
+        """A_block @ rhs with bounded gathers and complete column reductions."""
+        width = max(1, PRODUCT_PANEL_BYTES // max(1, self.shape[1]*self.a.itemsize))
+        result = np.empty((self.shape[0], rhs.shape[1]), dtype=np.result_type(self.a, rhs))
+        for start in range(0, self.shape[0], width):
+            self.checkpoint()
+            panel = Block(self.a, self.rows[start:start+width], self.cols, self.checkpoint).dense()
+            result[start:start+width] = panel @ rhs
+            del panel
+        return result
+
+    def project(self, basis):
+        """basis.H @ A_block; each output column retains its full reduction."""
+        width = max(1, PRODUCT_PANEL_BYTES // max(1, self.shape[0]*self.a.itemsize))
+        result = np.empty((basis.shape[1], self.shape[1]), dtype=np.result_type(self.a, basis))
+        # LAPACK/BLAS consumes the adjoint flag without conjugating the whole
+        # basis. Its Fortran copy, if necessary, is only proportional to rank.
+        basis = np.asfortranarray(basis)
+        for start in range(0, self.shape[1], width):
+            self.checkpoint()
+            panel = Block(self.a, self.rows, self.cols[start:start+width], self.checkpoint).dense()
+            result[:, start:start+width] = la.blas.zgemm(1., basis, panel, trans_a=2)
+            del panel
+        return result
 
     def error(self, u, v):
         total = error = largest = 0.
@@ -188,7 +216,7 @@ SAMPLE_COLUMNS = 32
 
 
 def compress_sampled(block, threshold, maximum_rank, rng, start=SAMPLE_COLUMNS):
-    """Low-rank factors ``u, v`` of a copied block (``u`` orthonormal).
+    """Low-rank factors ``u, v`` using bounded block products (``u`` orthonormal).
 
     Adaptive randomized range finder: the range grows by SAMPLE_COLUMNS
     products at a time (``start`` the first time) until fresh samples,
@@ -198,14 +226,13 @@ def compress_sampled(block, threshold, maximum_rank, rng, start=SAMPLE_COLUMNS):
     projected block then sets the rank.  Returns ``(u, v, error)``, ``error``
     the missed-norm estimate.
     """
-    a = block.dense()
-    m, n = a.shape
+    m, n = block.shape
     limit = min(int(maximum_rank), min(m, n)//2)
-    q = np.empty((m, 0), dtype=np.result_type(a.dtype, np.complex128))
+    q = np.empty((m, 0), dtype=np.complex128)
     width = max(1, min(int(start), n, max(limit, 1)))
     while True:
         block.checkpoint()
-        y = a @ (rng.standard_normal((n, width)) + 1j*rng.standard_normal((n, width)))
+        y = block.matmul(rng.standard_normal((n, width)) + 1j*rng.standard_normal((n, width)))
         # What projection can resolve: rounding of the raw samples.
         floor = 64*np.finfo(float).eps*float(np.max(np.linalg.norm(y, axis=0)))
         if q.shape[1]:
@@ -226,8 +253,7 @@ def compress_sampled(block, threshold, maximum_rank, rng, start=SAMPLE_COLUMNS):
         width = min(SAMPLE_COLUMNS, n)
     if not q.shape[1]:
         return q, np.empty((0, n), q.dtype), error
-    projected = q.conj().T @ a
-    a = None
+    projected = block.project(q)
     # The wide SVD through the QR of its tall adjoint (projected = r^H w^H):
     # LAPACK's wide path took 1.6 to 2 times as long on these shapes.
     w, r = la.qr(projected.conj().T, mode='economic', check_finite=False)
@@ -242,24 +268,47 @@ def compress_sampled(block, threshold, maximum_rank, rng, start=SAMPLE_COLUMNS):
 
 class Node:
     def solve(self, b, trans=0):
+        result = np.empty(np.shape(b), dtype=np.result_type(b, np.complex128), order='F')
+        self.solve_into(b, result, trans)
+        return result
+
+    def solve_into(self, b, result, trans=0):
+        """Reuse one RHS-sized destination throughout the inverse tree.
+
+        Input and output may alias: adjoint corrections are formed before
+        changing either half, and normal solves consume disjoint row ranges.
+        Leaves only need a bounded LAPACK workspace if a slice is strided.
+        """
+        checkpoint = getattr(self, 'checkpoint', None)
+        if checkpoint is not None:
+            checkpoint()
         if self.leaf:
-            return la.lu_solve(self.lu, b, trans=trans, check_finite=False)
+            result[...] = la.lu_solve(self.lu, b, trans=trans, check_finite=False)
+            return
         n = self.left.n
         if self.lu is None:
-            return np.vstack((self.left.solve(b[:n], trans), self.right.solve(b[n:], trans)))
+            self.left.solve_into(b[:n], result[:n], trans)
+            self.right.solve_into(b[n:], result[n:], trans)
+            return
         if trans == 0:
-            z1, z2 = self.left.solve(b[:n]), self.right.solve(b[n:])
+            self.left.solve_into(b[:n], result[:n])
+            self.right.solve_into(b[n:], result[n:])
+            z1, z2 = result[:n], result[n:]
             small = np.vstack((self.v12 @ z2, self.v21 @ z1))
             correction = la.lu_solve(self.lu, small, check_finite=False)
             r = self.e1.shape[1]
-            return np.vstack((z1-self.e1 @ correction[:r], z2-self.e2 @ correction[r:]))
+            z1 -= self.e1 @ correction[:r]
+            z2 -= self.e2 @ correction[r:]
+            return
         def adj(a):
             return a.T if trans == 1 else a.conj().T
         small = np.vstack((adj(self.e1) @ b[:n], adj(self.e2) @ b[n:]))
         correction = la.lu_solve(self.lu, small, trans=trans, check_finite=False)
         r = self.e1.shape[1]
-        return np.vstack((self.left.solve(b[:n]-adj(self.v21) @ correction[r:], trans),
-                          self.right.solve(b[n:]-adj(self.v12) @ correction[:r], trans)))
+        result[:n] = b[:n]-adj(self.v21) @ correction[r:]
+        result[n:] = b[n:]-adj(self.v12) @ correction[:r]
+        self.left.solve_into(result[:n], result[:n], trans)
+        self.right.solve_into(result[n:], result[n:], trans)
 
 
 LEAF_SIZE = 256
@@ -335,6 +384,7 @@ class HierarchicalFactor:
     def _build(self, ids):
         self.checkpoint()
         node = Node()
+        node.checkpoint = self.checkpoint
         node.n, node.leaf = len(ids), len(ids) <= LEAF_SIZE
         if node.leaf:
             node.lu = self._lu(Block(self.a, ids, ids, self.checkpoint).dense())

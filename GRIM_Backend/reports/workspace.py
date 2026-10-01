@@ -10,9 +10,11 @@ underlying electromagnetic data.
 from __future__ import annotations
 
 import math
+import re
 import tempfile
 import weakref
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -32,6 +34,7 @@ from GRIM_Backend.reports.report import (
     SLIDE_TITLE_FONT_SIZE_POINTS,
     SlidePlan,
     export_powerpoint_report,
+    export_report_images,
     geometry_for_layout,
     plan_azimuth_slides,
     plan_frequency_slides,
@@ -230,7 +233,7 @@ if GUI_AVAILABLE:
             exporter: Callable[..., Any],
             plan: PresentationPlan,
             output_path: str,
-            template_path: str,
+            template_path: str | None,
             template_layouts: Mapping[str, str],
         ) -> None:
             super().__init__()
@@ -243,9 +246,11 @@ if GUI_AVAILABLE:
         @Slot()
         def run(self) -> None:
             try:
-                kwargs: dict[str, Any] = {
-                    "template_path": self._template_path or None,
-                }
+                # None identifies an image-only export. It does not pass any
+                # presentation/template options to the independent renderer.
+                kwargs: dict[str, Any] = {}
+                if self._template_path is not None:
+                    kwargs["template_path"] = self._template_path or None
                 if self._template_layouts:
                     kwargs["template_layouts"] = self._template_layouts
                 result = self._exporter(
@@ -521,6 +526,7 @@ if GUI_AVAILABLE:
         """Top-level GRIM workspace for uniform, previewed PPTX reports."""
 
         report_exported = Signal(str)
+        images_exported = Signal(str)
         status_changed = Signal(str)
         main_selection_requested = Signal()
 
@@ -529,11 +535,15 @@ if GUI_AVAILABLE:
             parent: QWidget | None = None,
             *,
             exporter: Callable[..., Any] = export_powerpoint_report,
+            image_exporter: Callable[..., Any] = export_report_images,
             selected_ids_provider: Callable[[], Iterable[str]] | None = None,
             current_plot_provider: Callable[[], dict] | None = None,
         ) -> None:
             super().__init__(parent)
             self._exporter = exporter
+            self._image_exporter = image_exporter
+            self._active_export_operation = "PowerPoint report export"
+            self._last_images_directory = ""
             self._selected_ids_provider = selected_ids_provider
             self._current_plot_provider = current_plot_provider
             self._catalog: dict[str, DatasetCatalogEntry] = {}
@@ -726,7 +736,7 @@ if GUI_AVAILABLE:
             return bool(self._thread is not None and self._thread.isRunning())
 
         def busy_operation(self) -> str | None:
-            return "PowerPoint report export" if self.job_is_running() else None
+            return self._active_export_operation if self.job_is_running() else None
 
         def focus_workspace(self) -> None:
             self.build_preview_button.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -1216,7 +1226,14 @@ if GUI_AVAILABLE:
             self.build_preview_button.setDefault(True)
             self.export_button = QPushButton("Export PowerPoint", self)
             self.export_button.setEnabled(False)
+            self.export_images_button = QPushButton("Export PNG images…", self)
+            self.export_images_button.setToolTip(
+                "Save every plot and shared legend in the current report to "
+                "labeled slide folders. Works without PowerPoint or a template."
+            )
+            self.export_images_button.setEnabled(False)
             action_bar.addWidget(self.build_preview_button)
+            action_bar.addWidget(self.export_images_button)
             action_bar.addWidget(self.export_button)
             outer.addLayout(action_bar)
             self._update_navigation()
@@ -1326,6 +1343,7 @@ if GUI_AVAILABLE:
             )
             self.build_preview_button.clicked.connect(self.build_preview)
             self.export_button.clicked.connect(self.export_report)
+            self.export_images_button.clicked.connect(self.export_images)
             self.previous_slide_button.clicked.connect(self.previous_slide)
             self.next_slide_button.clicked.connect(self.next_slide)
             self._update_template_controls()
@@ -2021,6 +2039,7 @@ if GUI_AVAILABLE:
                 return
             self._preview_is_current = False
             self.export_button.setEnabled(False)
+            self.export_images_button.setEnabled(False)
             message = "Settings changed — click Build Preview to verify the updated slides."
             self.preview_canvas.show_feedback("Preview is out of date", message)
             self.page_label.setText("Stale preview")
@@ -2360,7 +2379,7 @@ if GUI_AVAILABLE:
         @Slot()
         def build_preview(self) -> bool:
             if self.job_is_running():
-                self._show_error("Wait for the current PowerPoint export to finish.")
+                self._show_error(f"Wait for the current {self.busy_operation()} to finish.")
                 return False
             self._last_plan_warnings = ()
             try:
@@ -2375,6 +2394,7 @@ if GUI_AVAILABLE:
                 self._preview_plan = None
                 self._preview_is_current = False
                 self.export_button.setEnabled(False)
+                self.export_images_button.setEnabled(False)
                 self._show_error(str(exc))
                 self.preview_canvas.show_feedback(
                     "Preview could not be built", str(exc)
@@ -2385,11 +2405,12 @@ if GUI_AVAILABLE:
                 self._update_navigation()
                 return False
             self.export_button.setEnabled(True)
+            self.export_images_button.setEnabled(True)
             self._last_error = ""
             message = (
                 f"Preview ready: {len(plan.slides)} slide(s), "
-                f"{plan.plot_count} plot(s). Review each page, choose an output, "
-                "then export PPTX."
+                f"{plan.plot_count} plot(s). Review each page, then export "
+                "PowerPoint or PNG images."
             )
             if self._last_plan_warnings:
                 warning_text = "\n".join(
@@ -2457,7 +2478,7 @@ if GUI_AVAILABLE:
         @Slot()
         def export_report(self) -> bool:
             if self.job_is_running():
-                self._show_error("A PowerPoint report export is already running.")
+                self._show_error(f"A {self.busy_operation()} is already running.")
                 return False
             if self._preview_plan is None or not self._preview_is_current:
                 self._show_error("Build and review a current slide preview before export.")
@@ -2494,7 +2515,6 @@ if GUI_AVAILABLE:
                     self._show_error(f"PowerPoint template not found: {template}")
                     return False
             template_layouts = self._selected_template_layouts()
-            thread = QThread(self)
             # PresentationPlan and copied strings are immutable snapshots.
             # Subsequent shell/catalog/layout edits cannot change an export.
             worker = _ExportWorker(
@@ -2504,9 +2524,69 @@ if GUI_AVAILABLE:
                 template,
                 template_layouts,
             )
+            return self._start_export(
+                worker, "PowerPoint report export",
+                "Rendering fixed-layout plot images and writing the PowerPoint report…",
+                self._export_succeeded,
+            )
+
+        @Slot()
+        def export_images(self) -> bool:
+            if self.job_is_running():
+                self._show_error(f"A {self.busy_operation()} is already running.")
+                return False
+            if self._preview_plan is None or not self._preview_is_current:
+                self._show_error("Build and review a current slide preview before export.")
+                return False
+            plan = self._preview_plan
+            title = self.deck_title_edit.text().strip() or "GRIM report"
+            initial = self._last_images_directory
+            if not initial:
+                output = self.output_edit.text().strip()
+                initial = str(Path(output).expanduser().parent) if output else str(Path.home())
+            directory = QFileDialog.getExistingDirectory(
+                self, "Choose a folder for report PNG images", initial,
+            )
+            if not directory:
+                self._set_status("PNG export canceled.")
+                return False
+            # A native folder dialog processes events. Recheck the captured
+            # preview before starting a background job after it returns.
+            if self.job_is_running():
+                self._show_error(f"A {self.busy_operation()} is already running.")
+                return False
+            if not self._preview_is_current or self._preview_plan is not plan:
+                self._show_error("Report settings changed. Build a current preview before export.")
+                return False
+            try:
+                parent = Path(directory).expanduser().resolve()
+                if not parent.is_dir():
+                    raise ValueError(f"Choose an existing folder for PNG export: {parent}")
+                # A fresh report folder keeps earlier image batches intact.
+                label = re.sub(r"[^\w .-]+", "-", title).strip(" .")[:40] or "GRIM report"
+                stem = f"{label}_images_{datetime.now():%Y%m%d-%H%M%S}"
+                destination = parent / stem
+                suffix = 2
+                while destination.exists() or destination.is_symlink():
+                    destination = parent / f"{stem}_{suffix}"
+                    suffix += 1
+            except (OSError, ValueError) as exc:
+                self._show_error(str(exc))
+                return False
+            self._last_images_directory = str(parent)
+            worker = _ExportWorker(self._image_exporter, plan, str(destination), None, {})
+            return self._start_export(
+                worker, "PNG image export",
+                f"Exporting all {plan.plot_count} plot(s) and shared legends to labeled slide folders…",
+                self._images_export_succeeded,
+            )
+
+        def _start_export(self, worker: _ExportWorker, operation: str,
+                          message: str, succeeded: Callable[[str], None]) -> bool:
+            thread = QThread(self)
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
-            worker.succeeded.connect(self._export_succeeded)
+            worker.succeeded.connect(succeeded)
             worker.failed.connect(self._export_failed)
             worker.succeeded.connect(thread.quit)
             worker.failed.connect(thread.quit)
@@ -2516,10 +2596,9 @@ if GUI_AVAILABLE:
             thread.finished.connect(self._export_thread_finished)
             self._thread = thread
             self._worker = worker
+            self._active_export_operation = operation
             self._set_busy(True)
-            self._set_status(
-                "Rendering fixed-layout plot images and writing the PowerPoint report…"
-            )
+            self._set_status(message)
             thread.start()
             return True
 
@@ -2535,6 +2614,13 @@ if GUI_AVAILABLE:
         def _export_failed(self, message: str) -> None:
             self._show_error(message)
 
+        @Slot(str)
+        def _images_export_succeeded(self, path: str) -> None:
+            self._last_error = ""
+            self._last_exported_images = path
+            self._set_status(f"PNG images saved: {path}")
+            self.images_exported.emit(path)
+
         @Slot()
         def _export_thread_finished(self) -> None:
             self._thread = None
@@ -2545,6 +2631,7 @@ if GUI_AVAILABLE:
             self.controls_content.setEnabled(not busy)
             self.build_preview_button.setEnabled(not busy)
             self.export_button.setEnabled(not busy and self._preview_is_current)
+            self.export_images_button.setEnabled(not busy and self._preview_is_current)
             self.previous_slide_button.setEnabled(
                 not busy
                 and self._preview_is_current
@@ -2593,7 +2680,7 @@ if GUI_AVAILABLE:
         def closeEvent(self, event: Any) -> None:
             if self.job_is_running():
                 self._set_status(
-                    "PowerPoint export is still running; wait for it to finish before closing."
+                    f"{self.busy_operation()} is still running; wait for it to finish before closing."
                 )
                 event.ignore()
                 return

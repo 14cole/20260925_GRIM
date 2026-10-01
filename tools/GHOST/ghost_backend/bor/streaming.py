@@ -2341,6 +2341,20 @@ class StreamingCrossFarBlocks:
                                                            (index,))[uv]], flush=False)
             return tuple(blocks)
 
+    def write_blocks(self, which, m, targets):
+        """Copy a cross mode straight into its final matrix quadrants."""
+        with self._range_lock:
+            self._ensure(abs(m))
+            store = self.Z if which == 'efie' else self.B
+            index = self._sidx[abs(m)]
+            views = tuple(store[uv, index] for uv in range(4))
+        for uv, (view, target) in enumerate(zip(views, targets)):
+            for lo, hi in _row_chunks(self.Np, self.Nq * store.dtype.itemsize):
+                np.multiply(view[lo:hi], mode_sign(uv, m), out=target[lo:hi])
+                if getattr(store, '_mmap', None) is not None:
+                    _release_spilled(store, [_spilled_rows(store, ('full', self.Nq), lo, hi,
+                                                           (index,))[uv]], flush=False)
+
     def _sample_G(self, rows, phase, ord_lo: 'int', hi: 'int', sources=None):
         ne_q = self.sq.gen.n_elems
         f0, f1 = (0, ne_q) if sources is None else sources

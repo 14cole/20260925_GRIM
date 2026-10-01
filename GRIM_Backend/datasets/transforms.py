@@ -951,3 +951,365 @@ def wedge_to_conic(
         attest_wedge_axes=False,
         assume_missing_cross_pol_zero=assume_missing_cross_pol_zero,
     )
+
+
+# --------------------------------------------------------------------------
+# Down-range time gating
+# --------------------------------------------------------------------------
+
+_GATE_PAD_FACTOR = 4
+_GATE_WORK_BYTES = 32 * 1024**2
+
+
+def _declared_time_sign(dataset: RcsGrid) -> str | None:
+    """Return "+jwt", "-jwt", or None when no time convention is declared."""
+
+    from GRIM_Backend.datasets.metadata import canonical_time_convention
+
+    signs = set()
+    for container in (dataset.units or {}, dataset.extra or {}):
+        for key in ("time_convention", "phase_reference", "amplitude_convention"):
+            raw = container.get(key)
+            if raw is None:
+                continue
+            array = np.asarray(raw)
+            if array.size != 1:
+                continue
+            sign = canonical_time_convention(str(array.reshape(-1)[0].item()))
+            if sign in {"+jwt", "-jwt"}:
+                signs.add(sign)
+    if len(signs) > 1:
+        raise ValueError("dataset declares contradictory time conventions")
+    return next(iter(signs)) if signs else None
+
+
+def _uniform_frequencies_hz(dataset: RcsGrid) -> np.ndarray:
+    frequencies = np.asarray(
+        dataset._frequency_value_to_hz(np.asarray(dataset.frequencies, dtype=float)),
+        dtype=float,
+    )
+    if frequencies.size < 8:
+        raise ValueError("time gating needs at least 8 frequencies")
+    steps = np.diff(frequencies)
+    step = float(np.mean(steps))
+    if not np.all(np.isfinite(frequencies)) or step <= 0.0 or np.max(
+        np.abs(steps - step)
+    ) > 1.0e-6 * step:
+        raise ValueError(
+            "time gating needs increasing, uniformly spaced frequencies; "
+            "Regrid the frequency axis first"
+        )
+    return frequencies
+
+
+def _gate_fft_size(count: int) -> int:
+    return 1 << int(np.ceil(np.log2(_GATE_PAD_FACTOR * count)))
+
+
+def gate_geometry(dataset: RcsGrid) -> dict[str, float]:
+    """Down-range resolution and unambiguous range (metres) of a sweep."""
+
+    from GRIM_Backend.datasets.constants import C0
+
+    frequencies = _uniform_frequencies_hz(dataset)
+    step = float(np.mean(np.diff(frequencies)))
+    return {
+        "resolution_m": C0 / (2.0 * step * frequencies.size),
+        "unambiguous_m": C0 / (2.0 * step),
+    }
+
+
+def _gate_window(ranges, start_m, stop_m, taper, mode):
+    """1 inside [start, stop] with raised-cosine edges; inverted for "remove"."""
+
+    width = stop_m - start_m
+    edge = 0.5 * float(taper) * width
+    gate = ((ranges >= start_m) & (ranges <= stop_m)).astype(float)
+    if edge > 0.0:
+        rising = (ranges >= start_m) & (ranges < start_m + edge)
+        falling = (ranges > stop_m - edge) & (ranges <= stop_m)
+        gate[rising] = 0.5 - 0.5 * np.cos(np.pi * (ranges[rising] - start_m) / edge)
+        gate[falling] = 0.5 - 0.5 * np.cos(np.pi * (stop_m - ranges[falling]) / edge)
+    return 1.0 - gate if mode == "remove" else gate
+
+
+def _gate_sweeps(sweeps, frequencies_hz, *, start_m, stop_m, taper, mode, compensate):
+    """Gate complex frequency sweeps along the last axis (GRIM exp(+jwt) law)."""
+
+    from GRIM_Backend.datasets.constants import C0
+
+    count = frequencies_hz.size
+    step = float(np.mean(np.diff(frequencies_hz)))
+    size = _gate_fft_size(count)
+    ranges = np.fft.fftfreq(size, d=step) * (C0 / 2.0)
+    gate = _gate_window(ranges, start_m, stop_m, taper, mode)
+    gated = np.fft.fft(np.fft.ifft(sweeps, n=size, axis=-1) * gate, axis=-1)[..., :count]
+    if compensate and mode == "keep":
+        centre = 0.5 * (start_m + stop_m)
+        point = np.exp(-4j * np.pi * frequencies_hz * centre / C0)
+        response = np.fft.fft(np.fft.ifft(point, n=size) * gate)[:count] / point
+        response = np.where(np.abs(response) > 1.0e-3, response, 1.0)
+        gated = gated / response
+    return gated
+
+
+def _validate_gate(dataset, start_m, stop_m, taper, mode):
+    start_m, stop_m, taper = float(start_m), float(stop_m), float(taper)
+    if mode not in {"keep", "remove"}:
+        raise ValueError("mode must be 'keep' or 'remove'")
+    if not all(math.isfinite(value) for value in (start_m, stop_m, taper)):
+        raise ValueError("gate start, stop, and taper must be finite")
+    if not 0.0 <= taper <= 1.0:
+        raise ValueError("taper must be between 0 and 1")
+    if stop_m <= start_m:
+        raise ValueError("gate stop must be beyond gate start")
+    geometry = gate_geometry(dataset)
+    half = 0.5 * geometry["unambiguous_m"]
+    if start_m < -half or stop_m > half:
+        raise ValueError(
+            f"the gate must lie within -{half:.4g} to +{half:.4g} m, the "
+            "unambiguous down range of this frequency step"
+        )
+    if stop_m - start_m < geometry["resolution_m"]:
+        raise ValueError(
+            f"the gate is narrower than the {geometry['resolution_m']:.4g} m "
+            "down-range resolution"
+        )
+    return start_m, stop_m, taper
+
+
+def time_gate(
+    dataset: RcsGrid,
+    *,
+    start_m: float,
+    stop_m: float,
+    taper: float = 0.2,
+    mode: str = "keep",
+    compensate: bool = True,
+) -> RcsGrid:
+    """Gate the down-range response of every frequency sweep.
+
+    Each azimuth/elevation/polarization sweep is transformed to down range
+    (inverse FFT over frequency, zero-padded), multiplied by a gate over
+    ``[start_m, stop_m]`` metres from the phase reference (positive away from
+    the radar), and transformed back to the original frequencies. ``taper``
+    is the fraction of the gate width given to raised-cosine edges.
+    ``mode="remove"`` keeps everything except the gate. ``compensate``
+    (keep mode) divides out the gate's band-edge droop for a point at the
+    gate centre. Data declaring exp(-jwt) are conjugated around the gate;
+    undeclared data follow GRIM's exp(+jwt) law. Sweeps with any missing
+    sample are left missing.
+    """
+
+    mode = str(mode).strip().lower()
+    start_m, stop_m, taper = _validate_gate(dataset, start_m, stop_m, taper, mode)
+    frequencies = _uniform_frequencies_hz(dataset)
+    conjugate = _declared_time_sign(dataset) == "-jwt"
+    shape = tuple(int(value) for value in dataset.rcs_power.shape)
+    power = np.full(shape, np.nan, dtype=np.float64)
+    phase = np.full(shape, np.nan, dtype=np.float64)
+    sweeps_per_azimuth = max(1, shape[1] * shape[3])
+    bytes_per_azimuth = sweeps_per_azimuth * _gate_fft_size(shape[2]) * 16 * 3
+    rows = max(1, _GATE_WORK_BYTES // bytes_per_azimuth)
+    usable = 0
+    for first in range(0, shape[0], rows):
+        block = (slice(first, min(shape[0], first + rows)),)
+        field = np.asarray(dataset.rcs_slice(block + (slice(None),) * 3), dtype=np.complex128)
+        sweeps = np.moveaxis(field, 2, -1)
+        if conjugate:
+            sweeps = np.conj(sweeps)
+        complete = np.all(np.isfinite(sweeps), axis=-1)
+        gated = _gate_sweeps(
+            np.where(complete[..., None], sweeps, 0.0), frequencies,
+            start_m=start_m, stop_m=stop_m, taper=taper, mode=mode,
+            compensate=compensate,
+        )
+        if conjugate:
+            gated = np.conj(gated)
+        gated = np.moveaxis(np.where(complete[..., None], gated, np.nan), -1, 2)
+        power[block] = np.abs(gated) ** 2
+        phase[block] = np.angle(gated)
+        usable += int(np.count_nonzero(complete))
+    if usable == 0:
+        raise ValueError(
+            "time gating needs complex (phase) data with every frequency present "
+            "in at least one sweep"
+        )
+    extra = _derived_response_extra(dataset)
+    extra["time_gate_json"] = json.dumps(
+        {
+            "schema": "grim.time-gate.v1",
+            "start_m": start_m,
+            "stop_m": stop_m,
+            "taper": taper,
+            "mode": mode,
+            "compensate": bool(compensate and mode == "keep"),
+            "time_convention": "exp(-jwt)" if conjugate else "exp(+jwt)",
+            "complete_sweeps": usable,
+            "total_sweeps": int(shape[0] * shape[1] * shape[3]),
+        },
+        sort_keys=True,
+    )
+    return RcsGrid(
+        dataset.azimuths,
+        dataset.elevations,
+        dataset.frequencies,
+        dataset.polarizations,
+        rcs_power=power,
+        rcs_phase=phase,
+        rcs_domain="complex_amplitude",
+        source_path=dataset.source_path,
+        history=dataset.history,
+        units=dict(dataset.units or {}),
+        extra=extra,
+    )
+
+
+def down_range_profile(
+    dataset: RcsGrid,
+    *,
+    elevation_index: int,
+    polarization_index: int,
+    gate: dict | None = None,
+    max_sweeps: int = 360,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Median Hann-windowed down-range power over azimuth, for gate previews.
+
+    Returns ``(ranges_m, linear_power)`` sorted by range. ``gate`` (the
+    ``time_gate`` keyword arguments) previews the gated result on the same
+    scale as the ungated profile.
+    """
+
+    from GRIM_Backend.datasets.constants import C0
+
+    frequencies = _uniform_frequencies_hz(dataset)
+    count = frequencies.size
+    azimuths = np.unique(np.linspace(
+        0, dataset.rcs_power.shape[0] - 1, min(max_sweeps, dataset.rcs_power.shape[0])
+    ).round().astype(int))
+    field = np.asarray(
+        dataset.rcs_slice((azimuths, int(elevation_index), slice(None), int(polarization_index))),
+        dtype=np.complex128,
+    )
+    field = field[np.all(np.isfinite(field), axis=-1)]
+    if field.size == 0:
+        raise ValueError("no complete complex sweep for this elevation and polarization")
+    if _declared_time_sign(dataset) == "-jwt":
+        field = np.conj(field)
+    if gate is not None:
+        field = _gate_sweeps(field, frequencies, **gate)
+    size = _gate_fft_size(count)
+    window = np.hanning(count)
+    profile = np.abs(np.fft.ifft(field * window, n=size, axis=-1)) ** 2
+    profile = np.fft.fftshift(np.median(profile, axis=0))
+    step = float(np.mean(np.diff(frequencies)))
+    ranges = np.fft.fftshift(np.fft.fftfreq(size, d=step)) * (C0 / 2.0)
+    return ranges, profile
+
+
+# --------------------------------------------------------------------------
+# Phase-centre translation
+# --------------------------------------------------------------------------
+
+
+def _angle_axis_radians(dataset: RcsGrid, axis: str) -> np.ndarray:
+    values = np.asarray(dataset.get_axis(axis), dtype=float)
+    unit = str((dataset.units or {}).get(axis, "deg")).strip().lower()
+    if unit in {"rad", "radian", "radians"}:
+        return values
+    if unit in {"deg", "degree", "degrees"}:
+        return np.deg2rad(values)
+    raise ValueError(f"unsupported {axis} unit {unit!r}; use deg or rad")
+
+
+def translate_phase_center(
+    dataset: RcsGrid,
+    *,
+    x_m: float,
+    y_m: float,
+    z_m: float,
+) -> RcsGrid:
+    """Move the phase reference to body point ``(x, y, z)`` metres.
+
+    GRIM angles are coming-from radar directions
+    ``u = (cos el cos az, cos el sin az, sin el)`` in body axes, and a point
+    scatterer at ``p`` has phase ``exp(+j 2k u.p)`` under exp(+jwt). Referencing
+    the field to ``t`` therefore multiplies every sample by ``exp(-j 2k u.t)``;
+    data declaring exp(-jwt) use the conjugate ramp. Levels are unchanged, and
+    samples without phase stay without phase.
+    """
+
+    from GRIM_Backend.datasets.constants import C0
+
+    offset = np.asarray([x_m, y_m, z_m], dtype=float)
+    if not np.all(np.isfinite(offset)):
+        raise ValueError("the phase-centre offset must be finite")
+    if not np.any(offset):
+        raise ValueError("the phase-centre offset is zero")
+    power = dataset.rcs_power
+    phase_in = _authoritative_response_phase(dataset)
+    if not np.any(np.isfinite(power) & np.isfinite(phase_in)):
+        raise ValueError("moving the phase centre needs complex (phase) data")
+    azimuth = _angle_axis_radians(dataset, "azimuth")
+    elevation = _angle_axis_radians(dataset, "elevation")
+    wavenumber = 2.0 * np.pi * np.asarray(
+        dataset._frequency_value_to_hz(np.asarray(dataset.frequencies, dtype=float)),
+        dtype=float,
+    ) / C0
+    projection = (
+        np.cos(elevation)[None, :] * np.cos(azimuth)[:, None] * offset[0]
+        + np.cos(elevation)[None, :] * np.sin(azimuth)[:, None] * offset[1]
+        + np.sin(elevation)[None, :] * offset[2]
+    )
+    sign = 1.0 if _declared_time_sign(dataset) == "-jwt" else -1.0
+    phase = np.empty(power.shape, dtype=np.float64)
+    rows = max(1, _GATE_WORK_BYTES // max(1, 8 * int(np.prod(power.shape[1:]))))
+    for first in range(0, power.shape[0], rows):
+        block = slice(first, min(power.shape[0], first + rows))
+        ramp = sign * 2.0 * projection[block, :, None] * wavenumber[None, None, :]
+        shifted = np.asarray(phase_in[block], dtype=np.float64) + ramp[..., None] + np.pi
+        phase[block] = np.remainder(shifted, 2.0 * np.pi) - np.pi
+
+    units = dict(dataset.units or {})
+    extra = _derived_response_extra(dataset)
+    previous = np.zeros(3)
+    if "phase_center_translation_json" in extra:
+        try:
+            previous = np.asarray(
+                json.loads(str(extra["phase_center_translation_json"]))["total_offset_m"],
+                dtype=float,
+            )
+        except (ValueError, KeyError, TypeError):
+            previous = np.zeros(3)
+    total = previous + offset
+    extra["phase_center_translation_json"] = json.dumps(
+        {
+            "schema": "grim.phase-center-translation.v1",
+            "last_offset_m": offset.tolist(),
+            "total_offset_m": total.tolist(),
+            "direction_convention": "coming-from radar u=(cos el cos az, cos el sin az, sin el)",
+            "time_convention": "exp(-jwt)" if sign > 0 else "exp(+jwt)",
+        },
+        sort_keys=True,
+    )
+    note = f"moved by ({offset[0]:g}, {offset[1]:g}, {offset[2]:g}) m in body axes"
+    for container in (units, extra):
+        declared = container.get("phase_reference")
+        if declared is None or np.asarray(declared).size != 1:
+            continue
+        text = str(np.asarray(declared).reshape(-1)[0].item()).strip()
+        if text:
+            container["phase_reference"] = f"{text}; {note}"
+    return RcsGrid(
+        dataset.azimuths,
+        dataset.elevations,
+        dataset.frequencies,
+        dataset.polarizations,
+        rcs_power=power,
+        rcs_phase=phase,
+        rcs_domain="complex_amplitude",
+        source_path=dataset.source_path,
+        history=dataset.history,
+        units=units,
+        extra=extra,
+    )

@@ -52,7 +52,7 @@ def build_qss(palette: Mapping[str, object]) -> str:
     QGroupBox {{ color: {palette['text']}; border: 1px solid {palette['border']}; border-radius: 8px; margin-top: 10px; }}
     QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}
     QLabel {{ color: {palette['text']}; }}
-    QTableWidget {{
+    QTableWidget, QTableView {{
         background: {palette['panel_bg']}; color: {palette['text']};
         alternate-background-color: {palette['head_bg']};
         border: 1px solid {palette['border']}; gridline-color: {palette['grid']};
@@ -118,7 +118,7 @@ def build_qss(palette: Mapping[str, object]) -> str:
     }}
     QToolButton:checked {{ background: {palette['checked_bg']}; color: white; border-color: {palette['checked_border']}; }}
     QComboBox QAbstractItemView {{ background: {palette['panel_bg']}; color: {palette['text']}; border: 1px solid {palette['border']}; }}
-    QTableWidget::item:selected {{ background: {palette['checked_bg']}; color: white; }}
+    QTableWidget::item:selected, QTableView::item:selected {{ background: {palette['checked_bg']}; color: white; }}
     QProgressBar {{
         background: {palette['head_bg']}; color: {palette['text']};
         border: 1px solid {palette['border']}; border-radius: 5px;
@@ -154,6 +154,7 @@ def build_qss(palette: Mapping[str, object]) -> str:
         border-radius: 7px;
     }}
     QLabel#featurePanelIntro {{ font-size: 13px; font-weight: 600; padding: 2px 1px; }}
+    QWidget#vehicleAssemblyPanel QLabel {{ border: none; }}
     QLabel#featureWorkflowSteps {{
         background: {palette['head_bg']}; color: {palette['text']};
         border: 1px solid {palette['border']}; border-radius: 6px;

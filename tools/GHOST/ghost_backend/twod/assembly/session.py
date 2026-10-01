@@ -20,6 +20,8 @@ class AssemblySession:
         # The latest batch's polynomial plane-wave loads (kernels.incident_loads),
         # reused as monostatic far-field weights; released with the session.
         self.plane_wave_loads = {}
+        from ghost_backend.linalg.sweep import CompressionHint
+        self.compression_hint = CompressionHint()
 
     def checkpoint(self):
         if self.abort_event is not None and self.abort_event.is_set():

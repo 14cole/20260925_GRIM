@@ -1001,8 +1001,8 @@ def _preflight_base_grim_zip(
     embedded_bor = bool(has_rho and has_z and has_requested_grid)
     if embedded_bor:
         summary = (
-            "Embedded BoR geometry detected; a separate mesh is optional unless "
-            "geometric shadowing is enabled."
+            "Embedded BoR geometry detected; placement and shadowing can use "
+            "it directly."
         )
     elif has_rho and has_z:
         summary = (
@@ -1012,7 +1012,7 @@ def _preflight_base_grim_zip(
     else:
         summary = (
             "External 3-D body response detected; choose its matching STL/facet "
-            "surface before validation."
+            "surface for feature placement or shadowing."
         )
     return BaseGrimPreflight(
         True,
@@ -2268,9 +2268,6 @@ class FeatureAssemblyFormModel:
         values = self.values
         return adapter.request_factory(
             **{key: getattr(values, key) for key in ("study_frequencies_ghz", "study_azimuths_deg", "study_elevations_deg")},
-            host_material=values.host_material,
-            host_stack_id=values.host_stack_id,
-            host_minimum_radius_m=values.host_minimum_radius_m,
             base_grim=_clean_path(values.base_grim),
             output_grim=_clean_path(values.output_grim),
             coordinate_units=values.coordinate_units,
@@ -2325,7 +2322,6 @@ class FeatureAssemblyFormModel:
 
         return (
             path_signature(values.base_grim),
-            values.host_material, values.host_stack_id, values.host_minimum_radius_m,
             values.study_frequencies_ghz, values.study_azimuths_deg, values.study_elevations_deg,
             path_signature(values.output_grim, output=True),
             values.coordinate_units,

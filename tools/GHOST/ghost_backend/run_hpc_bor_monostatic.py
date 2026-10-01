@@ -575,9 +575,7 @@ def _spill_directory():
 
 def _channel_result(result, polarization):
     # type: (Dict[str, Any], str) -> Dict[str, Any]
-    samples = list(
-        (result.get("co_solved_samples", {}) or {}).get(polarization, []) or []
-    )
+    samples = (result.get("co_solved_samples", {}) or {}).get(polarization, [])
     if not samples:
         raise RuntimeError(
             f"BoR solve did not return its co-solved {polarization} channel."
@@ -646,6 +644,8 @@ def _solve_and_export(pair, snapshot, material_base, run_dir_str):
     solver_config = dict(manifest.get("solver_config", {}) or {})
     solve = (solve_monostatic_rcs_bor_certified if certified
              else solve_monostatic_rcs_bor_survey)
+    from ghost_backend.twod.samples import compact_samples
+    solve = compact_samples()(solve)
     quality_kwargs = ({"mesh_convergence_policy": validate_mesh_convergence_policy(
         solver_config.get("mesh_convergence_policy")
     )} if certified else {})

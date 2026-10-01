@@ -57,9 +57,10 @@ class BoundaryDensityViewTests(unittest.TestCase):
         np.testing.assert_allclose(hh.collections[1].get_array(), [1., 2.])
         np.testing.assert_allclose(np.sort(vv.collections[1].get_segments(), axis=1),
                                    [[[.5, 0.], [1.5, 0.]], [[9.5, 0.], [10.5, 0.]]])
-        self.assertEqual(self.ui.table_results.rowCount(), 4)
-        self.assertEqual(self.ui.table_results.item(0, 6).text(), "5")
-        self.assertEqual(self.ui.table_results.item(1, 7).text(), "undefined")
+        model = self.ui.table_results.model()
+        self.assertEqual(model.rowCount(), 4)
+        self.assertEqual(model.data(model.index(0, 6)), "5")
+        self.assertEqual(model.data(model.index(1, 7)), "undefined")
         self.assertIn("3 GHz | 12 deg", self.ui.lbl_result_details.text())
         self.assertFalse(self.ui._is_computing_density)
 
@@ -77,10 +78,10 @@ class BoundaryDensityViewTests(unittest.TestCase):
         self.assertIs(self.ui.last_result, rcs)
         self.assertEqual(len(self.ui.canvas.fig.axes), 1)
         self.assertEqual(len(self.ui.canvas.ax.lines), 1)
-        self.assertEqual(self.ui.table_results.rowCount(), 1)
+        self.assertEqual(self.ui.table_results.model().rowCount(), 1)
         self.ui.cmb_result_view.setCurrentIndex(1)
         self.assertEqual(len(self.ui.canvas.fig.axes), 4)
-        self.assertEqual(self.ui.table_results.rowCount(), 4)
+        self.assertEqual(self.ui.table_results.model().rowCount(), 4)
 
     def test_input_replacement_and_queued_cancellation_leave_prior_density_intact(self):
         for cancel in (False, True):

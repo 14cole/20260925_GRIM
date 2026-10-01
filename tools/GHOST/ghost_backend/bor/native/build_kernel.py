@@ -28,6 +28,7 @@ REQUIRED_SYMBOLS = (
 
 _LOAD_CHECK = (
     "import ctypes, sys\n"
+    "if sys.platform == 'win32': ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)\n"
     "lib = ctypes.CDLL(sys.argv[1])\n"
     "missing = [s for s in sys.argv[2:] if not hasattr(lib, s)]\n"
     "if missing:\n"
@@ -161,11 +162,17 @@ def main() -> int:
         # Validate exactly the runtime environment a fresh worker will have.
         # Loading here with add_dll_directory(compiler/bin) concealed missing
         # redistributables, and retained a Windows mapping of the staged DLL.
-        checked = subprocess.run(
-            [sys.executable, "-I", "-c", _LOAD_CHECK, str(temporary), *REQUIRED_SYMBOLS],
-            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            universal_newlines=True,
-        )
+        try:
+            checked = subprocess.run(
+                [sys.executable, "-I", "-c", _LOAD_CHECK, str(temporary), *REQUIRED_SYMBOLS],
+                check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SystemExit(
+                f"Native BoR sampler load check timed out for {temporary.name}. "
+                "The previous library was not replaced."
+            ) from exc
         if checked.returncode != 0:
             raise SystemExit(
                 "Native BoR sampler load check failed for "

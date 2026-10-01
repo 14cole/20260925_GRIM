@@ -837,13 +837,16 @@ def test_memory_heavy_geometry():
 
 def test_resource_detection():
     print("\nresource detection")
+    with mock.patch.dict(os.environ, {'SLURM_CPUS_PER_TASK': '', 'SLURM_CPUS_ON_NODE': ''}):
+        available_cores = hpc_scheduler.detect_cores()
     saved = {name: os.environ.get(name) for name in
              ("SLURM_CPUS_PER_TASK", "SLURM_MEM_PER_NODE", "SLURM_MEM_PER_CPU")}
     try:
         os.environ["SLURM_CPUS_PER_TASK"] = "96"
         os.environ["SLURM_MEM_PER_NODE"] = str(750 * 1024)
         os.environ.pop("SLURM_MEM_PER_CPU", None)
-        check(hpc_scheduler.detect_cores() == 96, "SLURM core count is honoured")
+        check(hpc_scheduler.detect_cores() == min(96, available_cores),
+              "SLURM core count is bounded by this process's host and affinity")
         check(abs(hpc_scheduler.detect_memory_gb() - 750.0) < 1.0,
               "SLURM node memory is honoured over /proc/meminfo")
         os.environ.pop("SLURM_MEM_PER_NODE")

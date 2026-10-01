@@ -1,6 +1,5 @@
 """Small workflow actions layered onto the existing validated assembly form."""
 from __future__ import annotations
-import copy
 import os
 from pathlib import Path
 
@@ -124,7 +123,7 @@ class AssemblyWorkflowMixin:
         if target.exists():
             raise ValueError('Choose a new recipe filename to preserve existing variants.')
         self._pull_values()
-        values = copy.deepcopy(self.model.values)
+        values = self.recipe_values_with_vehicle_placements(target)
         stem = target.name.removesuffix('.assembly.json').removesuffix('.json')
         output = target.with_name(stem + '_total.grim')
         suffix = 2
@@ -177,7 +176,7 @@ class AssemblyWorkflowMixin:
             'Surface mesh units': (0,self.surface_units), 'Reviewed solve ↔ mesh binding': (0,self.check_surface_binding_button),
             'Placement coordinate units': (feature_tab,self.coordinate_units),
             'Placement CSV selected': (feature_tab,self.point_csv_picker if feature_tab==1 else self.line_csv_picker),
-            'Placement CSV read': (feature_tab,self.scan_button),
+            'Placement CSV read': (3,self.scan_button),
             'Every dataset_id mapped': (feature_tab,feature_mapping.table),
             'Mapped response files available': (feature_tab,feature_mapping.table),
             'Output response selected': (3,self.output_picker),

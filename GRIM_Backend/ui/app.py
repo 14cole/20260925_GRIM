@@ -51,6 +51,7 @@ from GRIM_Backend.assembly.panel import FeatureAssemblyPanel
 from GRIM_Backend.integrations.freddy import FreddyIntegrationWidget
 from GRIM_Backend.integrations.ghost import GhostIntegrationWidget, load_ghost_module
 from GRIM_Backend.datasets.grid import RcsGrid
+from GRIM_Backend.ui.analysis_controls import PlotAnalysisControls, PlotSliderBar
 from GRIM_Backend.ui.dataset_sidebar import DatasetSidebar, DatasetTable
 from GRIM_Backend.ui.widgets import (
     ClickableLabel, CollapsibleSection, PlotSettingsPopup, initial_window_size,
@@ -83,7 +84,7 @@ from GRIM_Backend.ui.palette import (
 SPLASH_DURATION_MS = 4000
 
 
-# Plot-operation buttons, per tab: (row1_specs, row2_specs). Each spec is
+# Plot-operation buttons, per tab: a tuple of toolbar rows. Each spec is
 # (button label, role key). Roles drive both the attribute wiring in
 # _activate_plot_tab and the signal connections in __init__.
 PLOT_OPS_SPECS = {
@@ -109,6 +110,14 @@ PLOT_OPS_SPECS = {
             ("Auto Scale", "auto_scale"),
             ("PbP", "pbp"),
             ("Phase", "phase"),
+        ),
+        (
+            ("CDF", "cdf"),
+            ("Sector Stats", "sector_stats"),
+            ("Range–Freq", "range_freq"),
+            ("Δ Ref", "delta_ref"),
+            ("Markers", "markers"),
+            ("Slider", "slider"),
         ),
     ),
     "isar": (
@@ -455,6 +464,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             ("Offset", "btn_offset"),
             ("Medianize", "btn_medianize"),
             ("Duplicate", "btn_duplicate"),
+            ("Time Gate…", "btn_time_gate"),
         ))
         _ops_pad("Calibration", (
             ("Range Cal", "btn_range_cal"),
@@ -501,6 +511,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             ("SENTRi El→GRIM", "btn_sentri_elevation"),
             ("Extrusion…", "btn_extrusion"),
             ("Wedge → Conic", "btn_wedge_to_conic"),
+            ("Phase Center…", "btn_phase_center"),
         ))
         self.btn_axis_units.setToolTip(
             "Convert stored angle and frequency coordinates between equivalent "
@@ -512,6 +523,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             "top-down, -90° bottom-up). Samples are reordered with the "
             "monotonically increasing elevation axis; no interpolation or "
             "phase change is applied."
+        )
+        self.btn_phase_center.setToolTip(
+            "Move the phase reference to a point (x, y, z) in body axes: exact "
+            "phase ramp per angle and frequency, levels unchanged. Needs phase."
         )
         self.btn_wedge_to_conic.setToolTip(
             "Convert a vertical-turntable/body-y-wedge acquisition into the "
@@ -601,6 +616,11 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 "result has unknown phase and cannot be used as a coherent field."
             ),
             "btn_duplicate": "Create an independent editable copy of each selected dataset.",
+            "btn_time_gate": (
+                "Keep or remove a down-range window: inverse FFT over frequency, "
+                "gate, and FFT back, with a live range-profile preview. Needs "
+                "complex data on a uniform frequency grid."
+            ),
             "btn_el_to_az360": (
                 "Convert a compatible elevation cut into a 0–360° azimuth cut. Seam "
                 "conflicts are rejected."
@@ -835,6 +855,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_dataset_selection_changed)
         self.table.itemChanged.connect(self._on_dataset_table_item_changed)
         self.table.customContextMenuRequested.connect(self._on_dataset_context_menu)
+        # Rows restored by Undo Delete carry whatever marker they had then.
+        self.table.model().rowsInserted.connect(
+            lambda *_: QTimer.singleShot(0, self._refresh_delta_reference_marker)
+        )
         self.table.horizontalHeader().sectionDoubleClicked.connect(self._on_dataset_header_double_clicked)
         for context in self._plot_contexts.values():
             context.delta_map_controls.changed.connect(self._on_delta_map_controls_changed)
@@ -853,6 +877,20 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             context.plot_canvas.mpl_connect("button_press_event", self._on_plot_mouse_press)
             context.plot_canvas.mpl_connect("motion_notify_event", self._on_plot_mouse_move)
             context.plot_canvas.mpl_connect("button_release_event", self._on_plot_mouse_release)
+        # Clicking the Plotting canvas takes keyboard focus, so Delete removes
+        # the selected curve instead of reaching the dataset table.
+        plotting_canvas = self._plot_contexts["plotting"].plot_canvas
+        plotting_canvas.setFocusPolicy(Qt.ClickFocus)
+        plotting_canvas.mpl_connect("key_press_event", self._on_plot_key_press)
+        plotting_context = self._plot_contexts["plotting"]
+        plotting_context.analysis_controls.changed.connect(self._on_analysis_setting_changed)
+        plotting_context.plot_slider.moved.connect(self._on_plot_slider_moved)
+        plotting_context.plot_slider.axis_changed.connect(self._refresh_plot_slider)
+        plotting_context.plot_slider.shown.connect(self._schedule_plot_slider_refresh)
+        for axis_list in (self.list_freq, self.list_elev, self.list_az):
+            axis_list.itemSelectionChanged.connect(self._schedule_plot_slider_refresh)
+            axis_list.model().rowsInserted.connect(self._schedule_plot_slider_refresh)
+            axis_list.model().rowsRemoved.connect(self._schedule_plot_slider_refresh)
         self.list_pol.itemSelectionChanged.connect(self._on_polarization_selection_changed)
         self.list_freq.itemSelectionChanged.connect(self._on_param_selection_changed)
         self.list_elev.itemSelectionChanged.connect(self._on_param_selection_changed)
@@ -879,6 +917,18 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 controls["compare"].clicked.connect(self._plot_compare)
             if "delta_map" in controls:
                 controls["delta_map"].clicked.connect(self._plot_delta_map)
+            if "cdf" in controls:
+                controls["cdf"].clicked.connect(self._plot_cdf)
+            if "sector_stats" in controls:
+                controls["sector_stats"].clicked.connect(self._plot_sector_stats)
+            if "range_freq" in controls:
+                controls["range_freq"].clicked.connect(self._plot_range_freq)
+            if "delta_ref" in controls:
+                controls["delta_ref"].toggled.connect(self._on_delta_ref_toggled)
+            if "markers" in controls:
+                controls["markers"].toggled.connect(self._on_markers_toggled)
+            if "slider" in controls:
+                controls["slider"].toggled.connect(self._on_plot_slider_toggled)
             if "clear" in controls:
                 controls["clear"].clicked.connect(self._clear_plot)
             if "fit_x" in controls:
@@ -917,6 +967,9 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 "compare",
                 "delta_map",
                 "az_vs_range",
+                "cdf",
+                "sector_stats",
+                "range_freq",
             ):
                 button = controls.get(recorded_mode)
                 if button is not None:
@@ -956,6 +1009,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_provenance.clicked.connect(self._provenance_selected_datasets)
         self.btn_medianize.clicked.connect(self._medianize_selected)
         self.btn_duplicate.clicked.connect(self._duplicate_selected)
+        self.btn_time_gate.clicked.connect(self._time_gate_selected)
         self.btn_el_to_az360.clicked.connect(self._elevation_to_azimuth_360_selected)
         self.btn_swap_el_az.clicked.connect(self._swap_elevation_azimuth_selected)
         self.btn_axis_units.clicked.connect(self._convert_axis_units_selected)
@@ -964,6 +1018,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         )
         self.btn_extrusion.clicked.connect(self._convert_extrusion_selected)
         self.btn_wedge_to_conic.clicked.connect(self._convert_wedge_to_conic_selected)
+        self.btn_phase_center.clicked.connect(self._phase_center_selected)
         self.btn_dataset_load.clicked.connect(self._load_dataset_files)
         self.btn_dataset_save.clicked.connect(self._save_selected_datasets)
         self.btn_dataset_save_all.clicked.connect(self._save_all_datasets)
@@ -1380,6 +1435,11 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         # ISAR formation controls live in their own nested section.  The
         # section is only inserted into the ISAR popup; the PlotContext still
         # owns compatible widgets so its public API remains unchanged.
+        analysis_controls = None
+        if tab_key == "plotting":
+            analysis_controls = PlotAnalysisControls(settings_frame)
+            row = analysis_controls.add_rows(settings_layout, row)
+
         common_settings_layout = settings_layout
         common_row = row
         isar_settings_section = QWidget(settings_frame.content_widget)
@@ -1717,6 +1777,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         delta_map_controls = DeltaMapControls()
         plot_layout.addWidget(delta_map_controls)
         plot_layout.addWidget(plot_canvas, 1)
+        plot_slider = None
+        if tab_key == "plotting":
+            plot_slider = PlotSliderBar()
+            plot_layout.addWidget(plot_slider)
         hover_readout = QLabel("x: --   y: --")
         hover_readout.setObjectName("hoverReadout")
         hover_readout.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1739,12 +1803,15 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         # two rows so the toolbar's minimum width stays narrow (otherwise a
         # single long row forces the whole plot area wider than the screen and
         # pushes the right-hand buttons off-screen when the side panels open).
-        row1_specs, row2_specs = PLOT_OPS_SPECS[tab_key]
+        row_specs = PLOT_OPS_SPECS[tab_key]
         plot_controls: dict[str, QToolButton] = {}
 
         def _make_plot_button(label: str, role: str) -> QToolButton:
             btn = QToolButton(text=label)
-            if role in ("hold", "auto_plot", "auto_scale", "pbp", "phase", "zoom_box", "pan"):
+            if role in (
+                "hold", "auto_plot", "auto_scale", "pbp", "phase", "zoom_box", "pan",
+                "markers", "slider", "delta_ref",
+            ):
                 btn.setCheckable(True)
             if role == "auto_scale":
                 btn.setChecked(tab_key == "plotting")
@@ -1759,6 +1826,47 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 )
             if role == "delta_map":
                 btn.setToolTip("Signed A - B level differences for two datasets over two selected axes; choose the fixed third coordinate in the plot controls.")
+            tooltips = {
+                "cdf": (
+                    "Share of samples at or below (or above) each level, one curve per "
+                    "dataset pooled over the selected azimuths, elevations, and "
+                    "frequencies. Choose cumulative or exceedance in Plot Settings."
+                ),
+                "sector_stats": (
+                    "Mean, median, max, min, or a percentile of linear power inside "
+                    "each azimuth sector, drawn over the sector. Set the sectors and "
+                    "statistic in Plot Settings; right-click to copy the table."
+                ),
+                "range_freq": (
+                    "Down-range profiles over sliding frequency sub-bands, averaged "
+                    "over the selected azimuths and elevations. Point scatterers stay "
+                    "at one range; cavities and travelling waves drift. Needs complex "
+                    "data on uniformly spaced frequencies; set the sub-band in Plot "
+                    "Settings."
+                ),
+                "markers": (
+                    "Click near a curve to drop a marker on the nearest data point; "
+                    "drag it along the curve or step it with the arrow keys."
+                ),
+                "slider": (
+                    "Show a slider that steps one parameter list (frequency, "
+                    "elevation, or azimuth) and re-plots at each value."
+                ),
+                "delta_ref": (
+                    "Plot each selected dataset minus the Δ reference in dB on "
+                    "Azimuth (Rect), Frequency, and Elevation Sweep plots. Right-click "
+                    "a dataset and choose Set as Δ reference to pick it (marked Δ in "
+                    "the table); otherwise the active row is used. Set a ± tolerance "
+                    "band in Plot Settings."
+                ),
+                "pbp": (
+                    "Point-by-point band across the selected series. Datasets with a "
+                    "PbP Group in the table get one band per group; choose Min–Max or "
+                    "percentile bands in Plot Settings."
+                ),
+            }
+            if role in tooltips:
+                btn.setToolTip(tooltips[role])
             return btn
 
         # Legend toggle sits at the head of the toolbar (left of Hold); it
@@ -1773,7 +1881,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         plot_ops_bar_layout = QVBoxLayout(plot_ops_bar)
         plot_ops_bar_layout.setContentsMargins(8, 6, 8, 6)
         plot_ops_bar_layout.setSpacing(4)
-        for _row_index, _specs in enumerate((row1_specs, row2_specs)):
+        for _row_index, _specs in enumerate(row_specs):
             bar_row = QHBoxLayout()
             bar_row.setSpacing(4)
             if _row_index == 0:
@@ -1853,6 +1961,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             plot_text_color=None,
             last_plot_mode=None,
             delta_map_controls=delta_map_controls,
+            analysis_controls=analysis_controls,
+            plot_slider=plot_slider,
         )
 
     def _move_shared_right_panel(self, tab_key: str) -> None:
@@ -1921,6 +2031,11 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_phase = controls.get("phase")
         self.btn_zoom_box = controls.get("zoom_box")
         self.btn_pan = controls.get("pan")
+        self.btn_markers = controls.get("markers")
+        self.btn_slider = controls.get("slider")
+        self.btn_delta_ref = controls.get("delta_ref")
+        self.btn_cdf = controls.get("cdf")
+        self.btn_sector_stats = controls.get("sector_stats")
 
         context = self._plot_contexts[tab_key]
         if tab_key == "isar":
@@ -2230,7 +2345,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             operation = self.ppt_workspace.busy_operation() or "PowerPoint report export"
             QMessageBox.warning(
                 self,
-                "PowerPoint Export Still Running",
+                "Report Export Still Running",
                 f"{operation} is still running. Wait for it to finish before "
                 "closing GRIM.",
             )

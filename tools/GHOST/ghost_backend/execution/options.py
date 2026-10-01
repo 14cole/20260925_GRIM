@@ -6,6 +6,7 @@ import math
 import ntpath
 import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import time
@@ -125,6 +126,38 @@ def efficient_defaults():
     return values
 
 
+_PSUTIL_MISSING = False
+_PSUTIL_IMPORT_LOCK = threading.Lock()
+
+
+def _optional_psutil():
+    """Avoid repeatedly searching for an absent optional package.
+
+    Only module absence is cached, never CPU counts or affinity. An already
+    loaded module (including one loaded after an earlier miss) takes priority.
+    Other import failures remain retryable and keep the native fallback.
+    """
+    global _PSUTIL_MISSING
+    if 'psutil' in sys.modules:
+        return sys.modules['psutil']
+    if _PSUTIL_MISSING:
+        return None
+    with _PSUTIL_IMPORT_LOCK:
+        if 'psutil' in sys.modules:
+            return sys.modules['psutil']
+        if _PSUTIL_MISSING:
+            return None
+        try:
+            import psutil
+        except ModuleNotFoundError as exc:
+            if exc.name == 'psutil':
+                _PSUTIL_MISSING = True
+            return None
+        except Exception:
+            return None
+        return psutil
+
+
 def _usable_logical_cpus():
     """Logical CPUs this process may use: affinity mask and SLURM task allocation."""
     count = os.cpu_count() or 1
@@ -133,6 +166,31 @@ def _usable_logical_cpus():
             count = min(count, len(os.sched_getaffinity(0)))
         except OSError:
             pass
+    else:
+        # Windows has no sched_getaffinity. Respect a restricted desktop/job
+        # affinity too, while keeping psutil optional for headless installs.
+        affinity = None
+        try:
+            psutil = _optional_psutil()
+            if psutil is not None:
+                affinity = psutil.Process().cpu_affinity()
+        except Exception:
+            pass
+        if affinity:
+            count = min(count, len(affinity))
+        elif os.name == 'nt':
+            try:
+                import ctypes
+                kernel = ctypes.windll.kernel32
+                kernel.GetCurrentProcess.restype = ctypes.c_void_p
+                kernel.GetProcessAffinityMask.argtypes = (ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t))
+                process_mask, system_mask = ctypes.c_size_t(), ctypes.c_size_t()
+                if kernel.GetProcessAffinityMask(kernel.GetCurrentProcess(),
+                        ctypes.byref(process_mask), ctypes.byref(system_mask)) and process_mask.value:
+                    count = min(count, bin(process_mask.value).count('1'))
+            except (AttributeError, OSError):
+                pass
     for name in ('SLURM_CPUS_PER_TASK', 'SLURM_CPUS_ON_NODE'):
         raw = os.environ.get(name, '').strip()
         if raw.isdigit() and int(raw) > 0:
@@ -149,8 +207,9 @@ def physical_core_count():
     if not _PHYSICAL_CORES:
         count = None
         try:
-            import psutil
-            count = psutil.cpu_count(logical=False)
+            psutil = _optional_psutil()
+            if psutil is not None:
+                count = psutil.cpu_count(logical=False)
         except Exception:
             count = None
         _PHYSICAL_CORES.append(max(1, int(count or os.cpu_count() or 1)))
@@ -241,13 +300,13 @@ def effective_assembly_threads(fallback=1):
     """
     active = _ACTIVE.get()
     if active is None:
-        return fallback
+        return min(max(1, int(fallback)), allocated_cpu_budget())
     requested = active['assembly_threads']
-    allocation = _ASSEMBLY_ALLOCATION.get()
+    allocation = allocated_cpu_budget()
     if requested == 'auto':
         host = host_assembly_threads()
-        return min(allocation, host) if allocation else host
-    return min(requested, allocation) if allocation is not None else requested
+        return min(allocation, host)
+    return min(requested, allocation)
 
 
 def allocated_memory_budget():
@@ -255,8 +314,17 @@ def allocated_memory_budget():
 
 
 def allocated_cpu_budget():
-    """Scheduler reservation, or the host CPU count for an independent solve."""
-    return max(1, int(_ASSEMBLY_ALLOCATION.get() or os.cpu_count() or 1))
+    """Usable affinity/SLURM CPUs, bounded by this solve's reservation."""
+    usable = _usable_logical_cpus()
+    return max(1, min(usable, int(_ASSEMBLY_ALLOCATION.get() or usable)))
+
+
+@contextmanager
+def cpu_allocation_scope(cpus):
+    """Temporarily lend part of a CPU reservation without changing the profile."""
+    count = min(allocated_cpu_budget(), max(1, int(cpus)))
+    with _ASSEMBLY_ALLOCATION.override(count):
+        yield count
 
 
 def blas_core_budget():
@@ -360,6 +428,11 @@ def execution_scope(value, limit_blas=False, assembly_threads=None, memory_budge
     """Restore settings after completion or failure; optionally control native BLAS."""
     checked = validate_options(value)
     allocation = assembly_threads if assembly_threads is not None else _ASSEMBLY_ALLOCATION.get()
+    if allocation is not None:
+        allocation = max(1, int(allocation))
+        inherited_allocation = _ASSEMBLY_ALLOCATION.get()
+        if inherited_allocation is not None:
+            allocation = min(allocation, inherited_allocation)
     memory=memory_budget_gib if memory_budget_gib is not None else _MEMORY_ALLOCATION.get()
     if memory is not None and (not math.isfinite(memory) or memory <= 0):
         raise ValueError('Allocated solve memory must be positive and finite.')

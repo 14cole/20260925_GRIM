@@ -115,10 +115,18 @@ class RunSetupMixin:
         if value['execution_options']['factorization'] == 'adaptive':
             from ghost_backend.execution.selection import select_backend
             from ghost_backend.runs.quality import accuracy_target_policy
-            selection = select_backend(dict(geometry_snapshot=snapshot, material_base_dir=base_dir,
+            arguments = dict(geometry_snapshot=snapshot, material_base_dir=base_dir,
                 geometry_units=value['units'], frequencies_ghz=value['frequencies_ghz'],
                 elevations_deg=value['angles_deg'], solver_method=value['solver_method'], max_panels=100000,
-                mesh_convergence_policy=accuracy_target_policy(value['accuracy'])), value['execution_options'], value['mesh_certification'], checkpoint)
+                mesh_convergence_policy=accuracy_target_policy(value['accuracy']))
+            # Execution finishes both channels per frequency. Forecast those
+            # same requests so its run-scoped cache can serve the actual solve.
+            selections = [select_backend(dict(arguments, frequencies_ghz=[frequency]),
+                value['execution_options'], value['mesh_certification'], checkpoint)
+                for frequency in value['frequencies_ghz']]
+            selection = dict(selected='/'.join(sorted({s['selected'] for s in selections})),
+                dense_peak_gib=max(s['dense_peak_gib'] for s in selections),
+                admission_budget_gib=min(s['admission_budget_gib'] for s in selections))
             selection_note = 'Planned backend: {}. Dense peak forecast {:.2f} GiB; admission budget {:.2f} GiB.\n'.format(
                 selection['selected'], selection['dense_peak_gib'], selection['admission_budget_gib'])
         warnings = list(result['warnings']) + list(library.warnings)

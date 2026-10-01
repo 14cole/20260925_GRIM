@@ -71,6 +71,65 @@ def geometry_arrays(mesh, element_mask=None):
             np.array([e.normal for e in elements],dtype=float).reshape(-1,2))
 
 
+PROJECTION_CACHE_BYTES = 8 * 1024**2
+
+
+class GridProjection:
+    """One solve's bounded, immutable observation weights for repeated RHS batches.
+
+    Cache only unweighted moments. DLP weights are made in the caller's existing
+    tile workspace, so SLP and DLP share the expensive phase evaluation without
+    retaining two copies. Once the cap is reached, uncached tiles use the usual
+    bounded calculation; there is no eviction/rebuild loop on a large mesh.
+    """
+    def __init__(self, mesh, k, observations, budget_bytes=PROJECTION_CACHE_BYTES):
+        self.mesh, self.k = mesh, float(k)
+        dirs = directions(observations)
+        self.direction_key = (dirs.shape, hashlib.sha256(dirs.tobytes()).digest())
+        self.budget = max(0, int(budget_bytes))
+        self.bytes = 0
+        self.geometry, self.weights = {}, {}
+        self.hits = self.builds = 0
+
+    def arrays(self, mesh, k, dirs, mask):
+        direction_key = (dirs.shape, hashlib.sha256(dirs.tobytes()).digest())
+        if mesh is not self.mesh or float(k) != self.k or direction_key != self.direction_key:
+            raise ValueError('Prepared projection belongs to another mesh, frequency or observation grid.')
+        key = None if mask is None else np.asarray(mask, bool).reshape(-1).tobytes()
+        arrays = self.geometry.get(key)
+        if arrays is None:
+            arrays = geometry_arrays(mesh, mask)
+            size = sum(a.nbytes for a in arrays) + (0 if key is None else len(key))
+            if self.bytes + size <= self.budget:
+                for array in arrays:
+                    array.flags.writeable = False
+                self.geometry[key] = arrays
+                self.bytes += size
+        return key, arrays
+
+    def moments(self, key, part, arrays, dirs):
+        token = (key, part.start, part.stop)
+        value = self.weights.get(token)
+        if value is not None:
+            self.hits += 1
+            return value
+        ids, centers, edges, lengths, _ = arrays
+        if ids.shape[1] > 2:
+            value = plane_wave_moments(centers[part], edges[part], lengths[part], self.k,
+                                      dirs, ids.shape[1]-1)
+        else:
+            value = moments(centers[part], edges[part], lengths[part], self.k, dirs)
+        self.builds += 1
+        buffers = (value,) if isinstance(value, np.ndarray) else value
+        size = sum(a.nbytes for a in buffers)
+        if self.bytes + size <= self.budget:
+            for array in buffers:
+                array.flags.writeable = False
+            self.weights[token] = value
+            self.bytes += size
+        return value
+
+
 def _load_cache():
     """The solve's plane-wave load slot while a monostatic batch is open, else None.
 
@@ -102,7 +161,7 @@ def _cached_loads(mesh, k, dirs, element_mask):
 
 @timed_stage("far_field")
 def farfield(mesh,density,k_air,observation_angles_deg,potential,order=8,
-             element_mask=None,projection="matched"):
+             element_mask=None,projection="matched",prepared_projection=None):
     dirs = directions(observation_angles_deg)
     rho = np.asarray(density,dtype=np.complex128)
     if rho.ndim==1: rho=rho[:,None]
@@ -112,7 +171,12 @@ def farfield(mesh,density,k_air,observation_angles_deg,potential,order=8,
         raise ValueError("Unsupported projection/potential")
     if projection=="matched" and rho.shape[1] not in (1,len(dirs)):
         raise ValueError("Matched projection needs one or angle-count columns")
-    ids,centers,edges,lengths,normals=geometry_arrays(mesh,element_mask)
+    plan = prepared_projection if projection == 'grid' else None
+    if plan is None:
+        arrays = geometry_arrays(mesh,element_mask)
+    else:
+        key, arrays = plan.arrays(mesh, k_air, dirs, element_mask)
+    ids,centers,edges,lengths,normals=arrays
     if ids.shape[1] > 2 and projection == "matched":
         # A monostatic batch observes along its incidence directions, where the
         # far-field weights (plane-wave moments, times j k n.d for a DLP) are
@@ -127,20 +191,26 @@ def farfield(mesh,density,k_air,observation_angles_deg,potential,order=8,
             return np.einsum('na,na->a', rho, weights)
     result = np.zeros((rho.shape[1],len(dirs)) if projection=="grid" else len(dirs),dtype=complex)
 
-    block=max(1,min(len(ids),250000//len(dirs)))
+    block=max(1,min(len(ids),250000//max(1,len(dirs))))
     for start in range(0,len(ids),block):
         part=slice(start,start+block)
         if ids.shape[1] > 2:
-            moments_all = plane_wave_moments(centers[part], edges[part], lengths[part], k_air, dirs, ids.shape[1]-1)
+            moments_all = (plane_wave_moments(centers[part], edges[part], lengths[part], k_air, dirs, ids.shape[1]-1)
+                           if plan is None else plan.moments(key, part, arrays, dirs))
             if potential == 'DLP':
+                if plan is not None:
+                    moments_all = moments_all.copy()
                 moments_all *= (1j*float(k_air)*(normals[part] @ dirs.T))[:, None, :]
             for local in range(ids.shape[1]):
                 if projection == 'grid': result += rho[ids[part, local]].T @ moments_all[:, local]
                 else: result += np.sum(rho[ids[part, local]] * moments_all[:, local], axis=0)
             continue
-        i0,i1=moments(centers[part],edges[part],lengths[part],k_air,dirs)
+        i0,i1=(moments(centers[part],edges[part],lengths[part],k_air,dirs)
+               if plan is None else plan.moments(key, part, arrays, dirs))
         if potential=="DLP":
             factor=1j*float(k_air)*(normals[part] @ dirs.T)
+            if plan is not None:
+                i0, i1 = i0.copy(), i1.copy()
             i0*=factor;i1*=factor
         if projection=="grid":
             result += rho[ids[part,0]].T @ i0 + rho[ids[part,1]].T @ i1

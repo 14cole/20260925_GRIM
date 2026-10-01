@@ -35,8 +35,15 @@ def output_reserved_gb():
 
 
 def estimate_output_gb(frequencies, aspects, certified=False, expanded=False):
-    """Two polarizations, row dictionaries/copies, sorting and base/fine overlap."""
-    return 2048. * int(frequencies) * int(aspects) * 2 * (2 if expanded else 1) * (2 if certified else 1) / 1e9
+    """Two channels plus sorting/column work and base/fine overlap.
+
+    Compact rows retain ten float64 fields, shared labels and order indices;
+    allow 256 bytes each for their column/sort temporaries. Public list calls
+    retain their original conservative dictionary allowance.
+    """
+    from ghost_backend.twod.samples import compact_samples_enabled
+    row_bytes = 256. if compact_samples_enabled() else 2048.
+    return row_bytes * int(frequencies) * int(aspects) * 2 * (2 if expanded else 1) * (2 if certified else 1) / 1e9
 
 
 def reserve_output(function):

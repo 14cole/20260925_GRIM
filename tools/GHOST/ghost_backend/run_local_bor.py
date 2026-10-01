@@ -302,9 +302,7 @@ def _pair_name(pair: 'Dict[str, Any]') -> 'str':
 def _channel_result(
     result: 'Dict[str, Any]', polarization: 'str'
 ) -> 'Dict[str, Any]':
-    samples = list(
-        (result.get("co_solved_samples", {}) or {}).get(polarization, []) or []
-    )
+    samples = (result.get("co_solved_samples", {}) or {}).get(polarization, [])
     if not samples:
         raise RuntimeError(
             f"BoR solve did not return its co-solved {polarization} channel."
@@ -371,6 +369,8 @@ def _solve_and_export(
     )
     solve = (solve_monostatic_rcs_bor_certified if context["mesh_certification"]
              else solve_monostatic_rcs_bor_survey)
+    from ghost_backend.twod.samples import compact_samples
+    solve = compact_samples()(solve)
     quality_kwargs = ({"mesh_convergence_policy": validate_mesh_convergence_policy(
         context.get("mesh_convergence_policy")
     )} if context["mesh_certification"] else {})

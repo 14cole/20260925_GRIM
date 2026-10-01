@@ -12,17 +12,18 @@ from GRIM_Backend.integrations.ghost import load_ghost_module
 
 class _InspectorWorker(QObject):
     done = Signal(object)
-    def __init__(self, service, plan, sample, cancel):
+    def __init__(self, service, plan, sample, cancel, generation=0):
         super().__init__()
         self.service, self.plan, self.sample, self.cancel = service, plan, sample, cancel
+        self.generation = generation
 
     @Slot()
     def run(self):
         try:
             value = self.service.evaluate(self.plan, *self.sample, cancel_check=self.cancel.is_set)
-            self.done.emit(value)
+            self.done.emit(dict(value, _generation=self.generation))
         except Exception as exc:
-            self.done.emit({"error": str(exc)})
+            self.done.emit({"error": str(exc), "_generation": self.generation})
 
 
 class InterferenceInspector(QWidget):
@@ -31,6 +32,7 @@ class InterferenceInspector(QWidget):
         self.plan_provider = lambda: None
         self._service = self._thread = self._result = None
         self._cancel = threading.Event()
+        self._generation = 0
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
         self.frequency, self.azimuth, self.elevation, self.polarization = (QComboBox() for _ in range(4))
@@ -71,6 +73,29 @@ class InterferenceInspector(QWidget):
         self._plan_timer.setInterval(500)
         self._plan_timer.timeout.connect(self._check_current_plan)
         self._plan_timer.start()
+
+    def clear_results(self):
+        """Discard the old vehicle without interrupting a running Qt worker."""
+        self._generation += 1
+        self._cancel.set()
+        self._result = None
+        # A running worker retains its own reference until cooperative exit.
+        # The next vehicle receives a fresh contribution cache.
+        self._service = None
+        for combo in (self.frequency, self.azimuth, self.elevation):
+            combo.clear()
+        selected = self.polarization.currentText()
+        blocked = self.polarization.blockSignals(True)
+        self.polarization.clear()
+        self.polarization.addItems(["VV", "HH", "VH"])
+        self.polarization.setCurrentIndex(max(0, self.polarization.findText(selected)))
+        self.polarization.blockSignals(blocked)
+        self.table.setRowCount(0)
+        self.axes.clear()
+        self._style_plot()
+        self.canvas.draw_idle()
+        self.total.clear()
+        self.status.setText("Validate the Assembly, then inspect an exact stored sample. Gain, phase, and Use edits below are previews at fixed geometry; they do not edit the Assembly.")
 
     def apply_application_palette(self, palette):
         self._palette = dict(palette)
@@ -130,7 +155,7 @@ class InterferenceInspector(QWidget):
     def _launch(self, service, plan, sample, receiver):
         self._cancel = threading.Event()
         self._thread = QThread(self)
-        self._worker = _InspectorWorker(service, plan, sample, self._cancel)
+        self._worker = _InspectorWorker(service, plan, sample, self._cancel, self._generation)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(receiver)
@@ -157,7 +182,7 @@ class InterferenceInspector(QWidget):
         self.status.setText("Checking family references, mesh refinements, and complex reconstruction errors...")
 
     def _show_family_study(self, result):
-        if self._cancel.is_set():
+        if self._cancel.is_set() or result.get("_generation", self._generation) != self._generation:
             return
         if "error" in result:
             self.status.setText(result["error"])
@@ -171,7 +196,7 @@ class InterferenceInspector(QWidget):
         self.status.setText(f"Family study: {sum(row['passed'] for row in result['cases'])}/{len(result['cases'])} cases passed. Missing references remain unvalidated.")
 
     def _show(self, result):
-        if self._cancel.is_set():
+        if self._cancel.is_set() or result.get("_generation", self._generation) != self._generation:
             return
         if "error" in result:
             self._result = None

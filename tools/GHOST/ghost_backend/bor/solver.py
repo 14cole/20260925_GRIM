@@ -172,6 +172,21 @@ def _reduce_constrained_operator(matrix, transform):
     return reduced
 
 
+def _constraint_coordinates(full_coordinates, transform):
+    """Positions of reduced unknowns; used only to order a checked factor.
+
+    Selecting each constraint's primary unknown preserves colocated electric
+    and magnetic components. General sparse relations use a weighted centroid;
+    neither choice changes matrix entries or the original-matrix checks.
+    """
+    structure = _constraint_structure(transform)
+    if structure is not None:
+        return np.asarray(full_coordinates)[structure[0]]
+    weights = abs(csr_matrix(transform))
+    totals = np.asarray(weights.sum(axis=0)).ravel()
+    return (weights.T @ np.asarray(full_coordinates)) / np.maximum(totals[:, None], 1e-300)
+
+
 def _rotate_test_rows(matrix, nodes):
     """Test n x field in (t, phi) coordinates: (-field_phi, field_t)."""
     return modal_block([[-matrix[nodes:, :]], [matrix[:nodes, :]]])
@@ -557,13 +572,16 @@ def plan_bor_mode_workers(n_dofs, n_rhs, workers, mode_tasks, assembly_peak_gb,
                           mirrored=False):
     """Treat requested modal concurrency as a ceiling, sharing runtime admission.
 
-    Keep the largest worker count that fits, including near-integration scratch,
-    linear-system workspaces and safety margins. If one worker still cannot fit,
-    return that honest minimum so the normal guard rejects before preparation.
+    Keep the largest worker count within the unit's CPU allocation that fits,
+    including near-integration scratch, linear-system workspaces and safety
+    margins. If one worker still cannot fit, return that honest minimum so the
+    normal guard rejects before preparation.
     """
+    from ghost_backend.execution.options import allocated_cpu_budget
     requested = max(1, int(workers))
+    cpu_budget = allocated_cpu_budget()
     limit = _solve_memory_limit_gb() if memory_limit_gb is None else float(memory_limit_gb)
-    for count in range(min(requested, max(1, int(mode_tasks))), 0, -1):
+    for count in range(min(requested, cpu_budget, max(1, int(mode_tasks))), 0, -1):
         linear_peak = estimate_bor_dense_peak_gb(n_dofs, n_rhs, count, mode_tasks,
                                                  **_factor_pricing(hierarchical, mirrored))
         near = plan_near_preparation(requested, assembly_peak_gb, linear_peak, limit,
@@ -575,7 +593,8 @@ def plan_bor_mode_workers(n_dofs, n_rhs, workers, mode_tasks, assembly_peak_gb,
                    estimate_bor_total_peak_gb(assembly_peak_gb, linear_peak))
         if peak <= limit:
             break
-    return dict(requested_workers=requested, workers=count, near_preparation=near,
+    return dict(requested_workers=requested, workers=count, cpu_budget=cpu_budget,
+                near_preparation=near,
                 linear_peak_gb=linear_peak, estimated_peak_gb=peak,
                 memory_limit_gb=limit, fits_memory=peak <= limit)
 
@@ -1021,8 +1040,17 @@ def _bessel_triplet(m: 'int', u):
 # 70 CPU-s of a certified 10 GHz ogive sweep.  Records are bounded by one
 # process-wide budget, priced once in the mode-phase estimate.
 ANGULAR_CACHE_BUDGET_BYTES = 256 * 1024**2
-# u, 2/u, J_T, J_{T+1} (8 bytes each), the phase (16) and the direct mask (1).
-ANGULAR_CACHE_BYTES_PER_VALUE = 49
+# u, 2/u, J_T, J_{T+1} (8 bytes each), phase (16), direct mask (1).
+ANGULAR_BASE_BYTES_PER_VALUE = 49
+# Retain a bounded number of intermediate recurrence states. Each state is
+# two real arrays. Reusing the exact downward-recurrence state avoids starting
+# at T for every mode; it does not change the recurrence or its arithmetic.
+ANGULAR_CHECKPOINT_MAX_COUNT = 8
+ANGULAR_CHECKPOINT_MIN_STEP = 16
+# Conservative planner bound, including sin/cos(theta) (at most 16 bytes per
+# point/aspect when there is only one point). Runtime reserves actual shapes.
+ANGULAR_CACHE_BYTES_PER_VALUE = (
+    ANGULAR_BASE_BYTES_PER_VALUE + 16 * ANGULAR_CHECKPOINT_MAX_COUNT + 16)
 # Where |J_{T+1}(u)| is this small (u = 0 on the axis aspects, or tiny u
 # against a high top order) the recurrence start has lost its precision;
 # those values are evaluated directly.
@@ -1060,11 +1088,13 @@ class _AngularChunk:
     """Mode-independent cylindrical-wave data of one aspect chunk.
 
     ``u = k sin(theta) rho`` and the axial phase for every point and aspect,
-    and J at the top orders ``T`` and ``T + 1``.  Immutable once built; a
-    request above ``T`` builds a new record.
+    and J at the top orders ``T`` and ``T + 1``. Optional checkpoints retain
+    the exact intermediate states of that recurrence, never new Bessel
+    evaluations. Immutable once built; a request above ``T`` builds a new
+    record. The caller reserves every checkpoint before construction.
     """
 
-    def __init__(self, k, rho, z, thetas, top: 'int'):
+    def __init__(self, k, rho, z, thetas, top: 'int', checkpoint_orders=()):
         th = np.radians(thetas)
         self.st = np.sin(th)[:, None]
         self.ct = np.cos(th)[:, None]
@@ -1076,32 +1106,59 @@ class _AngularChunk:
         self.j_above = sp.jv(self.top + 1, u)
         direct = np.abs(self.j_above) < ANGULAR_RECURRENCE_FLOOR
         self.u = u
-        self.direct = np.nonzero(direct) if np.any(direct) else None
+        # Keep the boolean mask itself. np.nonzero would retain two int64
+        # index arrays (up to 16 bytes/value) despite reserving one byte.
+        self.direct = direct if np.any(direct) else None
         self.two_over_u = 2.0 / np.where(direct, 1.0, u)
         # Directly evaluated values recur from zero (a tiny start would
         # overflow against the placeholder 2/u) and are replaced afterwards.
         self.j_top[direct] = 0.0
         self.j_above[direct] = 0.0
-        self.nbytes = int(sum(a.nbytes for a in (u, self.two_over_u, self.j_top,
-                                                 self.j_above, self.phase, direct)))
+        orders = tuple(sorted(set(int(value) for value in checkpoint_orders)))
+        if any(value <= 0 or value >= self.top for value in orders):
+            raise ValueError("BoR angular checkpoints must lie strictly between zero and the top order.")
+        self._checkpoints = {}
+        if orders:
+            pending = set(orders)
+            ring = [np.empty_like(self.j_top) for _ in range(3)]
+            high, current = self.j_above, self.j_top
+            for order in range(self.top, orders[0], -1):
+                target = ring[(order - 1) % 3]
+                np.multiply(self.two_over_u, current, out=target)
+                target *= float(order)
+                target -= high
+                high, current = current, target
+                if order - 1 in pending:
+                    self._checkpoints[order - 1] = (current.copy(), high.copy())
+        self._checkpoint_orders = orders + (self.top,)
+        retained = [u, self.two_over_u, self.j_top, self.j_above,
+                    self.phase, self.st, self.ct]
+        if self.direct is not None:
+            retained.append(self.direct)
+        retained.extend(value for pair in self._checkpoints.values() for value in pair)
+        self.nbytes = int(sum(value.nbytes for value in retained))
+        for value in retained:
+            value.setflags(write=False)
 
     def triplet(self, m: 'int'):
         """``_bessel_triplet(m, u)`` by downward recurrence from the top orders."""
         n = abs(int(m))
         if n + 1 > self.top:
             raise ValueError("BoR angular record was built below the requested mode.")
+        top = next(order for order in self._checkpoint_orders if order >= n + 1)
+        j_top, j_above = self._checkpoints.get(top, (self.j_top, self.j_above))
         ring = [np.empty_like(self.j_top) for _ in range(3)]
 
         def order(o):
-            if o == self.top + 1:
-                return self.j_above
-            if o == self.top:
-                return self.j_top
+            if o == top + 1:
+                return j_above
+            if o == top:
+                return j_top
             return ring[o % 3]
         # J_{o-1} = (2 o / u) J_o - J_{o+1}; a value never overwrites the two
         # it is computed from (they sit in other ring slots or the record).
         low = max(n - 1, 0)
-        for o in range(self.top, low, -1):
+        for o in range(top, low, -1):
             target = ring[(o - 1) % 3]
             np.multiply(self.two_over_u, order(o), out=target)
             target *= float(o)
@@ -1123,6 +1180,14 @@ class _AngularChunk:
             return j_down, j_n, j_up
         sign = -1.0 if n % 2 else 1.0
         return -sign * j_up, sign * j_n, -sign * j_down
+
+
+def _angular_checkpoint_orders(top: 'int', count: 'int'):
+    """Evenly spaced recurrence checkpoints, bounded in number and density."""
+    if count <= 0:
+        return ()
+    step = max(ANGULAR_CHECKPOINT_MIN_STEP, int(math.ceil(top / (count + 1))))
+    return tuple(range(step, int(top), step))
 
 
 def _causal_medium(eps_r: 'complex', mu_r: 'complex') -> 'Tuple[complex, complex]':
@@ -2120,7 +2185,7 @@ class BorPecSolver:
         self._add_bands_into(quads[3], bands, 0.5 * scale)
         return Z
 
-    def assemble_pmchwt_P(self, m: 'int', m_max: 'int') -> 'np.ndarray':
+    def assemble_pmchwt_P(self, m: 'int', m_max: 'int', out=None) -> 'np.ndarray':
         """
         The PMCHWT rotated-PV operator P (node-based [2Nn, 2Nn]) acting on a
         magnetic current expanded in the SAME (t, phi) triangle bases:
@@ -2132,18 +2197,25 @@ class BorPecSolver:
         (n x t = phi, n x phi = -t), so columns remap:  P[:, Mt] = -B[:, f_phi],
         P[:, Mphi] = +B[:, f_t].  The same bilinear form gives the H-side
         operator: <W, H_PV(J)> = -(P J).
+
+        ``out`` may be a strided system submatrix. Rotated brackets are
+        accumulated into their final column positions, avoiding a second
+        full matrix of bracket blocks before forming P.
         """
         if self._compressed:
+            if out is not None:
+                raise ValueError("Compressed BoR assembly cannot write in place.")
             return primitive(self, 'P', m, m_max)
 
 
-        Btt, Btf, Bft, Bff = self._rot_pv_blocks(m, m_max)
         Nn = self.Nn
-        P = np.empty((2 * Nn, 2 * Nn), dtype=np.complex128)
-        P[:Nn, :Nn] = -Btf
-        P[:Nn, Nn:] = Btt
-        P[Nn:, :Nn] = -Bff
-        P[Nn:, Nn:] = Bft
+        P = out if out is not None else np.empty((2 * Nn, 2 * Nn), dtype=np.complex128)
+        if P.shape != (2 * Nn, 2 * Nn):
+            raise ValueError("BoR in-place PMCHWT matrix has the wrong shape.")
+        P.fill(0.0)
+        self._accumulate_rot_pv(
+            (P[:Nn, Nn:], P[:Nn, :Nn], P[Nn:, Nn:], P[Nn:, :Nn]), m, m_max)
+        P[:, :Nn] *= -1.0
         return P
 
     def _prepared_near(self, kind, m_max):
@@ -2160,9 +2232,14 @@ class BorPecSolver:
         key = (kind, int(m_max))
         if key in self._near_contractions:
             return
-        count = 4 * len(pairs)
-        rows, cols, sources = (np.empty(count, dtype=np.intp) for _ in range(3))
-        values = np.empty((4, m_max + 1, count), complex)
+        from ghost_backend.bor.near_storage import compact_layout, reciprocal_pair_order, EfieReciprocity
+        # Keep the original independent pair integrations and their diagnostic,
+        # but accumulate directly into unique destinations. Source-element
+        # identity remains part of an IBC entry for later impedance weighting.
+        pairs = reciprocal_pair_order(pairs) if kind == 'efie' else pairs
+        layout, destinations = compact_layout(pairs, self.Nn, preserve_sources=kind == 'ibc')
+        values = np.zeros((4, m_max + 1, len(layout['rows'])), complex)
+        reciprocity = EfieReciprocity(m_max + 1) if kind == 'efie' else None
 
         def integrate(pair):
             if self._checkpoint is not None:
@@ -2181,10 +2258,6 @@ class BorPecSolver:
         task = NearTask(self.gen, self.gen, self.k, m_max, (kind,), depth=self.near_depth)
         with contextlib.closing(_iter_near_pairs(integrate, pairs, workers, task, self._checkpoint)) as results:
             for pi, ((e, f), (block, refinement)) in enumerate(zip(pairs, results)):
-                sl = slice(4 * pi, 4 * pi + 4)
-                rows[sl] = (e, e, e + 1, e + 1)
-                cols[sl] = (f, f + 1, f, f + 1)
-                sources[sl] = f
                 if refinement is not None:
                     order, error = refinement
                     self.near_quadrature_order_max = max(
@@ -2192,14 +2265,15 @@ class BorPecSolver:
                     self.near_quadrature_error_max = max(
                         getattr(self, 'near_quadrature_error_max', 0.), error)
                 retained = block if block.shape[1] == m_max + 1 else block[:, m_max:]
-                values[:, :, sl] = retained.reshape(4, m_max + 1, 4)
-        if kind == 'efie':
+                if reciprocity is not None:
+                    reciprocity.add((e, f), retained)
+                # The four corners within one element pair are distinct;
+                # contributions from previous pairs have already been summed.
+                values[:, :, destinations[pi]] += retained.reshape(4, m_max + 1, 4)
+        if reciprocity is not None:
             self.near_efie_asymmetry = max(getattr(self, 'near_efie_asymmetry', 0.0),
-                                           _efie_near_asymmetry(pairs, values))
-        row_order = np.argsort(rows, kind='stable')
-        row_ptr = np.searchsorted(rows[row_order], np.arange(self.Nn+1))
-        self._near_contractions[key] = dict(rows=rows, cols=cols,
-            source_elems=sources, values=values, row_order=row_order, row_ptr=row_ptr)
+                                           reciprocity.value())
+        self._near_contractions[key] = dict(layout, values=values)
         self._near_cache.pop(m_max if kind == 'efie' else (kind, m_max), None)
 
 
@@ -2368,15 +2442,29 @@ class BorPecSolver:
                 return chunk
             top = max(int(need), self._angular_top, ANGULAR_MIN_TOP,
                       2 * chunk.top if chunk is not None else 0)
-            nbytes = ANGULAR_CACHE_BYTES_PER_VALUE * thetas.size * self.g.rho.size
-            if not _reserve_angular_bytes(nbytes):
+            values = thetas.size * self.g.rho.size
+            base_bytes = ANGULAR_BASE_BYTES_PER_VALUE * values + 16 * thetas.size
+            checkpoint_count = min(ANGULAR_CHECKPOINT_MAX_COUNT,
+                                   max(0, (top - 1) // ANGULAR_CHECKPOINT_MIN_STEP))
+            reserved = False
+            for count in range(checkpoint_count, -1, -1):
+                checkpoint_orders = _angular_checkpoint_orders(top, count)
+                nbytes = base_bytes + 16 * values * len(checkpoint_orders)
+                if _reserve_angular_bytes(nbytes):
+                    reserved = True
+                    break
+            if not reserved:
                 return None
             try:
-                built = _AngularChunk(self.k, self.g.rho, self.g.z, thetas, top)
+                built = _AngularChunk(self.k, self.g.rho, self.g.z, thetas, top,
+                                      checkpoint_orders=checkpoint_orders)
             except BaseException:
                 _release_angular_bytes(nbytes)
                 raise
-            weakref.finalize(built, _release_angular_bytes, nbytes)
+            # No direct fallback means no retained mask. Charge only the
+            # arrays actually retained, including aspect vectors and seeds.
+            _release_angular_bytes(nbytes - built.nbytes)
+            weakref.finalize(built, _release_angular_bytes, built.nbytes)
             with self._angular_shared_lock:
                 self._angular_shared[key] = built
             return built
@@ -2720,7 +2808,8 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
                      signed_mode_symmetry: 'bool' = False,
                      stream_mode_block: 'Optional[int]' = None,
                      coordinates: 'Optional[Callable]' = None,
-                     mirror: 'Optional[Callable]' = None):
+                     mirror: 'Optional[Callable]' = None,
+                     hierarchical_pricing: 'bool' = True):
     """
     Shared adaptive azimuthal-mode loop for every BoR formulation.
 
@@ -2774,7 +2863,8 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
     from ghost_backend.bor.options import output_reserved_gb
     assembly_peak_gb += output_reserved_gb()
     worker_plan = plan_bor_mode_workers(n_dofs, n_rhs, workers,
-        max(1, int(m_max) + 1), assembly_peak_gb, hierarchical=coordinates is not None,
+        max(1, int(m_max) + 1), assembly_peak_gb,
+        hierarchical=coordinates is not None and hierarchical_pricing,
         mirrored=mirror is not None)
     workers = worker_plan['workers']
     near_plan = worker_plan['near_preparation']
@@ -2787,7 +2877,7 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
         context=memory_context,
         streaming=stream_mode_block is not None,
         preparation_peak_gb=assembly_peak_gb + near_plan['scratch_gb'],
-        hierarchical=coordinates is not None,
+        hierarchical=coordinates is not None and hierarchical_pricing,
         mirrored=mirror is not None,
     )
     if prepare is not None:
@@ -2932,11 +3022,16 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
     # Executor threads start with an empty context: every mode runs in a copy
     # of the caller's, so the execution options (the unit's CPU allocation,
     # residual storage, temporary directory, ...) reach the mode workers too.
+    # Each concurrent mode lends only its share to nested assembly/product
+    # teams. BLAS is bounded once around the executor below, because its
+    # process-wide limits cannot be changed independently by mode threads.
+    from ghost_backend.execution.options import allocated_cpu_budget, cpu_allocation_scope
+    mode_cpu_budget = max(1, allocated_cpu_budget() // workers)
     caller_context = contextvars.copy_context()
 
     def scoped_solve_am(am):
         def run():
-            with option_scope(options):
+            with cpu_allocation_scope(mode_cpu_budget), option_scope(options):
                 with metrics_scope(metrics):
                     with cache_scope(tile_cache):
                         return solve_am(am)
@@ -3056,6 +3151,7 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
     stats = {
         "near_preparation": near_plan,
         "modal_execution": dict(options, systems=mode_events, worker_plan=worker_plan,
+                                cpu_budget_per_mode=mode_cpu_budget,
                                 rhs_compression_hint=compression_hint.evidence()),
         "linear_residual": max_res,
         "linear_backward_error": max_backward_error,
@@ -3376,8 +3472,9 @@ def bor_operator_storage_bytes(modes, surfaces, crosses=(), constraint_dofs=0,
                                streaming=False, compressed=False):
     """The one BoR operator-storage model, in bytes, by component.
 
-    ``tables`` and ``basis`` are the retained far tables and dense basis
-    matrices (absent when streaming, whose planner prices far blocks itself),
+    ``tables`` are the retained far tables (absent when streaming, whose
+    planner prices far blocks itself). ``basis`` is retained as a zero-valued
+    reporting field: production contracts local bases without dense matrices.
     ``near`` the same- and cross-surface near contractions, ``projection`` the
     junction projection matrices, ``fft_workspace`` and ``near_workspace`` the
     largest build scratch of each kind.  A gate needs
@@ -3403,7 +3500,6 @@ def bor_operator_storage_bytes(modes, surfaces, crosses=(), constraint_dofs=0,
         kinds = int(bool(surface.efie)) + int(bool(surface.mfie)) + int(bool(surface.ibc))
         square = float(surface.points) ** 2
         if not streaming and kinds:
-            basis += bor_basis_bytes(surface.nodes, surface.points)
             if surface.efie:
                 tables += square * (modes + 2) * surface.table_bytes
             if surface.mfie:
@@ -3458,8 +3554,8 @@ def estimate_bor_operator_storage_gb(
     """Estimate retained operator auxiliaries and their build workspace.
 
     ``solver_requirements`` contains ``(solver, efie, mfie, ibc)`` tuples.
-    Repeated solver instances are merged so their dense basis matrices and
-    tables are counted once.  Cross-surface operators are counted independently.
+    Repeated solver instances are merged so their tables are counted once.
+    Cross-surface operators are counted independently.
     ``constraint_dofs`` adds the sparse junction projection transforms retained by
     the partial/multiregion paths.  With ``streaming=True``, far tables and
     their FFT workspace are excluded because the combined streaming planner
@@ -3801,6 +3897,37 @@ def _block_diagonal_transforms(*blocks: 'np.ndarray') -> 'np.ndarray':
         row += nr
         column += nc
     return out
+
+
+def _assemble_pmchwt_interface_into(target, exterior, interior, m, m_max,
+                                    weight, eta_ratio2):
+    """Fill a dense J/M interface block using at most one material temporary.
+
+    Every sum and scaling keeps the former PMCHWT order (strided NumPy
+    operations may differ in final-bit rounding). The exterior
+    operators go straight into their final quadrants; the interior operator
+    is consumed before constructing the next one. No quadrature is changed.
+    """
+    size = 2 * exterior.Nn
+    if target.shape != (2 * size, 2 * size) or interior.Nn != exterior.Nn:
+        raise ValueError("BoR PMCHWT interface dimensions do not match.")
+    jj, jm = target[:size, :size], target[:size, size:]
+    mj, mm = target[size:, :size], target[size:, size:]
+    exterior.assemble_mode(m, m_max, out=jj)
+    mm[:] = jj
+    inner = interior.assemble_mode(m, m_max)
+    _scaled_add_into(jj, inner, weight)
+    _scaled_add_into(mm, inner, weight * eta_ratio2)
+    inner = None
+    exterior.assemble_pmchwt_P(m, m_max, out=mj)
+    inner = interior.assemble_pmchwt_P(m, m_max)
+    _scaled_add_into(mj, inner, weight)
+    inner = None
+    mj *= ETA0
+    if weight != 1.0:
+        _add_rotation_mass_into(mj, exterior, -(0.5 * (1.0 - weight) * ETA0))
+    np.negative(mj, out=jm)
+    return target
 
 
 def _apply_regular_axis_rows(Q: 'np.ndarray', columns: 'np.ndarray',
@@ -4342,17 +4469,24 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
         si.prepare_operators(mm, efie=True, ibc=True, workers=solve_workers)
 
     def assemble(m):
-        T_e = se.assemble_mode(m, m_max)
-        T_i = si.assemble_mode(m, m_max)
-        P_sum = ETA0 * (se.assemble_pmchwt_P(m, m_max) + weight * si.assemble_pmchwt_P(m, m_max))
-        if weight != 1.0:
-            P_sum = _add_rotation_mass_into(P_sum, se, -(0.5 * (1.0 - weight) * ETA0))
-        A = modal_matrix((4 * Nn, 4 * Nn), compressed_requested())
-        A[: 2 * Nn, : 2 * Nn] = T_e + weight * T_i
-        A[: 2 * Nn, 2 * Nn:] = -P_sum
-        A[2 * Nn:, : 2 * Nn] = P_sum
-        A[2 * Nn:, 2 * Nn:] = T_e + (weight * eta_ratio2) * T_i
-        del T_e, T_i, P_sum
+        if use_streaming and not se._compressed:
+            A = modal_matrix((4 * Nn, 4 * Nn), False)
+            _assemble_pmchwt_interface_into(A, se, si, m, m_max, weight, eta_ratio2)
+        else:
+            # Table contractions can have more scratch than the final block.
+            # Construct their operators before allocating A so those peaks
+            # do not overlap. Streamed operators above need no contraction.
+            T_e = se.assemble_mode(m, m_max)
+            T_i = si.assemble_mode(m, m_max)
+            P_sum = ETA0 * (se.assemble_pmchwt_P(m, m_max) + weight * si.assemble_pmchwt_P(m, m_max))
+            if weight != 1.0:
+                P_sum = _add_rotation_mass_into(P_sum, se, -(0.5 * (1.0 - weight) * ETA0))
+            A = modal_matrix((4 * Nn, 4 * Nn), compressed_requested())
+            A[: 2 * Nn, : 2 * Nn] = T_e + weight * T_i
+            A[: 2 * Nn, 2 * Nn:] = -P_sum
+            A[2 * Nn:, : 2 * Nn] = P_sum
+            A[2 * Nn:, 2 * Nn:] = T_e + (weight * eta_ratio2) * T_i
+            del T_e, T_i, P_sum
         if abs(int(m)) == 1:
             q_surface = se.basis_transform(m)
             Q = _block_diagonal_transforms(q_surface, q_surface)
@@ -4393,6 +4527,7 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
     stream_backend = None
     stream_sweeps = 0
     stream_spill_gb = 0.0
+    stream_compression = {}
     try:
         F, modes_used, stats = _mode_sweep(4 * Nn, thetas, ("VV", "HH"), m_max,
                                            mode_tol, assemble, rhs, farfield,
@@ -4406,8 +4541,12 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
                                            assembly_peak_gb=operator_storage_gb,
                                            memory_context="The dielectric BoR solve",
                                            stream_mode_block=mode_block,
-                                           signed_mode_symmetry=True)
+                                           signed_mode_symmetry=True,
+                                           coordinates=lambda m: np.tile(se.gen.nodes, (4, 1))[
+                                               np.tile(se.basis_mask(m), 2)],
+                                           hierarchical_pricing=False)
         if use_streaming:
+            stream_compression = _stream_compression_evidence({'exterior':se._stream,'interior':si._stream})
             stream_backends = {
                 "exterior": sampling_backend_name(se._stream),
                 "interior": sampling_backend_name(si._stream),
@@ -4440,6 +4579,7 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
         "stream_mode_block": mode_block if use_streaming else None,
         "stream_sweeps": stream_sweeps,
         "stream_spill_gb": stream_spill_gb,
+        "stream_far_compression": stream_compression,
         "stream_sampling_backend": stream_backend,
         "stream_sampling_backends": stream_backends,
         "warnings": solve_warnings,
@@ -4501,7 +4641,7 @@ def _near_point_chunks(gp, e, gq, f, points, nm):
 NEAR_BATCH_KERNEL_BYTES = 64_000_000
 
 
-def _near_chunk_kernels(chunks, k, m_max, kinds):
+def _near_chunk_kernels(chunks, k, m_max, kinds, signed=True):
     """Kernel values per chunk and kind: one graded-rule call per kind for all chunks."""
     sizes = [len(chunk[12]) for chunk in chunks]
     edges = np.cumsum([0] + sizes)
@@ -4516,7 +4656,8 @@ def _near_chunk_kernels(chunks, k, m_max, kinds):
             continue
         kernel = mfie_kernels_near if kind == 'mfie' else ibc_kernels_near
         brackets = kernel(columns['rp'], columns['zp'], columns['trp'], columns['tzp'],
-                          columns['rq'], columns['zq'], columns['trq'], columns['tzq'], k, m_max)
+                          columns['rq'], columns['zq'], columns['trq'], columns['tzq'], k, m_max,
+                          signed=signed)
         values.append([tuple(value[a:b] for value in brackets) for a, b in zip(edges[:-1], edges[1:])])
     return [dict(zip(kinds, per_chunk)) for per_chunk in zip(*values)]
 
@@ -4555,8 +4696,6 @@ def _contract_near_chunk(out, chunk, kernels, k, m_max, modes, signed):
         if kind == 'efie':
             continue
         for uv, value in enumerate(kernels[kind]):
-            if not signed:
-                value = value[:, m_max:]
             out[kind][uv] += contract(TT, 2 * np.pi * rr * value)
 
 
@@ -4571,14 +4710,14 @@ def _contract_near_batch(jobs, k, m_max, kinds, signed=True):
     modes = np.arange(-m_max, m_max + 1) if signed else np.arange(0, m_max + 1)
     nm = len(modes)
     outs = [{kind: np.zeros((4, nm, 2, 2), complex) for kind in kinds} for _ in jobs]
-    per_point = 16 * sum((m_max + 2) if kind == 'efie' else 4 * (2 * m_max + 1) for kind in kinds) + 160
+    per_point = 16 * sum((m_max + 2) if kind == 'efie' else 4 * nm for kind in kinds) + 160
     limit = max(256, NEAR_BATCH_KERNEL_BYTES // per_point)
     block, points = [], 0
 
     def flush():
         if not block:
             return
-        kernels = _near_chunk_kernels([chunk for _, chunk in block], k, m_max, kinds)
+        kernels = _near_chunk_kernels([chunk for _, chunk in block], k, m_max, kinds, signed=signed)
         for (index, chunk), values in zip(block, kernels):
             _contract_near_chunk(outs[index], chunk, values, k, m_max, modes, signed)
         block.clear()
@@ -4754,6 +4893,11 @@ def _warn_near_asymmetry(summary, warnings) -> 'None':
             "poles and sharp corners or check for extremely small elements.")
 
 
+def _stream_compression_evidence(streams):
+    return {name:dict(stream.evidence) for name,stream in streams.items()
+            if getattr(stream,'evidence',None)}
+
+
 def _near_quadrature_summary(*operators):
     asymmetry = max((getattr(op, 'near_efie_asymmetry', 0.0) for op in operators), default=0.0)
     return {
@@ -4864,16 +5008,25 @@ class BorCrossOperators:
         """
 
         from ghost_backend.bor.streaming import StreamingCrossFarBlocks
+        from ghost_backend.bor import kernels as modal_kernels
+        from ghost_backend.bor.compressed_far import far_compression_selected
+        from ghost_backend.bor.compressed_cross import CompressedCrossFarBlocks, CrossCompressionBudgetError
         self.close_streaming()
-        self._stream = StreamingCrossFarBlocks(
-            self,
-            m_max,
+        store = (CompressedCrossFarBlocks if modal_kernels.BANDED_FFT and not single_blocks and
+                 far_compression_selected(min(self.sp.Nn, self.sq.Nn)) else StreamingCrossFarBlocks)
+        arguments = dict(
             dtype=np.complex64 if single_blocks else np.complex128,
             tile_budget_gb=tile_budget_gb,
             workers=workers,
             mode_block=mode_block,
             spill=spill,
         )
+        try:
+            self._stream = store(self, m_max, **arguments)
+        except CrossCompressionBudgetError as exc:
+            self._stream = StreamingCrossFarBlocks(self, m_max, **arguments)
+            self._stream.evidence = {'backend': 'dense_rectangular_tiles',
+                                     'compression_fallback': str(exc)}
 
     def close_streaming(self) -> 'None':
         """Release streamed far blocks, including any spilled files."""
@@ -4965,21 +5118,27 @@ class BorCrossOperators:
             self._store_near(e, f, m_max, *self._integrate_near(e, f, m_max, signed=False))
         return cache[(e, f)]
 
-    def assemble_T(self, m: 'int', m_max: 'int') -> 'np.ndarray':
+    def assemble_T(self, m: 'int', m_max: 'int', out=None) -> 'np.ndarray':
         """Cross EFIE operator [2Np, 2Nq] (same normalization as
         BorPecSolver.assemble_mode, C = j k eta 2pi of this medium)."""
         if self.sp._compressed:
+            if out is not None:
+                raise ValueError('Compressed cross assembly cannot write in place.')
             return primitive(self, 'T', m, m_max)
 
 
         k = self.k
         gp, gq = self.sp.g, self.sq.g
+        Np, Nq = self.sp.Nn, self.sq.Nn
+        Z = np.empty((2*Np, 2*Nq), complex) if out is None else out
+        if Z.shape != (2*Np, 2*Nq):
+            raise ValueError('Cross EFIE destination has the wrong shape.')
+        ztt, ztf, zft, zff = Z[:Np,:Nq], Z[:Np,Nq:], Z[Np:,:Nq], Z[Np:,Nq:]
         if self._stream is not None:
-            ztt, ztf, zft, zff = self._stream.efie_blocks(m)
+            self._stream.write_blocks('efie', m, (ztt, ztf, zft, zff))
         else:
             G, _ = self._tables(m_max)
-            Np, Nq = self.sp.Nn, self.sq.Nn
-            ztt, ztf, zft, zff = (np.zeros((Np, Nq), dtype=np.complex128) for _ in range(4))
+            Z.fill(0.)
             _efie_tables_into((ztt, ztf, zft, zff), m, k,
                               gp, self.sp.gen.n_elems, self.sp.gauss_order,
                               gq, self.sq.gen.n_elems, self.sq.gauss_order, G, 1.0)
@@ -4990,27 +5149,28 @@ class BorCrossOperators:
                 target[rc] += value
 
         C = 1j * k * self.eta * 2.0 * np.pi
-        Np, Nq = self.sp.Nn, self.sq.Nn
-        Z = np.empty((2 * Np, 2 * Nq), dtype=np.complex128)
-        Z[:Np, :Nq] = C * ztt
-        Z[:Np, Nq:] = C * ztf
-        Z[Np:, :Nq] = C * zft
-        Z[Np:, Nq:] = C * zff
+        Z *= C
         return Z
 
-    def assemble_P(self, m: 'int', m_max: 'int') -> 'np.ndarray':
+    def assemble_P(self, m: 'int', m_max: 'int', out=None) -> 'np.ndarray':
         """Cross rotated-PV operator [2Np, 2Nq] (see assemble_pmchwt_P)."""
         if self.sp._compressed:
+            if out is not None:
+                raise ValueError('Compressed cross assembly cannot write in place.')
             return primitive(self, 'P', m, m_max)
 
 
         gp, gq = self.sp.g, self.sq.g
+        Np, Nq = self.sp.Nn, self.sq.Nn
+        P = np.empty((2*Np, 2*Nq), complex) if out is None else out
+        if P.shape != (2*Np, 2*Nq):
+            raise ValueError('Cross PV destination has the wrong shape.')
+        blocks = (P[:Np,Nq:], P[:Np,:Nq], P[Np:,Nq:], P[Np:,:Nq])
         if self._stream is not None:
-            blocks = list(self._stream.bracket_blocks(m))
+            self._stream.write_blocks('ibc', m, blocks)
         else:
             _, Bt = self._tables(m_max)
-            Np, Nq = self.sp.Nn, self.sq.Nn
-            blocks = [np.zeros((Np, Nq), dtype=np.complex128) for _ in range(4)]
+            P.fill(0.)
             _bracket_tables_into(blocks, m, m_max,
                                  gp, self.sp.gen.n_elems, self.sp.gauss_order,
                                  gq, self.sq.gen.n_elems, self.sq.gauss_order, Bt, 1.0)
@@ -5019,13 +5179,7 @@ class BorCrossOperators:
             rc = np.ix_([e, e + 1], [f, f + 1])
             for target, value in zip(blocks, near):
                 target[rc] += value
-        Btt, Btf, Bft, Bff = blocks
-        Np, Nq = self.sp.Nn, self.sq.Nn
-        P = np.empty((2 * Np, 2 * Nq), dtype=np.complex128)
-        P[:Np, :Nq] = -Btf
-        P[:Np, Nq:] = Btt
-        P[Np:, :Nq] = -Bff
-        P[Np:, Nq:] = Bft
+        P[:, :Nq] *= -1.
         return P
 
     def prepare(self, m_max: 'int', workers: 'int' = 1) -> 'None':
@@ -5388,20 +5542,26 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
         Xco.prepare(mm, workers=solve_workers)
 
     def assemble(m):
-        T_e = se.assemble_mode(m, m_max)
-        T_Lo = sLo.assemble_mode(m, m_max)
-        # The coating's equations enter the interface rows with the weight of
-        # ``_region_equation_weights`` (1 is PMCHWT), jump terms included.
-        P_sum = ETA0 * (se.assemble_pmchwt_P(m, m_max) + weight * sLo.assemble_pmchwt_P(m, m_max))
-        if weight != 1.0:
-            P_sum = _add_rotation_mass_into(P_sum, se, -(0.5 * (1.0 - weight) * ETA0))
-        A = modal_matrix((ntot, ntot), compressed_requested())
         memo = {}
-        A[iJ, iJ] = T_e + weight * T_Lo
-        A[iJ, iM] = -P_sum
+        # The coating's equations enter the interface rows with the weight
+        # of _region_equation_weights, jump terms included.
+        if use_streaming and not se._compressed:
+            A = modal_matrix((ntot, ntot), False)
+            _assemble_pmchwt_interface_into(A[:4 * No, :4 * No], se, sLo,
+                                            m, m_max, weight, eta_ratio2)
+        else:
+            T_e = se.assemble_mode(m, m_max)
+            T_Lo = sLo.assemble_mode(m, m_max)
+            P_sum = ETA0 * (se.assemble_pmchwt_P(m, m_max) + weight * sLo.assemble_pmchwt_P(m, m_max))
+            if weight != 1.0:
+                P_sum = _add_rotation_mass_into(P_sum, se, -(0.5 * (1.0 - weight) * ETA0))
+            A = modal_matrix((ntot, ntot), compressed_requested())
+            A[iJ, iJ] = T_e + weight * T_Lo
+            A[iJ, iM] = -P_sum
+            A[iM, iJ] = P_sum
+            A[iM, iM] = T_e + (weight * eta_ratio2) * T_Lo
+            del T_e, T_Lo, P_sum
         A[iJ, iC] = -weight * _cross_block(Xoc, 'T', m, m_max, memo)
-        A[iM, iJ] = P_sum
-        A[iM, iM] = T_e + (weight * eta_ratio2) * T_Lo
         A[iM, iC] = (-weight * ETA0) * _cross_block(Xoc, 'P', m, m_max, memo)
         Tco = _cross_block(Xco, 'T', m, m_max, memo)
         Pco = _cross_block(Xco, 'P', m, m_max, memo)
@@ -5410,7 +5570,6 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
         A[iC, iJ] = Tco + sLc.eta * _rotate_test_rows(Pco, Nc)
         A[iC, iM] = -ETA0 * Pco + (ETA0/sLc.eta) * _rotate_test_rows(Tco, Nc)
         A[iC, iC] = -sLc.assemble_mode(m, m_max) - sLc.eta*sLc.assemble_mfie_mode(m, m_max)
-        del T_e, T_Lo, P_sum
         if abs(int(m)) == 1:
             q_outer = se.basis_transform(m)
             Q = _block_diagonal_transforms(
@@ -5468,7 +5627,11 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
                                            assembly_peak_gb=operator_storage_gb,
                                            memory_context="The coated-PEC BoR solve",
                                            stream_mode_block=mode_block,
-                                           signed_mode_symmetry=True)
+                                           signed_mode_symmetry=True,
+                                           coordinates=lambda m: np.vstack((np.tile(se.gen.nodes, (4, 1)),
+                                               np.tile(sLc.gen.nodes, (2, 1))))[
+                                                   np.r_[np.tile(se.basis_mask(m), 2), sLc.basis_mask(m)]],
+                                           hierarchical_pricing=False)
         if use_streaming:
             stream_objects = {
                 "exterior_outer": se._stream,
@@ -5478,6 +5641,7 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
             }
             if not reverse_derived:
                 stream_objects["cross_core_outer"] = Xco._stream
+            stream_compression = _stream_compression_evidence(stream_objects)
             stream_backends = {
                 name: sampling_backend_name(stream)
                 for name, stream in stream_objects.items()
@@ -5516,6 +5680,7 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
         "stream_sweeps": stream_sweeps,
         "stream_spill_gb": stream_spill_gb,
         "cross_reverse_derived": bool(reverse_derived),
+        "stream_far_compression": stream_compression if use_streaming else {},
         "stream_sampling_backend": stream_backend,
         "stream_sampling_backends": stream_backends,
         "warnings": solve_warnings,
@@ -6027,7 +6192,12 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
                                            assembly_peak_gb=plan["assembly_peak_gb"],
                                            memory_context="The partial-coating BoR solve",
                                            stream_mode_block=plan["mode_block"],
-                                           signed_mode_symmetry=True)
+                                           signed_mode_symmetry=True,
+                                           coordinates=lambda m: _constraint_coordinates(
+                                               np.vstack((np.tile(sd_e.gen.nodes, (4, 1)),
+                                                          np.tile(s2_L.gen.nodes, (2, 1)),
+                                                          *(np.tile(b.gen.nodes, (2, 1)) for b in bares))), build_Q(m)),
+                                           hierarchical_pricing=False)
         streams = {
             "interface_exterior": sd_e._stream,
             "interface_coating": sd_L._stream,
@@ -6043,6 +6213,7 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
             name: sampling_backend_name(stream)
             for name, stream in streams.items()
         } if plan["use_streaming"] else {}
+        stream_compression = _stream_compression_evidence(streams)
         stream_sweeps = (
             sum(stream.n_sweeps for stream in streams.values())
             if plan["use_streaming"] else 0
@@ -6081,6 +6252,7 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
         "stream_sampling_backends": stream_backends,
         "stream_spill_gb": stream_spill_gb,
         "stream_auxiliary_peak_gb": plan["auxiliary_peak_gb"],
+        "stream_far_compression": stream_compression,
         "warnings": solve_warnings,
         **stats,
     }
@@ -6494,7 +6666,11 @@ def _solve_multiregion(sys_: '_MultiRegionBor', freq_hz, thetas_deg, n_modes,
             assembly_peak_gb=plan["assembly_peak_gb"],
             memory_context=f"The {formulation} BoR solve",
             stream_mode_block=plan["mode_block"],
-            signed_mode_symmetry=True)
+            signed_mode_symmetry=True,
+            coordinates=lambda m: _constraint_coordinates(np.vstack([
+                np.tile(sys_.solv[(si, sys_.adj[si][0])].gen.nodes, (2 if sys_.is_cond[si] else 4, 1))
+                for si in range(sys_.n_surf)]), sys_.build_Q(m)),
+            hierarchical_pricing=False)
         streams = {
             **{
                 f"surface_{surface_index}_region_{region_index}": solver._stream
@@ -6510,6 +6686,7 @@ def _solve_multiregion(sys_: '_MultiRegionBor', freq_hz, thetas_deg, n_modes,
             name: sampling_backend_name(stream)
             for name, stream in streams.items()
         } if plan["use_streaming"] else {}
+        stream_compression = _stream_compression_evidence(streams)
         stream_sweeps = (
             sum(stream.n_sweeps for stream in streams.values())
             if plan["use_streaming"] else 0
@@ -6551,6 +6728,7 @@ def _solve_multiregion(sys_: '_MultiRegionBor', freq_hz, thetas_deg, n_modes,
         "stream_sampling_backends": stream_backends,
         "stream_spill_gb": stream_spill_gb,
         "stream_auxiliary_peak_gb": plan["auxiliary_peak_gb"],
+        "stream_far_compression": stream_compression,
     }
     out.update(extra)
     return out

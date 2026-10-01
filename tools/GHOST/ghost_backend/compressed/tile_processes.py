@@ -6,6 +6,7 @@ state, assembles whole tiles and returns them already compressed; the caller
 stores results in tile order exactly as the in-process path does.
 """
 from contextlib import contextmanager
+from collections import deque
 import multiprocessing as mp
 import os
 import pickle
@@ -62,18 +63,14 @@ def _sources(oracle):
 
 def prepare(oracle, operators):
     """(worker count, worker payload) for this operator, or (0, None) to stay in process."""
-    from ghost_backend.execution.options import _ASSEMBLY_ALLOCATION, current_options, environment_value
+    from ghost_backend.execution.options import current_options, environment_value, effective_assembly_threads
     tiles = len(operators[0].groups)**2
     if (not getattr(oracle, 'process_tiles', False) or tiles < MIN_TILES or
             mp.current_process().daemon or current_options() is None):
         return 0, None
     configured = environment_value('GHOST_TILE_PROCESSES', '').strip()
-    if configured:
-        count = int(configured)
-    else:
-        allocation = _ASSEMBLY_ALLOCATION.get()
-        # A desktop solve owns the host; a scheduled solve keeps to its reservation.
-        count = min(MAX_WORKERS, (os.cpu_count() or 1)//2) if allocation is None else int(allocation)
+    allocation = effective_assembly_threads()
+    count = min(MAX_WORKERS, allocation, int(configured) if configured else allocation)
     if count < 2:
         return 0, None
     payload = pickle.dumps((oracle, [_compressor(op) for op in operators], dict(current_options(), assembly_threads=1)),
@@ -121,36 +118,64 @@ def compressed_tiles(oracle, operators, workers, payload, checkpoint):
     The parent oracle's query counters are advanced as the workers report them.
     If a worker process dies, the remaining tiles are assembled in this process.
     """
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ProcessPoolExecutor, TimeoutError
     from concurrent.futures.process import BrokenProcessPool
     from ghost_backend.execution.runtime import single_thread_worker_environment
     groups = operators[0].groups
-    tiles = [(i, j) for j in range(len(groups)) for i in range(len(groups))]
+    def tiles():
+        return ((i, j) for j in range(len(groups)) for i in range(len(groups)))
+    remaining = iter(tiles())
     sources = _sources(oracle)
     done = 0
+    pending = deque()
+    window = max(1, 2*int(workers))
     executor = ProcessPoolExecutor(workers, mp_context=mp.get_context('spawn'),
                                    initializer=_initialize, initargs=(payload,))
-    try:
-        # map submits every tile at once, so the pool starts all its workers
-        # here: each with one BLAS thread (no per-thread OpenBLAS buffers).
+    def fill():
+        # Starting a process imports numerical runtimes before its initializer.
+        # Keep both bootstrap protections around every bounded submission.
         with _without_main_module(), single_thread_worker_environment():
-            results = executor.map(_tile, tiles, chunksize=2)
-        for compressed, counters in results:
+            while len(pending) < window:
+                task = next(remaining, None)
+                if task is None:
+                    break
+                checkpoint()
+                pending.append(executor.submit(_tile, task))
+    try:
+        fill()
+        while pending:
             checkpoint()
+            future = pending[0]
+            while True:
+                try:
+                    compressed, counters = future.result(timeout=.1)
+                    break
+                except TimeoutError:
+                    checkpoint()
+            pending.popleft()
             for source, (deltas, largest) in zip(sources, counters):
                 for name, delta in zip(COUNTERS, deltas):
                     setattr(source, name, getattr(source, name)+delta)
                 source.max_entries = max(source.max_entries, largest)
             done += 1
             yield compressed
+            # The consumer has stored/released the preceding result before
+            # another job enters the window. Futures cannot retain the full
+            # operator behind a slow early tile.
+            del compressed, counters, future
+            fill()
     except BrokenProcessPool:
         pass
     finally:
-        for process in list(getattr(executor, '_processes', {}).values()):
+        for future in pending:
+            future.cancel()
+        pending.clear()
+        for process in list((getattr(executor, '_processes', None) or {}).values()):
             if process.is_alive():
                 process.terminate()
         executor.shutdown(wait=True, cancel_futures=True)
-    for i, j in tiles[done:]:
+    from itertools import islice
+    for i, j in islice(tiles(), done, None):
         checkpoint()
         values = oracle.get_with_error(groups[i], groups[j])
         if len(operators) == 1:

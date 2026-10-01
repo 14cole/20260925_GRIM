@@ -27,9 +27,6 @@ class FeatureAssemblyValues:
     allow_legacy_base_metadata: bool = True
     require_feature_manifests: bool = False
     require_body_mesh_certification: bool = False
-    host_material: str = ""
-    host_stack_id: str = ""
-    host_minimum_radius_m: float | None = None
     study_frequencies_ghz: tuple[float, ...] | None = None
     study_azimuths_deg: tuple[float, ...] | None = None
     study_elevations_deg: tuple[float, ...] | None = None

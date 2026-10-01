@@ -182,7 +182,9 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
 
 
     tile_metadata = 1280*groups**2
-    overhead = 128*MIB + 6144*n + count*4096 + tile_metadata
+    from ghost_backend.twod.polynomial_quadrature import MOMENT_CACHE_BYTES
+    moment_cache = resources.get('moment_cache_bytes', MOMENT_CACHE_BYTES if resources.get('basis_width', 2) > 2 else 0)
+    overhead = 128*MIB + 6144*n + count*4096 + tile_metadata + moment_cache
 
     from ghost_backend.twod.operators import _ASSEMBLY_TILE
     from ghost_backend.execution.options import option
@@ -195,15 +197,18 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
     assembly_work = 64*MIB + max(1,threads)*kernel_work + 16*512*min(n,1024)
 
 
+    from ghost_backend.twod.assembly.kernels import PROJECTION_CACHE_BYTES
     solve_work = 32*MIB + 16*12*d*batch
     phases = dict(assembly=min(storage_limit,operator)+assembly_work+overhead,
                   factorization=resident+inverse_growth+overhead,
-                  solve=resident+solve_work+overhead)
+                  solve=resident+solve_work+PROJECTION_CACHE_BYTES+overhead)
     peak = max(float(floor_gb)*GIB, max(phases.values()))
     return dict(model='compressed_phase_v1', peak_bytes=int(math.ceil(peak)),
         phase_bytes={k:int(v) for k,v in phases.items()}, operator_bytes=int(expected),
         operator_allowance_bytes=int(operator), inverse_ceiling_bytes=int(inverse),
         process_geometry_bytes=int(overhead), rhs_workspace_bytes=int(solve_work),
+        projection_cache_bytes=PROJECTION_CACHE_BYTES,
+        moment_cache_bytes=moment_cache,
         assembly_workspace_bytes=int(assembly_work),
         tile_metadata_bytes=int(tile_metadata),
         storage_limit_bytes=int(storage_limit), temporary_disk_bytes=int(sample['operator_allowance_bytes']),

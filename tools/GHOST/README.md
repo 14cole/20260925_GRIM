@@ -82,10 +82,15 @@ exports with newly generated results.
 far-field block quadrature and scatter. Both match the NumPy path bit for bit
 wherever the kernel table covers the distance, and are skipped when they cannot
 load. Portable distributions include their C sources and build script;
-development checkouts may also contain binaries built for their host.
-After editing `table.c` or `far.c`, set `CC` to the MSYS2 UCRT64 compiler
-(for example `C:\msys64\ucrt64\bin\gcc.exe`) and run
-`py ghost_backend/twod/assembly/native/build.py`.
+development checkouts may also contain binaries built for their host. A release
+maintainer can use `scripts/build_distribution.py --native --output <folder>`
+to bundle checked kernels in a Windows or Linux wheel. Its recipients need no
+compiler; see [native releases](DISTRIBUTION.md#optional-native-releases).
+After editing `table.c` or `far.c`, run
+`py ghost_backend/twod/assembly/native/build.py`. Both native builders discover
+MSYS2 UCRT64 in its standard Windows location and accept `--compiler` and
+`--output-dir`. They compile to a temporary file, check it in a fresh process,
+and replace the previous library only after validation succeeds.
 
 Build the native BoR sampler on the worker machine with:
 
@@ -120,6 +125,54 @@ junction projections and direct near/junction operators, which remain resident
 when the far field is streamed. Result metadata records the sampling backend
 for each medium side/mapping (a lossy material side uses the complex-wavenumber
 NumPy sampler).
+
+## CPU performance and memory
+
+The Windows and Linux CPU paths use the existing NumPy/SciPy stack; these
+optimizations require no additional Python package or higher minimum version.
+The mesh, precision selection, integration tolerances, retained modes, and
+physical acceptance checks keep their existing meanings.
+
+* 2-D bistatic batches share bounded observation weights. Compressed dielectric
+  coefficient queries fuse common kernel work and reuse the existing angular
+  compression hint across compatible frequencies. Near coefficient storage is
+  capped at 16 MiB in RAM, with larger stores using automatically removed
+  temporary files; polynomial integration works in bounded batches. Integer
+  near-pair plans still grow with the number of interactions.
+* BoR near coefficients combine duplicate nodal destinations while preserving
+  source impedance weights and independent reciprocal-pair diagnostics.
+  Compressed far blocks retain a shared basis when that reduces storage.
+  Angular projection selects complex products, packed real products, or
+  DCT/DST evaluation of the same folded quadrature, including their scratch
+  memory in the chunk allowance.
+* Large material BoR systems can use the existing checked hierarchical
+  factorization with dense fallback. Rectangular cross-surface storage can
+  compress well-separated tiles only after checking every original tile's
+  coefficients; nearby tiles remain dense. Mode ranges and temporary disk
+  spilling remain available. Closely spaced layers may offer little compression.
+* Hierarchical factorization uses bounded matrix panels and shared solve
+  destinations. GMRES retains both orthogonalization passes while avoiding
+  repeated copies of the growing conjugated basis.
+* Batch planning reads CPU allocation once per plan and reuses each candidate's
+  thread reservation across its proposed schedules. A new plan reads current
+  allocation again; exhaustive searches avoid repeated OS and optional-import
+  work without changing their scheduling choices.
+* GUI and local/HPC BoR results use shared float64 sample arrays through
+  certification and export. Public Python calls still return ordinary lists
+  unless wrapped in `ghost_backend.twod.samples.compact_samples()`. GRIM
+  formats, channel ordering, amplitudes, phase, and diagnostics are preserved.
+
+Runtime reports retain the original main-process RAM measurement and add
+parent-plus-worker samples. Shared pages can be counted more than once in
+those sums. Windows private committed memory, when available, is reported
+separately from resident RAM. These samples include other concurrent work and
+are not an exclusive allocation peak.
+
+Small Windows stage benchmarks found about 22% less dielectric assembly time
+and 40% less bistatic projection time. A 100,000-sample BoR storage probe used
+about 8.8 MB retained with compact rows versus 92 MB with dictionary rows.
+These are component measurements, not whole-solve speedup or peak-RAM
+guarantees. Linux timing and native-build qualification require a Linux host.
 
 ## GPU scope
 

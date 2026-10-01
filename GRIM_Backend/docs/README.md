@@ -9,6 +9,10 @@ self-contained tools under `tools/`; GRIM embeds their authoritative user
 interfaces instead of copying their numerical implementations into the
 plotting code.
 
+The [vehicle assembly guide](ASSEMBLY_WORKFLOW.md) describes the Body, Points,
+Line features, and Build workflow, including direct feature authoring and reusable
+assembly recipes.
+
 Run GRIM from the repository root after an editable installation:
 
 ```powershell
@@ -547,8 +551,7 @@ it never silently treats changed bytes as the saved configuration. Loading a
 different recipe or closing GRIM with recipe edits presents **Save / Discard /
 Cancel**, so a trade-study configuration is not silently lost. Current recipes
 use schema version 5. Only the current
-recipe format is accepted. Recipes now retain the installed host material,
-stack ID, declared minimum principal radius, and exact study samples.
+recipe format is accepted. Recipes retain the exact study samples.
 If every feature is unchecked, **Preview geometry** deliberately shows the
 clean body alone. Validation and build also accept this body-only baseline,
 including a body with no placement CSVs. A body-only build needs no mounting
@@ -751,7 +754,7 @@ used for frequency-sweep slides.
 
 **Build Preview** renders the real 16:9 slide geometry used by export. Review
 pages with Previous/Next, choose either a fresh blank deck or a widescreen 16:9
-`.pptx`/`.potx` template, and then select **Export PPTX**. GRIM includes
+`.pptx`/`.potx` template, and then select **Export PowerPoint**. GRIM includes
 `templates/GRIM_Report_Template.pptx` as an editable starting point and selects
 it automatically when that file is present. It provides the named custom
 layouts **GRIM Azimuth 3x2** and **GRIM Frequency Sweep** under **GRIM Report
@@ -781,8 +784,19 @@ report presentation created by GRIM; presentations already open in PowerPoint
 and PowerPoint's application-level visibility and alert settings are preserved.
 GRIM never issues PowerPoint's application-wide **Quit** command.
 
-The slide preview uses GRIM's normal NumPy/Matplotlib/PySide dependencies.
-Final export currently requires Windows, desktop Microsoft PowerPoint, and the
+To save the report's images separately, select **Build preview**, then
+**Export PNG images…** and choose a destination folder. GRIM creates a new
+dated report folder containing numbered slide folders. Each plot filename
+includes its order, plot type, and cut/frequency/polarization caption; any
+shared slide legend is saved as `legend.png`. A `manifest.json` preserves the
+full titles, axis units, dataset labels, and image paths. All report pages are
+exported using the same PNG renderer, resolution, and styles as PowerPoint.
+Template/master artwork is not included. Existing exports are preserved, and
+a failed export does not leave a partial report folder.
+
+The slide preview and PNG export use GRIM's normal NumPy/Matplotlib/PySide
+dependencies; neither requires `python-pptx`, PowerPoint, or a template.
+PowerPoint export currently requires Windows, desktop Microsoft PowerPoint, and the
 optional bridge installed with:
 
 ```powershell

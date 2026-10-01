@@ -107,12 +107,13 @@ def _read_response_cut(path, *, frequency, elevation, polarization, cancel_check
 
 class _CutWorker(QObject):
     done = Signal(object)
-    def __init__(self, paths, selected, cancel):
+    def __init__(self, paths, selected, cancel, generation=0):
         super().__init__()
         self.paths, self.selected, self.cancel = paths, selected, cancel
+        self.generation = generation
     @Slot()
     def run(self):
-        result = {"curves": [], "errors": []}
+        result = {"curves": [], "errors": [], "_generation": self.generation}
         try:
             axes = response_axes(self.paths[-1][1])
             selection = self.selected or (float(axes[2][0]), float(axes[1][np.argmin(np.abs(axes[1]))]), str(axes[3][0]))
@@ -137,6 +138,7 @@ class ResponseComparison(QWidget):
         super().__init__(parent)
         self._paths, self._thread, self._pending = [], None, None
         self._cancel = threading.Event()
+        self._generation = 0
         self._last_result, self._difference_axes = None, None
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
@@ -171,6 +173,28 @@ class ResponseComparison(QWidget):
         self.source_label.setToolTip("\n".join(f"{label}: {path}" for label, path in self._paths))
         self._queue(None)
 
+    def clear_outputs(self):
+        """Reset this vehicle's plots and safely discard in-flight archive reads."""
+        self._generation += 1
+        self._cancel.set()
+        self._paths = []
+        self._pending = None
+        self._last_result = None
+        for combo in (self.frequency, self.elevation, self.polarization):
+            blocked = combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(blocked)
+        if self._difference_axes is not None:
+            self._difference_axes.remove()
+            self._difference_axes = None
+        self.axes.clear()
+        self.axes.set(xlabel="Azimuth (deg)", ylabel="RCS (dBsm)")
+        self.axes.grid(alpha=.25)
+        self.canvas.draw_idle()
+        self.source_label.setText("Comparison uses saved response files.")
+        self.source_label.setToolTip("")
+        self.status.setText("Build an Assembly to compare body, features and coherent total. Double-click a feature in the 3-D tab to select it for editing.")
+
     def refresh(self, *_):
         if self._paths and all(combo.count() for combo in (self.frequency, self.elevation, self.polarization)):
             self._queue((float(self.frequency.currentData()), float(self.elevation.currentData()), str(self.polarization.currentData())))
@@ -184,7 +208,7 @@ class ResponseComparison(QWidget):
         self._pending = None
         self._cancel = threading.Event()
         self._thread = QThread(self)
-        self._worker = _CutWorker(paths, selection, self._cancel)
+        self._worker = _CutWorker(paths, selection, self._cancel, self._generation)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._show)
@@ -195,7 +219,7 @@ class ResponseComparison(QWidget):
         self._thread.start()
 
     def _show(self, result):
-        if self._cancel.is_set():
+        if self._cancel.is_set() or result.get("_generation", self._generation) != self._generation:
             return
         self._last_result = result
         if "axes" in result:

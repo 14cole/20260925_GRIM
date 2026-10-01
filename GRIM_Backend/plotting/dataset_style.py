@@ -21,6 +21,25 @@ _LINE_PROPERTIES = (
     "color", "linewidth", "linestyle", "marker", "markersize",
     "markerfacecolor", "markeredgecolor", "markeredgewidth",
 )
+# Plot-item key shared by every artist of one PBP envelope, so a band is
+# selected, highlighted, and removed as one item alongside dataset curves.
+# PBP by group draws one band per group name; the ungrouped band uses "".
+def pbp_band_key(group: str | None = None) -> tuple[str, str]:
+    return ("pbp_band", str(group or ""))
+
+
+def is_pbp_band_key(key) -> bool:
+    return isinstance(key, tuple) and len(key) == 2 and key[0] == "pbp_band"
+
+
+PBP_BAND_KEY = pbp_band_key()
+
+
+def _legend_label(artist) -> str | None:
+    label = artist.get_label()
+    if isinstance(label, str) and label and not label.startswith("_"):
+        return label
+    return None
 
 
 class DatasetPlotStyleMixin:
@@ -31,7 +50,10 @@ class DatasetPlotStyleMixin:
         return reference.dataset_id if reference is not None else id(dataset)
 
     def _register_dataset_line(self, line, dataset) -> None:
-        line._grim_dataset_key = self._dataset_plot_key(dataset)
+        self._register_plot_line(line, self._dataset_plot_key(dataset))
+
+    def _register_plot_line(self, line, key) -> None:
+        line._grim_dataset_key = key
         line._grim_base_style = {
             name: getattr(line, f"get_{name}")() for name in _LINE_PROPERTIES
         }
@@ -215,9 +237,106 @@ class DatasetPlotStyleMixin:
         menu.addAction("Reset plot style", lambda: self._set_dataset_plot_style(keys))
 
     def _show_dataset_plot_style_menu(self, line, global_pos) -> None:
+        self._dataset_plot_menu(line).exec(global_pos)
+
+    def _dataset_plot_menu(self, line) -> QMenu:
+        """Build the right-click menu for one curve, legend entry, or PBP band."""
         key = line._grim_dataset_key
         self._highlight_plot_dataset(key)
         menu = QMenu(self)
-        menu.addSection(line.get_label().split(" | ", 1)[0])
-        self._add_dataset_plot_style_menu(menu, [key], line=line)
-        menu.exec(global_pos)
+        menu.addSection(self._plot_item_name(key))
+        if not is_pbp_band_key(key):
+            self._add_dataset_plot_style_menu(menu, [key], line=line)
+            menu.addSeparator()
+        remove = menu.addAction(
+            "Remove from plot\tDel", lambda: self._remove_plot_dataset(key)
+        )
+        remove.setEnabled(self._plot_item_removal_blocked_reason() is None)
+        return menu
+
+    def _plot_item_artists(self, key) -> list:
+        return [
+            artist
+            for ax in self.plot_figure.axes
+            for artist in (*ax.lines, *ax.collections)
+            if getattr(artist, "_grim_dataset_key", None) == key
+        ]
+
+    def _plot_item_name(self, key, artists=None) -> str:
+        for artist in self._plot_item_artists(key) if artists is None else artists:
+            label = _legend_label(artist)
+            if label is not None:
+                return label.split(" | ", 1)[0]
+        return "PBP band" if is_pbp_band_key(key) else "Dataset"
+
+    def _remove_plot_item_artists(self, key) -> list:
+        """Detach one dataset's curves (or the PBP band) from the canvas."""
+        removed = []
+        for ax in self.plot_figure.axes:
+            artists = [
+                artist for artist in (*ax.lines, *ax.collections)
+                if getattr(artist, "_grim_dataset_key", None) == key
+            ]
+            for artist in artists:
+                artist.remove()
+            legend = ax.get_legend()
+            if legend is not None and any(_legend_label(a) for a in artists):
+                # The legend is rebuilt from the remaining artists.
+                legend.remove()
+            removed.extend(artists)
+        return removed
+
+    def _plot_item_removal_blocked_reason(self) -> str | None:
+        if getattr(self, "last_plot_mode", None) == "compare":
+            return (
+                "RF Compare always shows its two datasets together; select a "
+                "different pair and plot again."
+            )
+        return None
+
+    def _remove_plot_dataset(self, key) -> bool:
+        """Remove one dataset (or the PBP band) from the Plotting canvas only.
+
+        The dataset table selection is left alone, so plotting again brings
+        the dataset back.
+        """
+        if key is None or getattr(self, "_active_plot_tab", "plotting") != "plotting":
+            return False
+        blocked = self._plot_item_removal_blocked_reason()
+        if blocked is not None:
+            self.status.showMessage(blocked)
+            return False
+        removed = self._remove_plot_item_artists(key)
+        if not removed:
+            return False
+        name = self._plot_item_name(key, removed)
+        self._highlighted_plot_datasets = (
+            set(getattr(self, "_highlighted_plot_datasets", set())) - {key}
+        )
+        figure = self.plot_figure
+        figure._grim_held_phase_datasets = [
+            entry for entry in getattr(figure, "_grim_held_phase_datasets", [])
+            if self._dataset_plot_key(entry[1]) != key
+        ]
+        self._drop_dataset_from_python_plot_spec(key)
+        self._restore_plot_markers()
+        self._update_legend_visibility()
+        self._maybe_autoscale()
+        self.plot_canvas.draw_idle()
+        self.status.showMessage(f"Removed {name} from the plot. Plot again to restore it.")
+        return True
+
+    def _on_plot_key_press(self, event) -> None:
+        if getattr(event, "canvas", None) is not self.plot_canvas:
+            return
+        if self._on_marker_key(event):
+            return
+        if getattr(event, "key", None) not in ("delete", "backspace"):
+            return
+        keys = list(getattr(self, "_highlighted_plot_datasets", set()))
+        removed = [key for key in keys if self._remove_plot_dataset(key)]
+        if not removed and self._plot_item_removal_blocked_reason() is None:
+            self.status.showMessage(
+                "Click a curve or legend entry to select it, then press Delete "
+                "to remove it from the plot."
+            )

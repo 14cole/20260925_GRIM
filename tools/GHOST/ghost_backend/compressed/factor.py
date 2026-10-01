@@ -114,6 +114,7 @@ class CompressedFactor:
         """
         n,count=b.shape
         x=np.array(x,complex,copy=True);iterations=0;previous=np.inf
+        basis_storage=work_storage=None
         while True:
             self.checkpoint()
             residual=b-self.a.matmul(x,trans)
@@ -126,7 +127,13 @@ class CompressedFactor:
             previous=worst
             beta=np.linalg.norm(residual[:,active],axis=0)
             c,m=len(active),min(GMRES_RESTART,GMRES_ITERATION_CAP-iterations)
-            basis=np.empty((n,c,m+1),complex);basis[:,:,0]=residual[:,active]/beta
+            if basis_storage is None:
+                # Each iteration's n-by-c RHS is contiguous. Reuse this
+                # allocation across restarts, including shrinking active sets.
+                basis_storage=np.empty((n,count,GMRES_RESTART+1),complex,order='F')
+                work_storage=np.empty((n,count),complex,order='F')
+            basis=basis_storage[:,:c,:m+1];work=work_storage[:,:c]
+            basis[:,:,0]=residual[:,active]/beta
             hessenberg=np.zeros((c,m+1,m),complex)
             cosines=np.zeros((c,m),complex);sines=np.zeros((c,m),complex)
             rhs=np.zeros((c,m+1),complex);rhs[:,0]=beta
@@ -135,8 +142,12 @@ class CompressedFactor:
                 self.checkpoint()
                 w=self.a.matmul(self.factor.apply(basis[:,:,j],solve=True,trans=trans),trans)
                 for _ in range(2):
-                    h=np.einsum('ncj,nc->cj',basis[:,:,:j+1].conj(),w)
-                    w-=np.einsum('ncj,cj->nc',basis[:,:,:j+1],h)
+                    # Conjugate the current vector, not the growing Krylov
+                    # basis: <V,w> = conjugate(V.T @ conjugate(w)).
+                    np.conjugate(w,out=work)
+                    h=np.einsum('ncj,nc->cj',basis[:,:,:j+1],work).conj()
+                    np.einsum('ncj,cj->nc',basis[:,:,:j+1],h,out=work)
+                    w-=work
                     hessenberg[:,:j+1,j]+=h
                 size=np.linalg.norm(w,axis=0)
                 breakdown=size<=1e-14*np.linalg.norm(hessenberg[:,:j+1,j],axis=1)
@@ -157,7 +168,8 @@ class CompressedFactor:
                 # there, or at a breakdown: every column's triangle is nonsingular now.
                 if np.all(abs(rhs[:,j+1])<=REFINEMENT_BACKWARD_ERROR*denominator[active]/4) or np.any(breakdown):break
             y=np.linalg.solve(hessenberg[:,:steps,:steps],rhs[:,:steps,None])[...,0]
-            x[:,active]+=self.factor.apply(np.einsum('ncj,cj->nc',basis[:,:,:steps],y),solve=True,trans=trans)
+            np.einsum('ncj,cj->nc',basis[:,:,:steps],y,out=work)
+            x[:,active]+=self.factor.apply(work,solve=True,trans=trans)
 
     def inverse(self,rhs,trans=0,return_residual=False,limit=SOLVE_BACKWARD_ERROR_LIMIT):
         if trans not in (0,1,2):raise ValueError('Invalid transpose mode.')

@@ -7,10 +7,68 @@ import numpy as np
 from . import common
 
 
+def _series(self, reference, plan, *, p50_mode, az_bounds):
+    """Yield (x, display, label, trace_key) for one dataset, one per frequency."""
+    name, dataset, freq_indices, az_indices, elev_indices, pol_indices = plan
+    freq_unit = self._plot_axis_unit(reference, "frequency")
+    az_unit = self._plot_axis_unit(reference, "azimuth")
+    az_name = self._plot_axis_name(reference, "azimuth")
+    az_min, az_max = az_bounds
+    x_values = self._plot_axis_values(
+        reference, dataset, "elevation", dataset.elevations[elev_indices]
+    )
+    pol_value = dataset.polarizations[pol_indices[0]]
+    selected_azimuths = tuple(float(value) for value in dataset.azimuths[az_indices])
+    selected_elevations = tuple(float(value) for value in dataset.elevations[elev_indices])
+    for freq_idx in freq_indices:
+        native_frequency = float(dataset.frequencies[freq_idx])
+        frequency = float(
+            self._plot_axis_values(reference, dataset, "frequency", [native_frequency])[0]
+        )
+        if self._button_checked(self.btn_phase):
+            raw = dataset.rcs_slice(
+                np.ix_(az_indices, elev_indices, [freq_idx], [pol_indices[0]])
+            )[:, :, 0, 0]
+            phase_degrees = self._phase_display_degrees(dataset, raw)
+            display = (
+                self._wrap_phase_degrees(
+                    dataset, self._phase_p50(phase_degrees, axis=0)
+                )
+                if p50_mode else phase_degrees[0]
+            )
+        else:
+            power = dataset.rcs_power[
+                np.ix_(az_indices, elev_indices, [freq_idx], [pol_indices[0]])
+            ][:, :, 0, 0]
+            power = np.where(np.isfinite(power), power, np.nan)
+            if p50_mode:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    linear = np.nanmedian(power, axis=0)
+            else:
+                linear = power[0]
+            display = self._display_from_linear(
+                dataset, linear, frequency_value=native_frequency
+            )
+        if p50_mode:
+            label = (
+                f"{name} | Pol {pol_value}, Freq {frequency:.12g} {freq_unit}, "
+                f"P50 over {az_name} ({az_min:.12g},{az_max:.12g}) {az_unit}"
+            )
+        else:
+            label = (
+                f"{name} | Pol {pol_value}, Freq {frequency:.12g} {freq_unit}, "
+                f"{az_name} {az_min:.12g} {az_unit}"
+            )
+        trace_key = ("p50" if p50_mode else "cut", selected_azimuths,
+                     selected_elevations, native_frequency, str(pol_value))
+        yield x_values, display, label, trace_key
+
+
 def render(self) -> None:
     self.last_plot_mode = "elevation_sweep"
     self._start_plot_render()
-    datasets = self._selected_datasets()
+    datasets = self._with_delta_reference(self._selected_datasets())
     if not datasets:
         self.status.showMessage("Select a dataset before plotting.")
         return
@@ -79,6 +137,14 @@ def render(self) -> None:
     except ValueError as exc:
         self.status.showMessage(f"Plot blocked: {exc}.")
         return
+    az_bounds = (float(az_values[0]), float(az_values[-1]))
+
+    def series_for(plan):
+        return _series(self, reference, plan, p50_mode=p50_mode, az_bounds=az_bounds)
+
+    delta = self._delta_reference(plans, series_for)
+    if delta is False:
+        return
     if not self._prepare_line_plot_axes(
         "elevation_sweep", "rectilinear", reference, datasets
     ):
@@ -86,66 +152,20 @@ def render(self) -> None:
 
     rendered = 0
     omitted = 0
-    freq_unit = self._plot_axis_unit(reference, "frequency")
-    az_unit = self._plot_axis_unit(reference, "azimuth")
-    az_name = self._plot_axis_name(reference, "azimuth")
-    az_min, az_max = float(az_values[0]), float(az_values[-1])
-
-    for name, dataset, freq_indices, az_indices, elev_indices, pol_indices in plans:
+    for plan in plans:
+        name, dataset, freq_indices = plan[0], plan[1], plan[2]
+        if delta is not None and dataset is delta.dataset:
+            continue
         if rendered >= common.MAX_LINE_SERIES:
             omitted += len(freq_indices)
             continue
-        x_values = self._plot_axis_values(
-            reference, dataset, "elevation", dataset.elevations[elev_indices]
-        )
-        pol_value = dataset.polarizations[pol_indices[0]]
-        selected_azimuths = tuple(float(value) for value in dataset.azimuths[az_indices])
-        selected_elevations = tuple(float(value) for value in dataset.elevations[elev_indices])
-        for candidate_index, freq_idx in enumerate(freq_indices):
-            native_frequency = float(dataset.frequencies[freq_idx])
-            frequency = float(
-                self._plot_axis_values(reference, dataset, "frequency", [native_frequency])[0]
-            )
-            if self._button_checked(self.btn_phase):
-                raw = dataset.rcs_slice(
-                    np.ix_(az_indices, elev_indices, [freq_idx], [pol_indices[0]])
-                )[:, :, 0, 0]
-                phase_degrees = self._phase_display_degrees(dataset, raw)
-                display = (
-                    self._wrap_phase_degrees(
-                        dataset, self._phase_p50(phase_degrees, axis=0)
-                    )
-                    if p50_mode else phase_degrees[0]
-                )
-            else:
-                power = dataset.rcs_power[
-                    np.ix_(az_indices, elev_indices, [freq_idx], [pol_indices[0]])
-                ][:, :, 0, 0]
-                power = np.where(np.isfinite(power), power, np.nan)
-                if p50_mode:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", category=RuntimeWarning)
-                        linear = np.nanmedian(power, axis=0)
-                else:
-                    linear = power[0]
-                display = self._display_from_linear(
-                    dataset, linear, frequency_value=native_frequency
-                )
-            if p50_mode:
-                label = (
-                    f"{name} | Pol {pol_value}, Freq {frequency:.12g} {freq_unit}, "
-                    f"P50 over {az_name} ({az_min:.12g},{az_max:.12g}) {az_unit}"
-                )
-            else:
-                label = (
-                    f"{name} | Pol {pol_value}, Freq {frequency:.12g} {freq_unit}, "
-                    f"{az_name} {az_min:.12g} {az_unit}"
-                )
+        series = series_for(plan)
+        if delta is not None:
+            series = delta.apply(name, series)
+        for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
             if not np.any(np.isfinite(display)):
                 continue
             if rendered < common.MAX_LINE_SERIES:
-                trace_key = ("p50" if p50_mode else "cut", selected_azimuths,
-                             selected_elevations, native_frequency, str(pol_value))
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
                                         dataset=dataset, trace_key=trace_key)
                 rendered += 1
@@ -167,9 +187,12 @@ def render(self) -> None:
         )
 
     self.plot_ax.set_xlabel(self._plot_axis_label(reference, "elevation"))
-    self.plot_ax.set_ylabel(
-        self._display_axis_label(datasets, tag=" P50" if p50_mode else "")
-    )
+    tag = " P50" if p50_mode else ""
+    if delta is not None:
+        self.plot_ax.set_ylabel(self._delta_axis_label(delta, tag=tag))
+        self._finish_delta_plot(delta)
+    else:
+        self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=tag))
     self._update_legend_visibility()
     self.spin_plot_xmin.blockSignals(True)
     self.spin_plot_xmax.blockSignals(True)

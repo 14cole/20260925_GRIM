@@ -41,9 +41,10 @@ class TestGuiEntrypoint(unittest.TestCase):
         window = GhostMainWindow()
         try:
             self.assertEqual(window.windowTitle(), "GHOST 2-D RCS Solver")
-            self.assertEqual(window.tabs.count(), 2)
+            self.assertEqual(window.tabs.count(), 3)
             self.assertEqual(window.tabs.tabText(0), "Geometry")
             self.assertEqual(window.tabs.tabText(1), "Solver")
+            self.assertEqual(window.tabs.tabText(2), "Line Expansion")
             self.assertIs(window.solver_tab.geometry_tab, window.geometry_tab)
         finally:
             window.close()
@@ -55,7 +56,7 @@ class TestGuiEntrypoint(unittest.TestCase):
             lambda paths, kind: received.append((list(paths), kind))
         )
         try:
-            self.assertEqual(workspace.count(), 2)
+            self.assertEqual(workspace.count(), 3)
             self.assertIs(
                 workspace.solver_tab.geometry_tab, workspace.geometry_tab
             )

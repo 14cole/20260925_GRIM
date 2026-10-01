@@ -1,5 +1,7 @@
 """Shared, capability-aware planning before allocating solver operators."""
 import math
+import copy
+import json
 from ghost_backend.execution.options import execution_scope, validate_options
 from ghost_backend.execution.runtime import ScopedValue
 from ghost_backend.execution.policy import MODEL, BACKENDS, relative_cost, rank_candidates
@@ -20,6 +22,104 @@ def current_batch_selection():
 
 
 def select_backend(arguments, options, certified=False, checkpoint=None):
+    """Reuse immutable run forecasts, but make every admission against live RAM."""
+    from ghost_backend.twod.preparation import forecast_cache
+    from ghost_backend.twod import solver as s
+    from ghost_backend.runs.quality import validate_mesh_convergence_policy
+    cache = forecast_cache()
+    if checkpoint:
+        checkpoint()
+    event = arguments.get('abort_event')
+    if event is not None and event.is_set():
+        raise InterruptedError('Backend planning canceled.')
+    fields = ('geometry_snapshot', 'frequencies_ghz', 'elevations_deg', 'polarization')
+    inputs = {key: arguments[key] for key in fields if key in arguments}
+    inputs.update(geometry_units=arguments.get('geometry_units', 'inches'),
+                  material_base_dir=arguments.get('material_base_dir'),
+                  max_panels=arguments.get('max_panels', s.MAX_PANELS_DEFAULT),
+                  mesh_reference_ghz=arguments.get('mesh_reference_ghz'),
+                  fine_factor=validate_mesh_convergence_policy(arguments.get('mesh_convergence_policy'))['fine_factor'] if certified else 1.)
+    normalized = validate_options(options)
+    from ghost_backend.execution.options import (
+        effective_assembly_threads, blas_thread_reservation, allocated_memory_budget,
+    )
+    from ghost_backend.linalg.refined_lu import requested_precision
+    with execution_scope(dict(normalized, factorization='dense')):
+        allocation = (effective_assembly_threads(), blas_thread_reservation(),
+                      allocated_memory_budget(), requested_precision())
+    key = json.dumps([inputs, normalized, allocation], sort_keys=True) if cache is not None else None
+    if cache is not None and key in cache:
+        cached, resource_records = cache[key]
+        result = copy.deepcopy(cached)
+        _refresh_memory_forecast(result, resource_records, arguments, normalized, checkpoint)
+        result['forecast_reused'] = True
+        return result
+    frequencies = list(arguments['frequencies_ghz'])
+    if cache is not None and len(frequencies) > 1 and 'polarization' not in arguments:
+        if len(set(frequencies)) != len(frequencies):
+            raise ValueError('Duplicate frequencies are not supported.')
+        # Setup previews each frequency independently. An uncheckpointed API
+        # sweep may choose one backend for the whole sweep; combine the same
+        # forecasts instead of constructing every candidate mesh again.
+        parts = [select_backend(dict(arguments, frequencies_ghz=[frequency]),
+                                normalized, certified, checkpoint) for frequency in frequencies]
+        result = copy.deepcopy(parts[0])
+        result['meshes'] = [row for part in parts for row in part['meshes']]
+        result['candidates'] = {
+            mode: dict(cost=sum(part['candidates'][mode]['cost'] for part in parts),
+                       peak_gb=max(part['candidates'][mode]['peak_gb'] for part in parts))
+            for mode in result['candidates']}
+        with execution_scope(dict(normalized, factorization='dense')):
+            budget = s._solve_memory_limit_gb()
+        ranked = rank_candidates(result['candidates'], budget)
+        result.update(selected=ranked[0], retry_order=ranked[1:], admission_budget_gib=budget,
+                      dense_peak_gib=max(part['dense_peak_gib'] for part in parts),
+                      forecast_reused=all(part.get('forecast_reused', False) for part in parts))
+        return result
+    resource_records = []
+    result = _forecast_backend(arguments, normalized, certified, checkpoint, resource_records)
+    if cache is not None:
+        # A frequency sweep must not leave an unbounded planning cache behind.
+        if len(cache) >= 128:
+            cache.pop(next(iter(cache)))
+        cache[key] = (copy.deepcopy(result), resource_records)
+    return result
+
+
+def _refresh_memory_forecast(result, resource_records, arguments, options, checkpoint=None):
+    """Reprice saved geometry resources with current RAM and storage limits.
+
+    Automatic compressed storage and dense residual storage depend on live
+    memory, so retaining the old peak and merely re-ranking is insufficient.
+    Only small geometry resource counts are cached; no meshes or operators.
+    """
+    from ghost_backend.twod import solver as s
+    for candidate in result['candidates'].values():
+        candidate['peak_gb'] = 0.
+    dense = dict(options, factorization='dense')
+    with execution_scope(dense):
+        budget = s._solve_memory_limit_gb()
+        for record, (resources, mesh_options) in zip(result['meshes'], resource_records):
+            if checkpoint is not None:
+                checkpoint()
+            event = arguments.get('abort_event')
+            if event is not None and event.is_set():
+                raise InterruptedError('Backend planning canceled.')
+            peaks = {}
+            for mode in result['candidates']:
+                with execution_scope(dict(mesh_options, factorization=mode)):
+                    peaks[mode] = s._estimate_memory_gb(resources['nodes'], False,
+                        n_regions=resources['n_regions'], system_dofs=resources['system_dofs'],
+                        operator_matrices=resources['operator_matrices'], dense_resources=dict(resources),
+                        n_rhs=len(arguments['elevations_deg']), solver_method='experimental_cpu')
+                result['candidates'][mode]['peak_gb'] = max(result['candidates'][mode]['peak_gb'], peaks[mode])
+            record.update(dense_peak_gib=peaks['dense'], backend_peak_gib=peaks)
+    ranked = rank_candidates(result['candidates'], budget)
+    result.update(selected=ranked[0], retry_order=ranked[1:], admission_budget_gib=budget,
+                  dense_peak_gib=max(record['dense_peak_gib'] for record in result['meshes']))
+
+
+def _forecast_backend(arguments, options, certified=False, checkpoint=None, resource_records=None):
     """Forecast both polarizations and certification meshes before allocating A.
 
     Rank compatible backends using mesh-specific work and memory forecasts.
@@ -79,6 +179,8 @@ def select_backend(arguments, options, certified=False, checkpoint=None):
                         coupled = s._build_linear_coupled_infos(mesh, materials, freq, pol, k0)
                         layer = s.layer_for_mesh(mesh, materials, freq) if any(i.bc_kind == 'thin_layer' for i in coupled) else None
                         resources = s._dense_formulation_resources(mesh, coupled, pol, layer, sample_compression=False)
+                        if resource_records is not None:
+                            resource_records.append((dict(resources), dict(mesh_options)))
                         peaks={}
                         for mode in BACKENDS:
                             with execution_scope(dict(dense,factorization=mode)):

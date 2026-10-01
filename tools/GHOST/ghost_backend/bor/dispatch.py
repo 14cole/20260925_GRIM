@@ -1926,10 +1926,8 @@ def solve_monostatic_rcs_bor(
         if abort_event is not None and abort_event.is_set():
             raise InterruptedError("Solve cancelled by user.")
 
-    samples_by_pol: 'Dict[str, List[Dict[str, Any]]]' = {
-        "VV": [],
-        "HH": [],
-    }
+    from ghost_backend.bor.samples import channel_buffers, finish_channels, nonfinite_sample_count
+    samples_by_pol = channel_buffers(len(frequencies), aspects, expand_to_360)
     per_freq_meta: 'List[Dict[str, Any]]' = []
     formulation_label = ""
     total_steps = len(frequencies)
@@ -2389,35 +2387,7 @@ def solve_monostatic_rcs_bor(
             except Exception:
                 pass
 
-    if expand_to_360:
-        for channel in ("VV", "HH"):
-            mirrored = []
-            for sample in samples_by_pol[channel]:
-                th = float(sample["theta_inc_deg"])
-                if 0.0 < th < 180.0:
-                    duplicate = dict(sample)
-                    duplicate["theta_inc_deg"] = duplicate["theta_scat_deg"] = (
-                        360.0 - th
-                    )
-                    mirrored.append(duplicate)
-            samples_by_pol[channel] = sorted(
-                samples_by_pol[channel] + mirrored,
-                key=lambda row: (
-                    row["frequency_ghz"],
-                    row["theta_inc_deg"],
-                ),
-            )
-
-    samples = []
-    for channel in ("VV", "HH"):
-        for source in samples_by_pol[channel]:
-            row = dict(source)
-            row["polarization"] = channel
-            samples.append(row)
-    samples.sort(key=lambda row: (
-        row["frequency_ghz"], row["polarization"], row["theta_inc_deg"]
-    ))
-    all_physical_samples = samples
+    samples = finish_channels(samples_by_pol, expand_to_360)
 
     residual_values = np.asarray(
         [row.get("linear_residual", math.nan) for row in per_freq_meta],
@@ -2472,14 +2442,7 @@ def solve_monostatic_rcs_bor(
         not bool(row.get("mode_converged", False))
         for row in per_freq_meta
     ))
-    nonfinite_samples = int(sum(
-        not all(math.isfinite(float(sample[key])) for key in (
-            "rcs_linear",
-            "rcs_amp_real",
-            "rcs_amp_imag",
-        ))
-        for sample in all_physical_samples
-    ))
+    nonfinite_samples = nonfinite_sample_count(samples_by_pol)
     quality_violations: 'List[str]' = []
     if residual_nonfinite_count:
         quality_violations.append(
@@ -2597,9 +2560,9 @@ def solve_monostatic_rcs_bor(
             "frequency_count": int(len(frequencies)),
             "aspect_count": int(len(aspects)),
             "elevation_count": int(len(aspects)),
-            "output_aspect_count": int(len({
-                float(sample["theta_inc_deg"]) for sample in samples
-            })),
+            "output_aspect_count": len(set(aspects) | (
+                {360.0 - angle for angle in aspects if 0.0 < angle < 180.0}
+                if expand_to_360 else set())),
             "expanded_to_360": bool(expand_to_360),
             "per_frequency": per_freq_meta,
             "residual_norm_max": residual_max,
@@ -2645,7 +2608,7 @@ def _bor_channel_result(
     """Expose one co-solved BoR polarization to the shared mesh comparator."""
 
     channels = result.get("co_solved_samples", {}) or {}
-    samples = list(channels.get(polarization, []) or [])
+    samples = channels.get(polarization, [])
     if not samples:
         raise ValueError(
             "Certified BoR solve is missing co-solved "

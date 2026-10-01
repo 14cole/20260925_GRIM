@@ -350,7 +350,8 @@ class ReportWorkflowMixin:
                     if path: bridge.preflight_template(Path(path),layouts)
                     else: bridge.preflight()
                     worker.done.emit('PowerPoint is available. '+result)
-                except Exception as exc: worker.done.emit('Correct before exporting: '+str(exc))
+                except Exception as exc: worker.done.emit('PowerPoint export unavailable: '+str(exc)+' PNG image export remains available.')
+        self._active_export_operation = 'PowerPoint availability check'
         self._set_busy(True)
         self._set_status('Checking PowerPoint and template…')
         self._thread=QThread(self)

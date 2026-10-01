@@ -426,20 +426,28 @@ largest amplitude (1.5e-7 dB within 40 dB of the peak).
   certification are unchanged. The 10 GHz ogive's far blocks: 17 s on eight
   process workers (25 s on threads) against 43 s for the streamed build in
   memory and 62 s spilled, 1.08 GB against 12.1 GB, agreement 2e-11 per mode.
+  Compressed double-precision modal slices now retain a shared orthonormal
+  left basis when it costs less than separate expanded left factors. The
+  existing factors, truncation tolerance, and reconstruction order remain
+  unchanged. Explicit single precision still expands in double before casting.
 - The BoR option `far_compression` selects it: `auto` (default) for surfaces
   of at least `FAR_COMPRESSION_MIN_NODES` (1,000) nodes, `on`, `off`. The
   streaming estimates price the compressed store (2.0-2.4 times above the
   measured stores) for every mode at once; the dense per-range stream budget
   and the spill no longer apply to it. Conductor and dielectric solves price
   it so; the coated, partial-coating and multi-region planners still price
-  their self streams as dense (an upper bound) and keep their cross-surface
-  streams dense.
+  their self streams as dense (an upper bound). Their rectangular cross
+  streams now have a separately verified bounded representation, described below.
 - Tiles are sampled in spawn processes when the near-preparation scope admits
   a process pool (the same capability test and size); otherwise on threads.
 - Mode factors: a mode system of at least 10,000 unknowns on a single surface
   is factored as the checked HODLR inverse of the 2-D dense factor (see
   [numerical methods](NUMERICAL_METHODS.md)), priced at two matrix copies per
   worker instead of three, and falls back to LU if rejected.
+  Dielectric, coated, partial-coating, and multi-region systems also supply
+  their reduced-coordinate ordering to the same checked factor. These newer
+  paths retain the conservative LU memory estimate; the original modal
+  matrix, residual and conditioning gates still decide acceptance and LU fallback.
 - Mirror symmetry: a surface symmetric about a plane normal to its axis
   (nodes, impedances and sheets) factors each mode as its even and odd halves
   (`bor.factor.MirrorSplit`, a quarter of the LU), refined against the exact
@@ -462,6 +470,50 @@ and in `modal_execution.systems` each mode's factor `backend` with any
 factorization. 2-D results record `linear_backend` (`cpu_hierarchical` for the
 hierarchical factor, `cpu` for LU), `dense_fallback_reasons` and, for automatic
 runs, `backend_selection`.
+
+## Bounded near and rectangular storage
+
+Self near blocks accumulate directly into preindexed nodal destinations. EFIE
+and MFIE combine repeated node pairs; IBC also keeps the source element in the
+key so arbitrary element impedances are weighted exactly as before. No full
+uncoalesced coefficient cache is constructed first. Independently integrated
+reciprocal EFIE pairs are compared before accumulation, preserving the existing
+near-quadrature diagnostic. Planning keeps the older conservative upper bound.
+For the 2,000-element sphere topology, 63,088 raw corner entries reduce to
+19,773 nodal entries or 35,544 source-aware entries: at a mode cap of 128,
+520.9 MB per raw four-component family becomes 163.2 MB or 293.5 MB respectively.
+These are retained coefficient byte counts, not measured process peak memory.
+
+Double-precision cross streams selected by `far_compression` use complete
+original quadrature samples in rectangular nodal tiles. Only geometrically
+separated tiles whose supporting elements contain no near pair may be reduced.
+An SVD proposes factors; comparison against **every original coefficient** must
+pass the existing 1e-10 relative Frobenius tolerance and save payload bytes.
+Otherwise the exact tile remains dense. Near integration, signed-mode parity,
+mode caps, mesh, and material properties are unchanged. This avoids a new
+coefficient-accuracy assumption based on sampled rows or solve residuals.
+
+The rectangular store preserves admitted mode ranges and disk spilling. Its
+numerical payload cannot exceed the corresponding dense range. Resident values
+occupy an arena with at most 1 MiB of unused final capacity; spilled values use
+one delete-on-close file. Each component uses three int64 index values rather
+than a retained Python record. Index/container overhead and arena slack are
+reserved within the existing tile-work budget; tile dimensions and modal
+batches shrink to fit the existing sampler/contraction memory model. If the
+index or minimum tile allowance cannot fit, the original dense stream is used.
+The existing dense rectangular resource forecast remains in force. This change
+primarily reduces retained RAM and spill I/O; it still samples every coefficient
+and adds small SVDs, so it is not an unconditional preparation-time speedup.
+
+Cross EFIE and rotated-PV assembly can also write directly into a caller's
+strided system-matrix quadrants. This removes intermediate component matrices;
+their scaling and near additions occur in the original numerical order.
+Material results report `stream_far_compression` by operator name, including
+coefficient-check evidence, retained/spilled payload, compact index allowance,
+and any budget fallback. A small complete lossy coated-sphere solve compares
+complex fields against the original streamed store; separate tests compare
+real/complex-medium coefficients, signed modes, near preservation, spill
+cleanup, and forced hierarchical acceptance/rejection on all material paths.
 
 ## Geometry and angle conventions
 

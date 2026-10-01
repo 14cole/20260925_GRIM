@@ -120,9 +120,6 @@ def feature_assembly_recipe_payload(
 
     serialized_values: dict[str, Any] = {
         **{key: getattr(values, key) for key in ("study_frequencies_ghz", "study_azimuths_deg", "study_elevations_deg")},
-        "host_material": values.host_material,
-        "host_stack_id": values.host_stack_id,
-        "host_minimum_radius_m": values.host_minimum_radius_m,
         "base_grim": relative(values.base_grim),
         "output_grim": relative(values.output_grim),
         "coordinate_units": str(values.coordinate_units),
@@ -320,9 +317,6 @@ def read_feature_assembly_recipe(
     raw_values = payload.get("values")
     if not isinstance(raw_values, Mapping):
         raise ValueError("Assembly recipe values must be a JSON object.")
-    for key in ("host_material", "host_stack_id"):
-        if not isinstance(raw_values.get(key, ""), str):
-            raise ValueError(f"Recipe {key} must be a string.")
 
     required = {
         "base_grim",
@@ -433,9 +427,6 @@ def read_feature_assembly_recipe(
         normal_tol_deg=normal_tol,
         allow_legacy_base_metadata=raw_values["allow_legacy_base_metadata"],
         **{key: parse_study_samples(raw_values.get(key)) for key in ("study_frequencies_ghz", "study_azimuths_deg", "study_elevations_deg")},
-        host_material=raw_values.get("host_material", ""),
-        host_stack_id=raw_values.get("host_stack_id", ""),
-        host_minimum_radius_m=(None if raw_values.get("host_minimum_radius_m") is None else _require_finite_nonnegative(raw_values["host_minimum_radius_m"], "Host minimum radius")),
         require_feature_manifests=raw_values["require_feature_manifests"],
         require_body_mesh_certification=raw_values["require_body_mesh_certification"],
         base_dir=None,

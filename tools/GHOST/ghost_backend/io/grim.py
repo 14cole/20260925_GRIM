@@ -3,6 +3,7 @@ import cmath
 import math
 import os
 import tempfile
+from io import StringIO
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -60,7 +61,6 @@ def _json_safe(value: 'Any') -> 'Any':
 def _solver_metadata_json(result: 'Dict[str, Any]') -> 'str':
     """Build the stable audit envelope stored alongside every solver export."""
 
-    diagnostics = []
     diagnostic_keys = (
         'linear_residual',
         'linear_backward_error',
@@ -68,26 +68,18 @@ def _solver_metadata_json(result: 'Dict[str, Any]') -> 'str':
         'constraint_residual_norm',
         'condition_est',
     )
-    for row in result.get('samples', []) or []:
-        values = {
-            key: row[key]
-            for key in diagnostic_keys
-            if key in row
-        }
-        if not values:
-            continue
-        diagnostics.append({
-            'frequency_ghz': row.get('frequency_ghz'),
-            'theta_inc_deg': row.get('theta_inc_deg'),
-            'theta_scat_deg': row.get('theta_scat_deg'),
-            'polarization': row.get('polarization', ''),
-            **values,
-        })
-    diagnostics.sort(key=lambda row: (
-        float(row.get('frequency_ghz', 0.0)),
-        float(row.get('theta_inc_deg', 0.0)),
-        float(row.get('theta_scat_deg', 0.0)),
-    ))
+    from ghost_backend.twod.samples import sample_column, sorted_samples
+    samples = result.get('samples', []) or []
+    if sample_column(samples, 'linear_residual') is not None:
+        # Standard compact rows all contain linear_residual. Sort only indices;
+        # materialize and encode each diagnostic once, without retaining dicts.
+        diagnostic_rows = sorted_samples(samples)
+    else:
+        diagnostic_rows = sorted(
+            (row for row in samples if any(key in row for key in diagnostic_keys)),
+            key=lambda row: tuple(float(row.get(key)) for key in
+                                  ('frequency_ghz', 'theta_inc_deg', 'theta_scat_deg')),
+        )
 
     envelope = {
         'schema': SOLVER_METADATA_SCHEMA,
@@ -102,15 +94,36 @@ def _solver_metadata_json(result: 'Dict[str, Any]') -> 'str':
         'amplitude_convention': result.get('amplitude_convention', ''),
         'amplitude_version': result.get('amplitude_version', 1),
         'metadata': result.get('metadata', {}) or {},
-        'sample_diagnostics': diagnostics,
+        'sample_diagnostics': None,
     }
-    return json.dumps(
-        _json_safe(envelope),
-        sort_keys=True,
-        separators=(',', ':'),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+    encoder = json.JSONEncoder(sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
+    def encode(value):
+        return encoder.encode(_json_safe(value))
+    # The exported schema and deterministic key/row order are unchanged. The
+    # JSON string is required by GRIM; temporary Python diagnostic objects are not.
+    stream = StringIO()
+    stream.write('{')
+    for index, key in enumerate(sorted(envelope)):
+        if index:
+            stream.write(',')
+        stream.write(encode(key) + ':')
+        if key != 'sample_diagnostics':
+            stream.write(encode(envelope[key]))
+            continue
+        stream.write('[')
+        for row_index, row in enumerate(diagnostic_rows):
+            if row_index:
+                stream.write(',')
+            stream.write(encode(dict(
+                frequency_ghz=row.get('frequency_ghz'),
+                theta_inc_deg=row.get('theta_inc_deg'),
+                theta_scat_deg=row.get('theta_scat_deg'),
+                polarization=row.get('polarization', ''),
+                **{key: row[key] for key in diagnostic_keys if key in row},
+            )))
+        stream.write(']')
+    stream.write('}')
+    return stream.getvalue()
 
 
 def _required_finite_sample_value(row: 'Dict[str, Any]', key: 'str') -> 'float':
@@ -215,7 +228,7 @@ def _build_grid_for_samples(
             "rcs_linear_quantity must be 'sigma_2d' or 'sigma_3d'."
         )
 
-    validated_rows = []
+    validated_rows = np.empty((len(samples), 5), dtype=np.float64)
     for row_index, row in enumerate(samples):
         try:
             az = _required_finite_sample_value(row, 'theta_scat_deg')
@@ -263,7 +276,7 @@ def _build_grid_for_samples(
                 f"{linear_quantity} normalization (expected "
                 f"{expected_linear:.12g})."
             )
-        validated_rows.append((az, freq, lin, amp_real, amp_imag))
+        validated_rows[row_index] = (az, freq, lin, amp_real, amp_imag)
 
     azimuths = np.asarray(sorted({row[0] for row in validated_rows}), dtype=float)
     elevations = np.asarray([0.0], dtype=float)
@@ -406,7 +419,7 @@ def _build_grid_for_co_solved_samples(
     channel_payloads = []
     for polarization in required:
         channel_payloads.append(_build_grid_for_samples(
-            list(co_solved_samples[polarization] or []),
+            co_solved_samples[polarization] or [],
             polarization,
             source_path=source_path,
             history=history,
@@ -821,6 +834,32 @@ def _save_grim_npz_batch(
                     except OSError:
                         pass
 
+def _group_incidence_samples(samples, channel=''):
+    """Group compact rows by incidence with numeric indices, preserving order."""
+    from ghost_backend.twod.samples import sample_column, SampleSelection
+    incidence = sample_column(samples, 'theta_inc_deg')
+    if incidence is not None:
+        invalid = np.flatnonzero(~np.isfinite(incidence))
+        if not len(invalid):
+            order = np.argsort(incidence, kind='stable')
+            ordered = incidence[order]
+            boundaries = np.concatenate(([0], np.flatnonzero(ordered[1:] != ordered[:-1]) + 1, [len(order)]))
+            return {float(ordered[start]): SampleSelection(samples, order[start:end])
+                    for start, end in zip(boundaries[:-1], boundaries[1:]) if start < end}
+        indexed_rows = ((index, samples[index]) for index in invalid[:1])
+    else:
+        indexed_rows = enumerate(samples)
+    grouped = {}
+    for index, row in indexed_rows:
+        try:
+            value = _required_finite_sample_value(row, 'theta_inc_deg')
+        except ValueError as exc:
+            raise ValueError('Invalid {}bistatic solver sample at index {}: {}'.format(
+                channel + ' ' if channel else '', index, exc)) from exc
+        grouped.setdefault(value, []).append(row)
+    return grouped
+
+
 def export_result_to_grim(
     result: 'Dict[str, Any]',
     output_path: 'str',
@@ -889,17 +928,7 @@ def export_result_to_grim(
     if dual_polarized:
         by_channel_inc: 'Dict[str, Dict[float, List[Dict[str, Any]]]]' = {}
         for channel in ('VV', 'HH'):
-            by_inc_channel: 'Dict[float, List[Dict[str, Any]]]' = {}
-            for row_index, row in enumerate(list(co_solved[channel] or [])):
-                try:
-                    inc = _required_finite_sample_value(row, 'theta_inc_deg')
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Invalid {channel} bistatic solver sample at index "
-                        f"{row_index}: {exc}"
-                    ) from exc
-                by_inc_channel.setdefault(inc, []).append(row)
-            by_channel_inc[channel] = by_inc_channel
+            by_channel_inc[channel] = _group_incidence_samples(co_solved[channel] or [], channel)
         incidence_sets = [set(by_channel_inc[channel]) for channel in ('VV', 'HH')]
         if incidence_sets[0] != incidence_sets[1]:
             raise ValueError(
@@ -910,6 +939,7 @@ def export_result_to_grim(
         rootspec = _ensure_grim_ext(output_path)
         root_no_ext = rootspec[:-5]
         batch = []
+        metadata_json = None
         for inc in sorted(incidence_sets[0]):
             payload = _build_grid_for_co_solved_samples(
                 {
@@ -922,24 +952,19 @@ def export_result_to_grim(
                 preserve_raw_complex_amplitude=preserve_raw_complex_amplitude,
                 **unit_kwargs,
             )
-            payload['solver_metadata_json'] = _solver_metadata_json(result)
+            if metadata_json is None:
+                metadata_json = _solver_metadata_json(result)
+            payload['solver_metadata_json'] = metadata_json
             out = f'{root_no_ext}_{_suffix_for_incidence(inc)}.grim'
             batch.append((payload, out))
         return _save_grim_npz_batch(batch)
 
-    by_inc: 'Dict[float, List[Dict[str, Any]]]' = {}
-    for row_index, row in enumerate(samples):
-        try:
-            inc = _required_finite_sample_value(row, 'theta_inc_deg')
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid bistatic solver sample at index {row_index}: {exc}"
-            ) from exc
-        by_inc.setdefault(inc, []).append(row)
+    by_inc = _group_incidence_samples(samples)
 
     rootspec = _ensure_grim_ext(output_path)
     root_no_ext = rootspec[:-5]
     batch = []
+    metadata_json = None
     for inc in sorted(by_inc.keys()):
         payload = _build_grid_for_samples(
             by_inc[inc],
@@ -949,7 +974,9 @@ def export_result_to_grim(
             preserve_raw_complex_amplitude=preserve_raw_complex_amplitude,
             **unit_kwargs,
         )
-        payload['solver_metadata_json'] = _solver_metadata_json(result)
+        if metadata_json is None:
+            metadata_json = _solver_metadata_json(result)
+        payload['solver_metadata_json'] = metadata_json
         out = f'{root_no_ext}_{_suffix_for_incidence(inc)}.grim'
         batch.append((payload, out))
     return _save_grim_npz_batch(batch)
@@ -991,14 +1018,8 @@ def export_result_to_dbke_csv(
         raise ValueError('No solver samples were returned, nothing to export.')
 
     out = _ensure_csv_ext(output_path)
-    rows = sorted(
-        samples,
-        key=lambda row: (
-            float(row.get('frequency_ghz', 0.0)),
-            float(row.get('theta_inc_deg', 0.0)),
-            float(row.get('theta_scat_deg', 0.0)),
-        ),
-    )
+    from ghost_backend.twod.samples import sorted_samples
+    rows = sorted_samples(samples)
     header = [
         'frequency_hz',
         'theta_inc_deg',

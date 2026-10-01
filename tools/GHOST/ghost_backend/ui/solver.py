@@ -17,8 +17,8 @@ try:
     from PySide6.QtCore import QObject, QStandardPaths, QThread, Qt, Signal, Slot
     from PySide6.QtWidgets import (
         QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-        QLineEdit, QMessageBox, QPushButton, QSplitter, QTableWidget,
-        QTableWidgetItem, QVBoxLayout, QWidget, QComboBox, QCheckBox,
+        QLineEdit, QMessageBox, QPushButton, QSplitter, QTableView,
+        QVBoxLayout, QWidget, QComboBox, QCheckBox,
         QProgressBar, QSizePolicy, QToolButton, QScrollArea, QFrame,
     )
 except ImportError:
@@ -27,8 +27,8 @@ except ImportError:
     )
     from PySide2.QtWidgets import (  # type: ignore
         QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-        QLineEdit, QMessageBox, QPushButton, QSplitter, QTableWidget,
-        QTableWidgetItem, QVBoxLayout, QWidget, QComboBox, QCheckBox,
+        QLineEdit, QMessageBox, QPushButton, QSplitter, QTableView,
+        QVBoxLayout, QWidget, QComboBox, QCheckBox,
         QProgressBar, QSizePolicy, QToolButton, QScrollArea, QFrame,
     )
 
@@ -69,6 +69,7 @@ from ghost_backend.runs.quality import (
     solver_report_text,
     validate_mesh_convergence_policy,
 )
+from ghost_backend.ui.result_table import ResultRows, SolverResultsTableModel, plot_groups
 
 
 def _2d_panel_limit() -> 'int':
@@ -125,6 +126,12 @@ def _finite_unique_count(
     rows: 'List[Dict[str, Any]]',
     key: 'str',
 ) -> 'int':
+    if isinstance(rows, ResultRows):
+        try:
+            column = rows.column(key, math.nan)
+            return len(np.unique(column[np.isfinite(column)]))
+        except (TypeError, ValueError):
+            pass  # Preserve permissive counting for extension/malformed rows.
     values = set()
     for row in rows:
         try:
@@ -136,31 +143,9 @@ def _finite_unique_count(
     return len(values)
 
 
-def _result_rows(result: 'Dict[str, Any]') -> 'List[Dict[str, Any]]':
-    """Return every solved channel with an explicit VV/HH row label."""
-
-    channels = result.get("co_solved_samples")
-    if isinstance(channels, dict) and channels:
-        rows: 'List[Dict[str, Any]]' = []
-        for polarization in ("VV", "HH"):
-            for source in channels.get(polarization, []) or []:
-                row = dict(source)
-                row["polarization"] = polarization
-                rows.append(row)
-        if rows:
-            return rows
-    polarization = str(
-        result.get("polarization_export")
-        or result.get("polarization")
-        or ""
-    )
-    rows = []
-    for source in result.get("samples", []) or []:
-        row = dict(source)
-        if polarization:
-            row.setdefault("polarization", polarization)
-        rows.append(row)
-    return rows
+def _result_rows(result: 'Dict[str, Any]') -> ResultRows:
+    """Expose every solved channel with labels, retaining its original storage."""
+    return ResultRows(result)
 
 
 def _result_sample_counts(result: 'Dict[str, Any]') -> 'Dict[str, int]':
@@ -292,19 +277,10 @@ def _display_db_value(
 
 def _result_plot_groups(
     result: 'Dict[str, Any]',
-) -> 'Dict[Tuple[float, Optional[float], str], List[Dict[str, Any]]]':
+) -> dict:
     """Keep separate bistatic incidence sweeps from becoming one curve."""
 
-    bistatic = _result_kind(result) == "2d_bistatic"
-    groups: 'Dict[\n    Tuple[float, Optional[float], str],\n    List[Dict[str, Any]],\n]' = {}
-    for row in _result_rows(result):
-        freq = float(row.get("frequency_ghz", 0.0))
-        incidence = (
-            float(row.get("theta_inc_deg", 0.0)) if bistatic else None
-        )
-        polarization = str(row.get("polarization", ""))
-        groups.setdefault((freq, incidence, polarization), []).append(row)
-    return groups
+    return plot_groups(_result_rows(result), _result_kind(result) == "2d_bistatic")
 
 
 def _stable_sha256(path: 'str') -> 'str':
@@ -492,6 +468,11 @@ class _SolveWorker(QObject):
         self.progress.emit(pct, message)
 
     def _run_bor(self):
+        from ghost_backend.twod.samples import compact_samples
+        with compact_samples():
+            return self._run_bor_compact()
+
+    def _run_bor_compact(self):
         """BoR (axisymmetric) route: elevations are ASPECT angles from the +z
         rotation axis. The displayed BoR CFIE value is passed unchanged."""
 
@@ -521,7 +502,8 @@ class _SolveWorker(QObject):
 
     def _run_2d(self, snapshot, progress_callback):
         from ghost_backend.linalg.refined_lu import linear_precision
-        with linear_precision(self.lu_precision):
+        from ghost_backend.twod.samples import compact_samples
+        with linear_precision(self.lu_precision), compact_samples():
             return self._run_2d_with_precision(snapshot, progress_callback)
 
     def _run_2d_with_precision(self, snapshot, progress_callback):
@@ -1181,11 +1163,10 @@ class SolverTab(RunSetupMixin, QWidget):
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas, stretch=2)
 
-        self.table_results = QTableWidget()
-        self.table_results.setColumnCount(4)
-        self.table_results.setHorizontalHeaderLabels(
-            ["Frequency (GHz)", "Azimuth (deg)", "RCS (linear)", "RCS (dB)"]
-        )
+        self.table_results = QTableView()
+        self.result_table_model = SolverResultsTableModel(self.table_results)
+        self.table_results.setModel(self.result_table_model)
+        self.table_results.setWordWrap(False)
         layout.addWidget(self.table_results, stretch=1)
         return panel
 
@@ -1770,6 +1751,11 @@ class SolverTab(RunSetupMixin, QWidget):
         title = (phase + ': ' if phase else '') + event.get('stage', 'Solving')
         rss = event.get('process_rss_bytes')
         memory = ' | process RAM {:.2f} GiB'.format(rss / 1024**3) if rss is not None else ''
+        tree_rss = event.get('process_tree_rss_bytes')
+        if tree_rss is not None:
+            memory = ' | RAM including workers ~{:.2f} GiB'.format(tree_rss / 1024**3)
+        self.lbl_status.setToolTip(
+            'RAM is sampled. Worker totals may count shared pages more than once and include other jobs.')
         self.lbl_status.setText('{} | {}m {:02d}s{}'.format(title, minutes, seconds, memory))
 
     def _on_solver_progress(self, pct: 'int', message: 'str'):
@@ -2219,109 +2205,13 @@ class SolverTab(RunSetupMixin, QWidget):
             bar = figure.colorbar(colored, ax=ax, shrink=0.8, pad=0.04)
             bar.set_label("Density phase (deg)" if phase else "Density magnitude")
         self.lbl_result_details.setText(self._density_result_text())
-        self.table_results.clear()
-        self.table_results.setColumnCount(8)
-        self.table_results.setHorizontalHeaderLabels([
-            "Pol", "Element", f"X ({unit_label})", f"Y ({unit_label})",
-            "Density real", "Density imag", "Magnitude", "Phase (deg)",
-        ])
-        self.table_results.setRowCount(sum(len(channel["real"]) for channel in channels))
-        row = 0
-        for channel in channels:
-            for index, (x, y) in enumerate(channel["centers"]):
-                values = (channel["label"], str(index + 1), f"{x:.8g}", f"{y:.8g}",
-                          f"{channel['real'][index]:.8g}", f"{channel['imag'][index]:.8g}",
-                          f"{channel['magnitude'][index]:.8g}",
-                          f"{channel['phase'][index]:.6g}" if np.isfinite(channel['phase'][index]) else "undefined")
-                for column, value in enumerate(values):
-                    item = QTableWidgetItem(value)
-                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                    self.table_results.setItem(row, column, item)
-                row += 1
+        self.result_table_model.set_densities(unit_label, channels)
         self._apply_plot_theme_to_axes()
         self.toolbar.update()
         self.canvas.draw_idle()
 
     def _populate_results_table(self, result: 'Dict[str, Any]'):
-        kind = _result_kind(result)
-        rows = sorted(
-            _result_rows(result),
-            key=lambda row: (
-                float(row.get("frequency_ghz", 0.0)),
-                str(row.get("polarization", "")),
-                float(row.get("theta_inc_deg", 0.0)),
-                float(row.get("theta_scat_deg", 0.0)),
-            ),
-        )
-        self.table_results.clear()
-        if kind == "2d_bistatic":
-            self.table_results.setColumnCount(6)
-            self.table_results.setHorizontalHeaderLabels(
-                [
-                    "Frequency (GHz)",
-                    "Pol",
-                    "Incidence (deg)",
-                    "Observation (deg)",
-                    "Width (m)",
-                    "Width (dBke)",
-                ]
-            )
-        elif kind == "bor":
-            self.table_results.setColumnCount(5)
-            self.table_results.setHorizontalHeaderLabels(
-                [
-                    "Frequency (GHz)",
-                    "Pol",
-                    "Aspect (deg)",
-                    "RCS (m^2)",
-                    "RCS (dBsm)",
-                ]
-            )
-        else:
-            self.table_results.setColumnCount(5)
-            self.table_results.setHorizontalHeaderLabels(
-                [
-                    "Frequency (GHz)",
-                    "Pol",
-                    "Cut angle (deg)",
-                    "Width (m)",
-                    "Width (dBke)",
-                ]
-            )
-        self.table_results.setRowCount(len(rows))
-        for r, row in enumerate(rows):
-            freq = float(row.get("frequency_ghz", 0.0))
-            inc = float(row.get("theta_inc_deg", 0.0))
-            obs = float(row.get("theta_scat_deg", 0.0))
-            lin = float(row.get("rcs_linear", 0.0))
-            db = self._display_db_from_linear(result, row)
-            self.table_results.setItem(r, 0, QTableWidgetItem(f"{freq:.6g}"))
-            self.table_results.setItem(
-                r, 1, QTableWidgetItem(str(row.get("polarization", "")))
-            )
-            if kind == "2d_bistatic":
-                self.table_results.setItem(
-                    r, 2, QTableWidgetItem(f"{inc:.6g}")
-                )
-                self.table_results.setItem(
-                    r, 3, QTableWidgetItem(f"{obs:.6g}")
-                )
-                self.table_results.setItem(
-                    r, 4, QTableWidgetItem(f"{lin:.6e}")
-                )
-                self.table_results.setItem(
-                    r, 5, QTableWidgetItem(f"{db:.3f}")
-                )
-            else:
-                self.table_results.setItem(
-                    r, 2, QTableWidgetItem(f"{obs:.6g}")
-                )
-                self.table_results.setItem(
-                    r, 3, QTableWidgetItem(f"{lin:.6e}")
-                )
-                self.table_results.setItem(
-                    r, 4, QTableWidgetItem(f"{db:.3f}")
-                )
+        self.result_table_model.set_result(result, _result_kind(result), self._display_db_from_linear)
 
     def _plot_results(self, result: 'Dict[str, Any]'):
         kind = _result_kind(result)
@@ -2329,6 +2219,10 @@ class SolverTab(RunSetupMixin, QWidget):
         self.canvas.fig.clear()
         self.canvas.ax = self.canvas.fig.add_subplot(111)
         ax = self.canvas.ax
+        if plot_groups:
+            source_rows = next(iter(plot_groups.values())).rows
+            observations = source_rows.column('theta_scat_deg')
+            linear = source_rows.column('rcs_linear')
         for freq, incidence, polarization in sorted(
             plot_groups.keys(),
             key=lambda key: (
@@ -2337,14 +2231,12 @@ class SolverTab(RunSetupMixin, QWidget):
                 -math.inf if key[1] is None else key[1],
             ),
         ):
-            rows = sorted(
-                plot_groups[(freq, incidence, polarization)],
-                key=lambda row: float(row.get("theta_scat_deg", 0.0)),
-            )
-            x = [float(row.get("theta_scat_deg", 0.0)) for row in rows]
-            y = [
-                self._display_db_from_linear(result, row) for row in rows
-            ]
+            indices = plot_groups[(freq, incidence, polarization)].indices
+            indices = indices[np.argsort(observations[indices], kind='stable')]
+            x = observations[indices]
+            y = np.fromiter((self._display_db_from_linear(result,
+                {'frequency_ghz': freq, 'rcs_linear': value}) for value in linear[indices]),
+                dtype=float, count=len(indices))
             label = f"{freq:g} GHz, {polarization}"
             if incidence is not None:
                 label += f", incidence {incidence:g}deg"

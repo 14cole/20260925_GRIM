@@ -121,6 +121,13 @@ def solver_report_text(metadata):
         lines.append("Sampled peak process RAM: " + (
             f"{peak / 1024**3:.3f} GiB" if peak is not None else "unavailable"))
         lines.append("Stages may overlap. RAM includes other work in this process.")
+        tree_peak = profile.get('sampled_peak_process_tree_rss_bytes')
+        if tree_peak is not None:
+            lines.append(f"Sampled RAM including worker processes: {tree_peak / 1024**3:.3f} GiB "
+                         "(shared pages may be counted more than once).")
+        private_peak = profile.get('sampled_peak_process_tree_private_bytes')
+        if private_peak is not None:
+            lines.append(f"Sampled private committed memory including workers: {private_peak / 1024**3:.3f} GiB.")
     return "\n".join(lines)
 
 
@@ -289,130 +296,137 @@ def evaluate_mesh_convergence(
     phase_floor_fraction = policy["phase_floor_relative"]
     db_floor_fraction = policy["db_floor_relative"]
 
-    base_samples = list(base_result.get("samples", []) or [])
-    fine_samples = list(fine_result.get("samples", []) or [])
+    base_samples = base_result.get("samples", []) or []
+    fine_samples = fine_result.get("samples", []) or []
     if not base_samples or not fine_samples:
         raise ValueError("Both base_result and fine_result must contain samples.")
 
-    def exact_sample_coordinates(row):
-        return (
-            float(row.get("frequency_ghz", 0.0)),
-            float(row.get("theta_inc_deg", 0.0)),
-            float(row.get("theta_scat_deg", 0.0)),
+    from ghost_backend.runs.quality_samples import compact_comparison
+    compact = compact_comparison(base_samples, fine_samples)
+    if compact is not None:
+        base_amp, fine_amp, unfloored_deltas, frequency_groups = compact
+        sample_count = len(base_amp)
+    else:
+        def exact_sample_coordinates(row):
+            return (
+                float(row.get("frequency_ghz", 0.0)),
+                float(row.get("theta_inc_deg", 0.0)),
+                float(row.get("theta_scat_deg", 0.0)),
+            )
+
+        def group_by_key(samples, label):
+            """Group samples that collide only because the tolerant key is rounded."""
+
+            grouped = {}
+            exact_coordinates = set()
+            for row in samples:
+                coordinates = exact_sample_coordinates(row)
+                if coordinates in exact_coordinates:
+                    raise ValueError(
+                        f"Mesh convergence {label} contains duplicate exact sample "
+                        f"coordinates {coordinates}."
+                    )
+                exact_coordinates.add(coordinates)
+                grouped.setdefault(_sample_key(row), []).append(row)
+            for rows in grouped.values():
+
+
+                rows.sort(key=exact_sample_coordinates)
+            return grouped
+
+        base_by_key = group_by_key(base_samples, "base_result")
+        fine_by_key = group_by_key(fine_samples, "fine_result")
+        base_keys = set(base_by_key)
+        fine_keys = set(fine_by_key)
+        all_keys = base_keys | fine_keys
+        missing_count = sum(
+            max(0, len(base_by_key.get(key, ())) - len(fine_by_key.get(key, ())))
+            for key in all_keys
         )
+        extra_count = sum(
+            max(0, len(fine_by_key.get(key, ())) - len(base_by_key.get(key, ())))
+            for key in all_keys
+        )
+        if missing_count or extra_count:
+            raise ValueError(
+                "Mesh convergence sample grids differ: "
+                f"{missing_count} missing and {extra_count} extra fine-result "
+                "sample point(s)."
+            )
 
-    def group_by_key(samples, label):
-        """Group samples that collide only because the tolerant key is rounded."""
+        matched: 'List[Tuple[Dict[str, Any], Dict[str, Any]]]' = []
+        for key in sorted(base_keys):
+            matched.extend(zip(base_by_key[key], fine_by_key[key]))
+        if not matched:
+            raise ValueError("Mesh convergence comparison produced no overlapping samples.")
 
-        grouped = {}
-        exact_coordinates = set()
-        for row in samples:
-            coordinates = exact_sample_coordinates(row)
-            if coordinates in exact_coordinates:
+        def finite_float(row, key):
+            if key not in row:
                 raise ValueError(
-                    f"Mesh convergence {label} contains duplicate exact sample "
-                    f"coordinates {coordinates}."
+                    "Mesh convergence requires authoritative complex amplitudes; "
+                    f"sample {_sample_key(row)} is missing {key!r}."
                 )
-            exact_coordinates.add(coordinates)
-            grouped.setdefault(_sample_key(row), []).append(row)
-        for rows in grouped.values():
-
-
-            rows.sort(key=exact_sample_coordinates)
-        return grouped
-
-    base_by_key = group_by_key(base_samples, "base_result")
-    fine_by_key = group_by_key(fine_samples, "fine_result")
-    base_keys = set(base_by_key)
-    fine_keys = set(fine_by_key)
-    all_keys = base_keys | fine_keys
-    missing_count = sum(
-        max(0, len(base_by_key.get(key, ())) - len(fine_by_key.get(key, ())))
-        for key in all_keys
-    )
-    extra_count = sum(
-        max(0, len(fine_by_key.get(key, ())) - len(base_by_key.get(key, ())))
-        for key in all_keys
-    )
-    if missing_count or extra_count:
-        raise ValueError(
-            "Mesh convergence sample grids differ: "
-            f"{missing_count} missing and {extra_count} extra fine-result "
-            "sample point(s)."
-        )
-
-    matched: 'List[Tuple[Dict[str, Any], Dict[str, Any]]]' = []
-    for key in sorted(base_keys):
-        matched.extend(zip(base_by_key[key], fine_by_key[key]))
-    if not matched:
-        raise ValueError("Mesh convergence comparison produced no overlapping samples.")
-
-    def finite_float(row, key):
-        if key not in row:
-            raise ValueError(
-                "Mesh convergence requires authoritative complex amplitudes; "
-                f"sample {_sample_key(row)} is missing {key!r}."
-            )
-        try:
-            value = float(row[key])
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"Mesh convergence sample {_sample_key(row)} has invalid "
-                f"{key}={row[key]!r}."
-            ) from exc
-        if not math.isfinite(value):
-            raise ValueError(
-                f"Mesh convergence sample {_sample_key(row)} has non-finite "
-                f"{key}={row[key]!r}."
-            )
-        return value
-
-    def sample_db(row):
-        if "rcs_db" in row:
-            value = float(row["rcs_db"])
-        else:
-            linear = finite_float(row, "rcs_linear")
-            if linear < 0.0:
+            try:
+                value = float(row[key])
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError(
-                    f"Mesh convergence sample {_sample_key(row)} has negative "
-                    f"rcs_linear={linear!r}."
+                    f"Mesh convergence sample {_sample_key(row)} has invalid "
+                    f"{key}={row[key]!r}."
+                ) from exc
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Mesh convergence sample {_sample_key(row)} has non-finite "
+                    f"{key}={row[key]!r}."
                 )
-            value = 10.0 * math.log10(max(linear, EPS))
-        if not math.isfinite(value):
-            raise ValueError(
-                f"Mesh convergence sample {_sample_key(row)} has non-finite "
-                f"rcs_db={value!r}."
+            return value
+
+        def sample_db(row):
+            if "rcs_db" in row:
+                value = float(row["rcs_db"])
+            else:
+                linear = finite_float(row, "rcs_linear")
+                if linear < 0.0:
+                    raise ValueError(
+                        f"Mesh convergence sample {_sample_key(row)} has negative "
+                        f"rcs_linear={linear!r}."
+                    )
+                value = 10.0 * math.log10(max(linear, EPS))
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Mesh convergence sample {_sample_key(row)} has non-finite "
+                    f"rcs_db={value!r}."
+                )
+            return value
+
+        base_amp = np.asarray([
+            complex(
+                finite_float(row, "rcs_amp_real"),
+                finite_float(row, "rcs_amp_imag"),
             )
-        return value
+            for row, _other in matched
+        ], dtype=np.complex128)
+        fine_amp = np.asarray([
+            complex(
+                finite_float(other, "rcs_amp_real"),
+                finite_float(other, "rcs_amp_imag"),
+            )
+            for _row, other in matched
+        ], dtype=np.complex128)
+        # Informational only: the display dB of each sample, without a level floor.
+        # Reading them also keeps the fail-closed validation of rcs_db/rcs_linear.
+        unfloored_deltas = np.asarray([
+            sample_db(row) - sample_db(other)
+            for row, other in matched
+        ], dtype=float)
 
-    base_amp = np.asarray([
-        complex(
-            finite_float(row, "rcs_amp_real"),
-            finite_float(row, "rcs_amp_imag"),
-        )
-        for row, _other in matched
-    ], dtype=np.complex128)
-    fine_amp = np.asarray([
-        complex(
-            finite_float(other, "rcs_amp_real"),
-            finite_float(other, "rcs_amp_imag"),
-        )
-        for _row, other in matched
-    ], dtype=np.complex128)
-    # Informational only: the display dB of each sample, without a level floor.
-    # Reading them also keeps the fail-closed validation of rcs_db/rcs_linear.
-    unfloored_deltas = np.asarray([
-        sample_db(row) - sample_db(other)
-        for row, other in matched
-    ], dtype=float)
-
-    frequency_groups = {}
-    for index, (row, _other) in enumerate(matched):
-        frequency = round(float(row.get("frequency_ghz", 0.0)), 9)
-        frequency_groups.setdefault(frequency, []).append(index)
-    complex_errors = np.zeros(len(matched), dtype=float)
-    deltas = np.zeros(len(matched), dtype=float)
-    above_db_floor = np.zeros(len(matched), dtype=bool)
+        frequency_groups = {}
+        for index, (row, _other) in enumerate(matched):
+            frequency = round(float(row.get("frequency_ghz", 0.0)), 9)
+            frequency_groups.setdefault(frequency, []).append(index)
+        sample_count = len(matched)
+    complex_errors = np.zeros(sample_count, dtype=float)
+    deltas = np.zeros(sample_count, dtype=float)
+    above_db_floor = np.zeros(sample_count, dtype=bool)
     phase_error_groups = []
     peak_by_frequency = {}
     for frequency, raw_indices in sorted(frequency_groups.items()):

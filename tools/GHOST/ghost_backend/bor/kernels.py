@@ -469,17 +469,61 @@ def _far_sample_counts(bracket, rp, rq, gap, k, top_order, pts_per_peak=8.0):
     return (FAR_SAMPLE_QUANTUM * np.ceil(need / FAR_SAMPLE_QUANTUM)).astype(np.int64)
 
 
-def _half_grid_tables(size, modes, want_sine):
+def _half_grid_projection_method(pairs, half, modes):
+    """Conservative shape crossover, without doing trial projections in a solve.
+
+    Few requested orders favor GEMM. Broad spectra favor the identical folded
+    trapezoid sum via DCT/DST; medium spectra can repay packing into real BLAS.
+    The methods differ only in summation order, not samples or retained modes.
+    """
+    if pairs >= 32 and modes >= 128 and modes >= half / 4:
+        return 'fft'
+    if pairs >= 128 and half >= 257 and modes >= 65:
+        return 'real'
+    return 'complex'
+
+
+def _project_half_grid(samples, table, modes, size, method, odd=False):
+    if method == 'complex':
+        return samples @ table
+    if method == 'real':
+        packed = np.ascontiguousarray(samples.T).view(np.float64)
+        result = (table.T @ packed).view(np.complex128).T
+        if odd:
+            result *= 1j  # table holds the imaginary part of -j sin(m xi).
+        return result
+    from scipy import fft
+    # DCT-I/DST-I exactly express the same folded periodic trapezoid rule.
+    # Fold arbitrary signed/out-of-Nyquist requested orders onto that grid;
+    # do not truncate or reorder the requested output spectrum.
+    index = np.remainder(modes, size)
+    folded = np.minimum(index, size - index)
+    phase = (2.0 * np.pi / size) * np.where(modes % 2, -1., 1.)
+    if not odd:
+        transformed = fft.dct(samples, type=1, axis=-1, workers=1)
+        return transformed[:, folded] * phase
+    result = np.zeros((len(samples), len(modes)), dtype=np.complex128)
+    active = (folded > 0) & (folded < size // 2)
+    if np.any(active):
+        transformed = fft.dst(samples[:, 1:-1], type=1, axis=-1, workers=1)
+        sign = np.where(index[active] > size // 2, -1., 1.)
+        result[:, active] = transformed[:, folded[active] - 1] * (-1j * phase[active] * sign)
+    return result
+
+
+def _half_grid_tables(size, modes, want_sine, projection='complex'):
     """Cached half-grid transform tables of one sample count and mode set.
 
     Returns ``(cosine, sine, sin2, cx, sx)``: the folded trapezoid weights
     times cos (complex, for the complex GEMM) and ``-j`` times sin of
     ``m xi`` on ``xi = 2 pi i/size - pi``, ``i = 0..size/2``, and the grid's
-    trigonometry for the samplers.  ``sine`` is None unless requested (the
+    trigonometry for the samplers. The real projection stores real cosine and
+    imaginary sine coefficients as float64; the FFT projection omits both
+    coefficient tables. ``sine`` is None unless requested (the
     Green's function is even and needs none).  Entries are read-only and
     shared across threads; the cache is bounded by FAR_TABLE_CACHE_BYTES.
     """
-    key = (int(size), modes.tobytes(), bool(want_sine))
+    key = (int(size), modes.tobytes(), bool(want_sine), projection)
     with _FAR_TABLE_LOCK:
         entry = _FAR_TABLES.get(key)
         if entry is not None:
@@ -493,9 +537,15 @@ def _half_grid_tables(size, modes, want_sine):
     # odd brackets vanish at both ends.
     weights = np.full(half, 2.0 * (2 * np.pi / size))
     weights[0] = weights[-1] = 2 * np.pi / size
-    argument = xi[:, None] * modes[None, :]
-    cosine = (weights[:, None] * np.cos(argument)).astype(np.complex128)
-    sine = (-1j * weights[:, None]) * np.sin(argument) if want_sine else None
+    cosine = sine = None
+    if projection != 'fft':
+        argument = xi[:, None] * modes[None, :]
+        if projection == 'real':
+            cosine = np.asfortranarray(weights[:, None] * np.cos(argument))
+            sine = np.asfortranarray(-weights[:, None] * np.sin(argument)) if want_sine else None
+        else:
+            cosine = (weights[:, None] * np.cos(argument)).astype(np.complex128)
+            sine = (-1j * weights[:, None]) * np.sin(argument) if want_sine else None
     sin2 = np.ascontiguousarray(np.sin(0.5 * xi) ** 2)
     cx = np.ascontiguousarray(np.cos(xi))
     sx = np.ascontiguousarray(np.sin(xi))
@@ -535,8 +585,9 @@ def banded_modal_kernels(kind, coordinates, k, m_max, near_mask, modes=None,
     components have exact parity (tt/ff even, tf/ft odd), so each group
     samples only the half grid ``xi`` in ``[-pi, 0]`` (both ends included) and
     the periodic trapezoid sums become real cosine/sine transforms of those
-    samples, formed as one GEMM per bracket for the requested orders only,
-    with transform tables cached per (size, modes).  Sampling runs in the
+    samples, evaluated by complex GEMM, packed real GEMM or DCT/DST according
+    to workload shape. Transform tables are cached per (size, modes, method).
+    Sampling runs in the
     native paired kernels on ``threads`` OpenMP threads when the library
     provides them; the NumPy forms remain the reference and the fallback.
     Raw angular samples stay bounded by ``work_bytes`` independently of the
@@ -577,8 +628,14 @@ def banded_modal_kernels(kind, coordinates, k, m_max, near_mask, modes=None,
         indices = active[order[start:stop]]
         size = int(size)
         half = size // 2 + 1
-        cosine, sine, sin2, cx, sx = _half_grid_tables(size, modes, bracket)
-        chunk = max(1, int(work_bytes // (16 * (per_sample * half + len(modes)))))
+        projected_pairs = min(len(indices), max(1, int(work_bytes // (
+            16 * ((per_sample + 4) * half + len(modes))))))
+        projection = _half_grid_projection_method(projected_pairs, half, len(modes))
+        # Include real packing, or conservative FFT scratch, in the existing
+        # chunk allowance. All transforms still finish in double precision.
+        overhead = {'complex': 0, 'real': 1, 'fft': 4}[projection]
+        cosine, sine, sin2, cx, sx = _half_grid_tables(size, modes, bracket, projection)
+        chunk = max(1, int(work_bytes // (16 * ((per_sample + overhead) * half + len(modes)))))
         for first in range(0,len(indices),chunk):
             ids = indices[first:first+chunk]
             pair = [a[ids] for a in arrays]
@@ -588,7 +645,7 @@ def banded_modal_kernels(kind, coordinates, k, m_max, near_mask, modes=None,
                     a,b,c,d = pair
                     distance = np.sqrt(((a-c)**2+(b-d)**2)[:,None]+4*(a*c)[:,None]*sin2)
                     samples = np.exp(-1j*wavenumber*distance)/(4*np.pi*distance)
-                outputs[0][ids] = samples @ cosine
+                outputs[0][ids] = _project_half_grid(samples, cosine, modes, size, projection)
             else:
                 samples = None if sampler is None else sampler(pair, wavenumber, cx, sx, threads)
                 if samples is None:
@@ -596,10 +653,10 @@ def banded_modal_kernels(kind, coordinates, k, m_max, near_mask, modes=None,
                     samples = (_mfie_brackets(*pair,k,xi) if kind=='mfie'
                                else _ibc_brackets_grid(*pair,k,np.broadcast_to(xi,(len(ids),half))))
                 tt, tf, ft, ff = samples
-                outputs[0][ids] = tt @ cosine
-                outputs[1][ids] = tf @ sine
-                outputs[2][ids] = ft @ sine
-                outputs[3][ids] = ff @ cosine
+                outputs[0][ids] = _project_half_grid(tt, cosine, modes, size, projection)
+                outputs[1][ids] = _project_half_grid(tf, sine, modes, size, projection, odd=True)
+                outputs[2][ids] = _project_half_grid(ft, sine, modes, size, projection, odd=True)
+                outputs[3][ids] = _project_half_grid(ff, cosine, modes, size, projection)
     result = tuple(o.reshape(shape+(len(modes),)) for o in outputs)
     return result[0] if kind=='g' else result
 

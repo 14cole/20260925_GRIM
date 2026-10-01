@@ -125,6 +125,8 @@ from GRIM_Backend.assembly.model import (
     write_feature_assembly_recipe,
     write_placement_csv_template,
 )
+from GRIM_Backend.assembly.vehicle_builder import VehicleBuilderMixin
+from GRIM_Backend.assembly.vehicle_ui import VehicleAssemblyUiMixin
 
 
 _GUI_IMPORT_ERROR: Exception | None = None
@@ -983,7 +985,7 @@ if GUI_AVAILABLE:
             return True
 
 
-    class FeatureAssemblyPanel(AssemblyWorkflowMixin, QWidget):
+    class FeatureAssemblyPanel(VehicleBuilderMixin, VehicleAssemblyUiMixin, AssemblyWorkflowMixin, QWidget):
         """New-user-facing feature assembly form with background execution."""
 
         preview_ready = Signal(object)
@@ -993,6 +995,7 @@ if GUI_AVAILABLE:
         status_changed = Signal(str)
         feature_instance_selected = Signal(str, str)
         comparison_ready = Signal(str, str, str)
+        assembly_cleared = Signal()
 
         def __init__(
             self,
@@ -1041,22 +1044,49 @@ if GUI_AVAILABLE:
                 form.setRowWrapPolicy(QFormLayout.WrapLongRows)
 
         def _build_ui(self) -> None:
+            self.setObjectName("vehicleAssemblyPanel")
             outer = QVBoxLayout(self)
             outer.setContentsMargins(6, 6, 6, 6)
             outer.setSpacing(6)
 
-            intro = QLabel(
-                "Choose a body, add point or line features, then Calculate & save.",
-                self,
-            )
+            heading_row = QHBoxLayout()
+            intro = QLabel("Vehicle assembly", self)
             intro.setWordWrap(True)
             intro.setObjectName("featurePanelIntro")
-            outer.addWidget(intro)
+            heading_row.addWidget(intro, 1)
+            self.clear_all_button = QPushButton("Clear all", self)
+            self.clear_all_button.setToolTip(
+                "Reset this vehicle's body, point and line features, mappings, "
+                "settings, and results. Source files and saved outputs are not deleted."
+            )
+            self.clear_all_button.clicked.connect(self.clear_all)
+            heading_row.addWidget(self.clear_all_button)
+            self.recipe_button = QPushButton("Recipe…", self)
+            self.recipe_button.setToolTip("Name, save, load, or create a variant of this vehicle assembly.")
+            heading_row.addWidget(self.recipe_button)
+            self.more_tools_button = QPushButton("More tools", self)
+            more_tools_menu = QMenu(self.more_tools_button)
+            more_tools_menu.addAction("Wing / fin section expansion…", self._show_wing_tools)
+            self.manual_placement_menu = more_tools_menu.addMenu("Manual placement (optional)")
+            self.more_tools_button.setMenu(more_tools_menu)
+            heading_row.addWidget(self.more_tools_button)
+            outer.addLayout(heading_row)
+            self.vehicle_summary_label = QLabel(self)
+            self.vehicle_summary_label.setWordWrap(True)
+            self.vehicle_summary_label.setTextFormat(Qt.PlainText)
+            self.vehicle_summary_label.setObjectName("featureHint")
+            outer.addWidget(self.vehicle_summary_label)
 
             self.next_step_label = QLabel(self)
             self.next_step_label.setObjectName("featureNextStep")
             self.next_step_label.setWordWrap(True)
-            outer.addWidget(self.next_step_label)
+            next_step_row = QHBoxLayout()
+            next_step_row.addWidget(self.next_step_label, 1)
+            self.next_step_action = QPushButton("Go", self)
+            self.next_step_action.setToolTip("Open the next input that needs attention.")
+            self.next_step_action.clicked.connect(self._fix_next_requirement)
+            next_step_row.addWidget(self.next_step_action)
+            outer.addLayout(next_step_row)
 
             recipe_group = QGroupBox("Reusable assembly recipe", self)
             recipe_group.setObjectName("featureRecipeBar")
@@ -1111,7 +1141,17 @@ if GUI_AVAILABLE:
                 "Reusable recipe (optional)", self, expanded=False
             )
             self.recipe_section.addWidget(recipe_group)
-            outer.addWidget(self.recipe_section)
+            self.recipe_dialog = QDialog(self)
+            self.recipe_dialog.setWindowTitle("Vehicle recipe and variants")
+            self.recipe_dialog.resize(600, 310)
+            recipe_dialog_layout = QVBoxLayout(self.recipe_dialog)
+            recipe_dialog_layout.addWidget(self.recipe_section)
+            self.recipe_section.header.setChecked(True)
+            self.recipe_section.header.hide()
+            recipe_close = QDialogButtonBox(QDialogButtonBox.Close, self.recipe_dialog)
+            recipe_close.rejected.connect(self.recipe_dialog.hide)
+            recipe_dialog_layout.addWidget(recipe_close)
+            self.recipe_button.clicked.connect(self.recipe_dialog.show)
 
             placement_units_bar = QWidget(self)
             placement_units_bar.setObjectName("featurePlacementUnitsBar")
@@ -1119,15 +1159,15 @@ if GUI_AVAILABLE:
             placement_units_layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
             placement_units_layout.setContentsMargins(8, 5, 8, 5)
             placement_units_layout.setSpacing(7)
-            placement_units_label = QLabel("Placement units:", placement_units_bar)
+            placement_units_label = QLabel("Coordinates:", placement_units_bar)
             placement_units_label.setWordWrap(True)
             self.coordinate_units = QComboBox(placement_units_bar)
             self.coordinate_units.addItem("Choose units…", "")
             for label, value in UNIT_CHOICES:
                 self.coordinate_units.addItem(label, value)
             self.coordinate_units.setToolTip(
-                "One shared unit system for every x/y/z coordinate in both the "
-                "point and line placement CSVs."
+                "One shared unit system for all point positions and line vertices. "
+                "CAD axes: +x right, +y nose, +z up. Normals and roll vectors are unitless."
             )
             placement_units_label.setBuddy(self.coordinate_units)
             placement_units_layout.addRow(placement_units_label, self.coordinate_units)
@@ -1139,6 +1179,7 @@ if GUI_AVAILABLE:
             self.point_step_page = QWidget(self.workflow_tabs)
             self.line_step_page = QWidget(self.workflow_tabs)
             self.review_step_page = QWidget(self.workflow_tabs)
+            self.wing_step_page = QWidget(self.workflow_tabs)
 
             def _step_scroll(page: QWidget, object_name: str):
                 page_layout = QVBoxLayout(page)
@@ -1172,19 +1213,29 @@ if GUI_AVAILABLE:
             review_content, review_content_layout, self.review_page_layout = _step_scroll(
                 self.review_step_page, "featureReviewScroll"
             )
+            wing_page, wing_layout, self.wing_page_layout = _step_scroll(
+                self.wing_step_page, "featureWingScroll"
+            )
             self.form_content = self.workflow_tabs
             self.workflow_tabs.addTab(self.body_step_page, "Body")
-            self.workflow_tabs.addTab(self.point_step_page, "Point Features")
-            self.workflow_tabs.addTab(self.line_step_page, "Line Features")
-            self.workflow_tabs.addTab(self.review_step_page, "Review")
+            self.workflow_tabs.addTab(self.point_step_page, "Points")
+            self.workflow_tabs.addTab(self.line_step_page, "Line features")
+            self.workflow_tabs.addTab(self.review_step_page, "Build")
+            # Appended after Build so the validated point/line workflow keeps
+            # its tab indices; the wing expansion is a separate calculation.
+            self.workflow_tabs.addTab(self.wing_step_page, "Wing Sections")
+            self.workflow_tabs.setTabVisible(4, False)
+            self.workflow_tabs.currentChanged.connect(self._vehicle_tab_changed)
             outer.addWidget(self.workflow_tabs, 1)
+            point_page, point_layout = self._build_vehicle_feature_page("point", point_page, point_layout)
+            line_page, line_layout = self._build_vehicle_feature_page("line", line_page, line_layout)
 
             body_group = QGroupBox("Body response", body_content)
             body_group.setObjectName("featureStepCard")
             body_form = QFormLayout(body_group)
             body_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
             self.base_picker = _PathPicker(
-                caption="Choose clean-body/base GRIM",
+                caption="Choose body response — BoR or normal GRIM",
                 file_filter="GRIM response (*.grim);;All files (*)",
                 allow_loaded_dataset=True,
             )
@@ -1222,22 +1273,16 @@ if GUI_AVAILABLE:
                 "Units of the selected STL/facet surface, independent of the CSV units."
             )
             body_form.addRow("Body dataset:", self.base_picker)
+            body_intro = QLabel(
+                "Choose a BoR or normal GRIM body response. Its stored frequencies "
+                "and angles define the vehicle calculation.", body_group,
+            )
+            body_intro.setWordWrap(True)
+            body_form.addRow(body_intro)
             self.body_response_summary = QLabel(body_group)
             self.body_response_summary.setWordWrap(True)
             self.body_response_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
             body_form.addRow(self.body_response_summary)
-            self.host_material = QLineEdit(body_group)
-            self.host_material.setPlaceholderText("Match library host.material, e.g. PEC outer skin")
-            self.host_stack = QLineEdit(body_group)
-            self.host_stack.setPlaceholderText("Characterized coating / layer-stack ID, if applicable")
-            self.host_radius = QLineEdit(body_group)
-            self.host_radius.setPlaceholderText("Minimum principal radius in inches; blank = unknown")
-            self.host_radius.setToolTip("Conservative minimum radius over every feature footprint, in both surface directions. A flat mesh facet does not prove a flat host. Enter a finite lower bound for a planar surface.")
-            body_form.addRow("Host material:", self.host_material)
-            body_form.addRow("Host stack ID:", self.host_stack)
-            body_form.addRow("Host curvature bound (in):", self.host_radius)
-            for control in (self.host_material, self.host_stack, self.host_radius):
-                control.editingFinished.connect(self._host_changed)
             body_geometry = QWidget(body_content)
             geometry_form = QFormLayout(body_geometry)
             geometry_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -1348,7 +1393,7 @@ if GUI_AVAILABLE:
             self.point_help_label.setVisible(False)
             point_layout.addWidget(self.point_help_label)
             point_format_row = QHBoxLayout()
-            self.point_edit_button = QPushButton("Create / edit…", point_page)
+            self.point_edit_button = QPushButton("Edit CSV manually…", point_page)
             self.point_edit_button.clicked.connect(lambda: self._edit_placements("point"))
             point_format_row.addWidget(self.point_edit_button)
             self.point_format_button = QPushButton(
@@ -1425,7 +1470,7 @@ if GUI_AVAILABLE:
             self.line_help_label.setVisible(False)
             line_layout.addWidget(self.line_help_label)
             line_format_row = QHBoxLayout()
-            self.line_edit_button = QPushButton("Create / edit…", line_page)
+            self.line_edit_button = QPushButton("Edit CSV manually…", line_page)
             self.line_edit_button.clicked.connect(lambda: self._edit_placements("line"))
             line_format_row.addWidget(self.line_edit_button)
             self.line_format_button = QPushButton(
@@ -1476,6 +1521,177 @@ if GUI_AVAILABLE:
             )
             line_layout.addWidget(self.line_mapping)
             line_layout.addStretch(1)
+
+            wing_help = QLabel(
+                "Fast wing/fin approximation: each row is one spanwise station. "
+                "Its 2-D section .geo is solved as a stand-alone object and "
+                "expanded along the straight line from root to tip; stations "
+                "add coherently to the Body dataset on its own grid (any "
+                "coherent monostatic response, or blank for the wing alone). "
+                "Root, tip and normal use the "
+                "placement frame (+y nose, +x right, +z up) and the Placement "
+                "units above the tabs. Draw each section in the plane "
+                "perpendicular to its span line with its origin on that line: "
+                "2-D +y is the normal and 2-D +x is span × normal. Single "
+                "bounce only: no tip, root or wing-body coupling.",
+                wing_page,
+            )
+            wing_help.setWordWrap(True)
+            wing_help.setObjectName("featureHint")
+            wing_layout.addWidget(wing_help)
+            self.wing_table = QTableWidget(0, 10, wing_page)
+            self.wing_table.setHorizontalHeaderLabels(
+                [
+                    "Section .geo",
+                    "Root x", "Root y", "Root z",
+                    "Tip x", "Tip y", "Tip z",
+                    "Normal x", "Normal y", "Normal z",
+                ]
+            )
+            self.wing_table.setSelectionBehavior(
+                QAbstractItemView.SelectionBehavior.SelectRows
+            )
+            self.wing_table.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.ResizeMode.Stretch
+            )
+            self.wing_table.setMinimumHeight(160)
+            wing_layout.addWidget(self.wing_table)
+            wing_row_actions = QHBoxLayout()
+            self.wing_add_button = QPushButton("Add section(s)…", wing_page)
+            self.wing_add_button.setToolTip(
+                "Choose one or more 2-D section .geo files; one station row is "
+                "added per file."
+            )
+            self.wing_remove_button = QPushButton("Remove selected", wing_page)
+            wing_row_actions.addWidget(self.wing_add_button)
+            wing_row_actions.addWidget(self.wing_remove_button)
+            wing_row_actions.addStretch(1)
+            wing_layout.addLayout(wing_row_actions)
+            wing_form_host = QWidget(wing_page)
+            wing_form = QFormLayout(wing_form_host)
+            wing_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+            self.wing_geometry_units = QComboBox(wing_form_host)
+            for label, value in UNIT_CHOICES:
+                if value in ("inches", "meters"):
+                    self.wing_geometry_units.addItem(label, value)
+            self.wing_geometry_units.setToolTip(
+                "Units of the coordinates inside the section .geo files."
+            )
+            wing_form.addRow("Section .geo units:", self.wing_geometry_units)
+            self.wing_mirror = QCheckBox(
+                "Also place the mirrored wing (x → −x)", wing_form_host
+            )
+            wing_form.addRow("", self.wing_mirror)
+            self.wing_angle_step = QDoubleSpinBox(wing_form_host)
+            self.wing_angle_step.setDecimals(3)
+            self.wing_angle_step.setRange(0.001, 90.0)
+            self.wing_angle_step.setValue(0.5)
+            self.wing_angle_step.setSuffix(" deg")
+            self.wing_angle_step.setToolTip(
+                "Angular step of each 2-D section solve over 0–360 deg. It must "
+                "divide 180. A warning is reported when it is too coarse for "
+                "the section size and frequency."
+            )
+            wing_form.addRow("Section angle step:", self.wing_angle_step)
+            self.wing_oblique = QCheckBox(
+                "Oblique-incidence correction (PEC sections only)", wing_form_host
+            )
+            self.wing_oblique.setToolTip(
+                "For looks tilted out of the plane normal to a section's span, "
+                "use the 2-D solve at the reduced frequency f·cos(tilt). Exact "
+                "for an infinitely long PEC section; not valid for coated or "
+                "dielectric sections. Adds 2-D solves."
+            )
+            wing_form.addRow("", self.wing_oblique)
+            self.wing_shadow = QCheckBox(
+                "Shadow sections behind the BoR body", wing_form_host
+            )
+            self.wing_shadow.setChecked(True)
+            self.wing_shadow.setToolTip(
+                "Hide the parts of each span line that the Body dataset's "
+                "embedded BoR profile blocks from the radar."
+            )
+            wing_form.addRow("", self.wing_shadow)
+            self.wing_use_as_body = QCheckBox(
+                "Then use the result as the Body dataset", wing_form_host
+            )
+            self.wing_use_as_body.setToolTip(
+                "After saving, select the body-plus-wing output on the Body tab "
+                "so point and line features are added on top of the wings."
+            )
+            wing_form.addRow("", self.wing_use_as_body)
+            self.wing_grid_fields = {}
+            for key, label in (
+                ("frequencies_ghz", "Frequencies (GHz):"),
+                ("azimuths_deg", "Azimuths (deg):"),
+                ("elevations_deg", "Elevations (deg):"),
+            ):
+                control = QLineEdit(wing_form_host)
+                control.setPlaceholderText(
+                    "Blank with a Body dataset; else list (1, 2, 3) or start:stop:step"
+                )
+                self.wing_grid_fields[key] = control
+                wing_form.addRow(label, control)
+            self.wing_output_picker = _PathPicker(
+                caption="Save body-plus-wing GRIM",
+                file_filter="GRIM response (*.grim);;All files (*)",
+                save=True,
+            )
+            wing_form.addRow("Output dataset:", self.wing_output_picker)
+            wing_layout.addWidget(wing_form_host)
+            wing_corner_help = QLabel(
+                "Corner estimates (optional): a rough physical-optics double "
+                "bounce where a wing meets the body. The fold is the root "
+                "line; the wing and body normals point out of the two faces "
+                "into the corner; face width is how far the double bounce "
+                "reaches along each face. Same frame and units as the "
+                "sections; the mirror option mirrors corners too. Its phase "
+                "against the other terms is approximate.",
+                wing_page,
+            )
+            wing_corner_help.setWordWrap(True)
+            wing_corner_help.setObjectName("featureHint")
+            wing_layout.addWidget(wing_corner_help)
+            self.wing_corner_table = QTableWidget(0, 13, wing_page)
+            self.wing_corner_table.setHorizontalHeaderLabels(
+                [
+                    "Fold start x", "Fold start y", "Fold start z",
+                    "Fold end x", "Fold end y", "Fold end z",
+                    "Wing normal x", "Wing normal y", "Wing normal z",
+                    "Body normal x", "Body normal y", "Body normal z",
+                    "Face width",
+                ]
+            )
+            self.wing_corner_table.setSelectionBehavior(
+                QAbstractItemView.SelectionBehavior.SelectRows
+            )
+            self.wing_corner_table.setMinimumHeight(110)
+            wing_layout.addWidget(self.wing_corner_table)
+            wing_corner_actions = QHBoxLayout()
+            self.wing_add_corner_button = QPushButton("Add corner", wing_page)
+            self.wing_remove_corner_button = QPushButton(
+                "Remove selected corner", wing_page
+            )
+            wing_corner_actions.addWidget(self.wing_add_corner_button)
+            wing_corner_actions.addWidget(self.wing_remove_corner_button)
+            wing_corner_actions.addStretch(1)
+            wing_layout.addLayout(wing_corner_actions)
+            self.wing_build_button = QPushButton("Expand wing && save", wing_page)
+            self.wing_build_button.setObjectName("featureWorkflowAction")
+            self.wing_build_button.setToolTip(
+                "Solve every section, expand it along its span, add the Body "
+                "dataset and save one monostatic .grim. Independent of the "
+                "point/line Calculate && save."
+            )
+            wing_layout.addWidget(self.wing_build_button)
+            self.wing_result_label = QLabel(wing_page)
+            self.wing_result_label.setWordWrap(True)
+            self.wing_result_label.setObjectName("featureSummary")
+            self.wing_result_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            wing_layout.addWidget(self.wing_result_label)
+            wing_layout.addStretch(1)
             scan_row = QHBoxLayout()
             self.scan_button = QPushButton("Refresh selected CSVs", feature_group)
             self.scan_button.setToolTip(
@@ -1646,11 +1862,17 @@ if GUI_AVAILABLE:
             )
             self.preview_guide.addWidget(self.preview_help_label)
 
-            review_group = QGroupBox("Readiness and output", review_content)
+            review_group = QGroupBox("Build checks", review_content)
             review_group.setObjectName("featureStepCard")
             review_form = QFormLayout(review_group)
             review_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-            review_form.addRow("Output response:", self.output_picker)
+            build_intro = QLabel(
+                "Calculate & save checks the current inputs and adds the enabled "
+                "features to the body. Any warnings appear here for review before "
+                "the output is written.", review_group,
+            )
+            build_intro.setWordWrap(True)
+            review_form.addRow(build_intro)
             self.study_fields = {}
             study_group = QWidget(review_content)
             study_form = QFormLayout(study_group)
@@ -1665,7 +1887,6 @@ if GUI_AVAILABLE:
                 study_form.addRow(label, control)
             self.study_section = _DisclosureSection("Study scope (all samples by default)", review_content, expanded=False)
             self.study_section.addWidget(study_group)
-            review_content_layout.addWidget(self.study_section)
             self.readiness_checklist = QTreeWidget(review_group)
             self.readiness_checklist.setObjectName("featureReadinessChecklist")
             self.readiness_checklist.setHeaderLabels(["Requirement", "Status"])
@@ -1808,19 +2029,19 @@ if GUI_AVAILABLE:
             review_form.addRow(self.validation_qa_table)
             review_content_layout.addWidget(review_group)
             review_content_layout.addWidget(self.readiness_section)
+            review_content_layout.addWidget(self.study_section)
             review_content_layout.addWidget(self.feature_selection_section)
             review_content_layout.addWidget(self.advanced_section)
             review_content_layout.addWidget(self.model_scope_section)
             review_content_layout.addWidget(self.preview_guide)
 
             self.status_label = QLabel(
-                "No Assembly operation is running.",
+                "Choose a body response to begin.",
                 self,
             )
             self.status_label.setObjectName("featureAssemblyStatus")
             self.status_label.setWordWrap(True)
-            self.status_label.setFrameShape(QFrame.Shape.StyledPanel)
-            self.status_label.setMargin(6)
+            self.status_label.setMargin(2)
             outer.addWidget(self.status_label)
 
             operation_row = QHBoxLayout()
@@ -1866,10 +2087,15 @@ if GUI_AVAILABLE:
                 "mapped feature and atomically save the selected output .grim file."
             )
             self.build_button.setDefault(True)
-            # Two rows remain usable at larger text scales.
+            # Manual checks remain available in Build; the primary action handles
+            # validation automatically and remains reachable on every page.
             action_row.addWidget(self.input_preview_button)
             action_row.addWidget(self.preview_button)
-            outer.addLayout(action_row)
+            self.review_page_layout.addLayout(action_row)
+            output_row = QFormLayout()
+            output_row.setRowWrapPolicy(QFormLayout.WrapLongRows)
+            output_row.addRow("Save result:", self.output_picker)
+            outer.addLayout(output_row)
             outer.addWidget(self.build_button)
             self.resume_draft_button = QPushButton("Resume an Assembly draft…", self)
             self.resume_draft_button.clicked.connect(self._resume_draft)
@@ -1879,11 +2105,13 @@ if GUI_AVAILABLE:
             self._busy_form_widgets = (
                 body_group,
                 self.body_geometry_section,
-                point_page,
-                line_page,
+                self.point_step_page,
+                self.line_step_page,
+                self.output_picker,
                 feature_group,
                 self.advanced_section,
                 review_group,
+                wing_page,
             )
 
             self.status_changed.connect(self.status_label.setText)
@@ -1965,6 +2193,13 @@ if GUI_AVAILABLE:
             self.input_preview_button.clicked.connect(self.preview_inputs)
             self.preview_button.clicked.connect(self.validate_and_preview)
             self.build_button.clicked.connect(self.calculate_and_save)
+            self.wing_add_button.clicked.connect(self._add_wing_sections)
+            self.wing_remove_button.clicked.connect(self._remove_wing_sections)
+            self.wing_add_corner_button.clicked.connect(self._add_wing_corner)
+            self.wing_remove_corner_button.clicked.connect(
+                self._remove_wing_corners
+            )
+            self.wing_build_button.clicked.connect(self.expand_wing_and_save)
             self.cancel_operation_button.clicked.connect(
                 self.request_cancel
             )
@@ -2095,8 +2330,9 @@ if GUI_AVAILABLE:
                     "Wait for the current feature operation before saving its recipe."
                 )
             self._pull_values()
+            recipe_values = self.recipe_values_with_vehicle_placements(path)
             saved = write_feature_assembly_recipe(
-                self.model.values,
+                recipe_values,
                 path,
                 name=self.recipe_name_edit.text(),
                 variant=self.recipe_variant_edit.text(),
@@ -2282,9 +2518,6 @@ if GUI_AVAILABLE:
                 self.surface_units.setCurrentIndex(surface_index)
                 self.flip_normals.setChecked(values.flip_surface_normals)
                 self.shadow.setChecked(values.shadow)
-                self.host_material.setText(values.host_material)
-                self.host_stack.setText(values.host_stack_id)
-                self.host_radius.setText("" if values.host_minimum_radius_m is None else format(values.host_minimum_radius_m / UNIT_SCALE_M["inches"], ".17g"))
                 for key, control in self.study_fields.items():
                     selected = getattr(values, key)
                     control.setText("" if selected is None else ", ".join(map(str, selected)))
@@ -2659,7 +2892,7 @@ if GUI_AVAILABLE:
             return estimate
 
         def _set_readiness_checklist(self, groups) -> None:
-            """Render the live, grouped run gate shown on the Review step."""
+            """Render the live, grouped run gate shown on the Build page."""
 
             if groups == getattr(self, "_readiness_groups", None):
                 return
@@ -2844,7 +3077,7 @@ if GUI_AVAILABLE:
             self.workflow_tabs.setTabToolTip(1, point_text)
             self.workflow_tabs.setTabToolTip(2, line_text)
             self.shared_units_label.setText(
-                "Placement units are shared across both CSVs and selected above the tabs."
+                "Imported coordinates use the shared units selected above."
             )
 
             selected_parts = []
@@ -2887,7 +3120,7 @@ if GUI_AVAILABLE:
                     + f"; QA: {qa_mode}"
                 )
                 if selected_parts
-                else "Choose a point or line placement CSV."
+                else "Body-only baseline. Add point or line features when needed."
             )
             shadow_state = "on" if values.shadow else "off"
             normals_state = (
@@ -3136,7 +3369,7 @@ if GUI_AVAILABLE:
                         ),
                     ),
                     (
-                        "Review",
+                        "Build",
                         (
                             ("Advanced settings valid", settings_ready, True),
                             ("Output response selected", output_ready, True),
@@ -3185,9 +3418,9 @@ if GUI_AVAILABLE:
             elif not scans_current:
                 next_step = "Next: refresh the selected CSV and correct any format error."
             elif not mappings_complete:
-                next_step = "Next: map every dataset_id to its OPN − FRD response."
+                next_step = "Next: choose a response for each imported feature."
             elif not response_files_ready:
-                next_step = "Next: map each response to an existing .grim file."
+                next_step = "Next: replace missing feature response files."
             elif not settings_ready:
                 next_step = "Next: enter a finite, non-negative shadow ray bias or leave it blank."
             elif not has_output:
@@ -3201,14 +3434,15 @@ if GUI_AVAILABLE:
                 )
             elif self._validation_warning_count and not self.validation_warning_ack.isChecked():
                 next_step = (
-                    "Validation passed with warnings. Review every warning and check "
-                    "the one-time waiver before assembly."
+                    "Open Build to review the validation warnings before saving."
                 )
             else:
-                next_step = "Validated and reviewed — ready to assemble and save."
+                next_step = "Placements validated — ready to calculate and save."
             self.next_step_label.setText(next_step)
 
             busy = self.job_is_running()
+            self.next_step_action.setVisible(not full_ready or (validation_current and not warnings_reviewed))
+            self.next_step_action.setEnabled(not busy and not self._placement_editors)
             input_preview_supported = bool(
                 service_ready
                 and adapter is not None
@@ -3269,6 +3503,7 @@ if GUI_AVAILABLE:
                 self.build_button.setEnabled(False)
                 self.input_preview_button.setEnabled(False)
                 self.build_button.setToolTip(input_error)
+            self._refresh_vehicle_ui()
 
         def job_is_running(self) -> bool:
             return bool(self._thread is not None and self._thread.isRunning())
@@ -3290,11 +3525,17 @@ if GUI_AVAILABLE:
         def request_cancel(self) -> None:
             """Request cooperative cancellation of validation or assembly."""
 
-            if self._active_kind not in {"preview", "build"} or self._worker is None:
+            if self._active_kind not in {"preview", "build", "wing"} or self._worker is None:
                 return
             self._worker.request_cancel()
             self.cancel_operation_button.setEnabled(False)
-            if self._active_kind == "preview":
+            if self._active_kind == "wing":
+                self.operation_progress.setFormat("Cancelling wing expansion safely…")
+                self.status_changed.emit(
+                    "Wing expansion cancellation requested. Finishing the "
+                    "current section; no partial output will be published."
+                )
+            elif self._active_kind == "preview":
                 self.operation_progress.setFormat("Cancelling validation safely…")
                 self.status_changed.emit(
                     "Validation cancellation requested. Finishing the current safe "
@@ -3643,10 +3884,19 @@ if GUI_AVAILABLE:
         def _sync_editor_context_lock(self) -> None:
             locked = bool(self._placement_editors)
             busy = self._thread is not None
+            self.clear_all_button.setEnabled(not locked and not busy)
             for widget in (self.base_picker, self.surface_picker, self.coordinate_units,
                            self.surface_units, self.flip_normals, self.load_recipe_button,
                            self.create_variant_button):
                 widget.setEnabled(not locked and not busy)
+            for kind in getattr(self, "vehicle_feature_controls", {}):
+                self._update_vehicle_selection_actions(kind)
+            if locked:
+                self.preview_button.setEnabled(False)
+                self.build_button.setEnabled(False)
+                self.next_step_label.setText(
+                    "Apply or close the placement editor before calculating the vehicle."
+                )
 
         def select_feature_instance(self, kind: str, identifier: str) -> None:
             """Select the matching authoring row after a 3-D pick."""
@@ -3659,21 +3909,6 @@ if GUI_AVAILABLE:
                         break
             self.status_changed.emit(f"Selected {kind} {identifier}. Use Create / edit to change its placement.")
 
-        def _host_changed(self) -> None:
-            try:
-                self._pull_host_values()
-            except ValueError as exc:
-                self._show_error(str(exc))
-                return
-            self._mark_preview_stale()
-
-        def _pull_host_values(self) -> None:
-            values = self.model.values
-            values.host_material = self.host_material.text().strip()
-            values.host_stack_id = self.host_stack.text().strip()
-            raw = self.host_radius.text().strip()
-            values.host_minimum_radius_m = None if not raw else _require_finite_nonnegative(raw, "Host minimum principal radius (in)") * UNIT_SCALE_M["inches"]
-
         def _study_changed(self) -> None:
             try:
                 for key, control in self.study_fields.items():
@@ -3685,7 +3920,6 @@ if GUI_AVAILABLE:
         def _pull_values(self) -> None:
             for key, control in self.study_fields.items():
                 setattr(self.model.values, key, parse_study_samples(control.text()))
-            self._pull_host_values()
             values = self.model.values
             values.base_grim = self.base_picker.path()
             values.output_grim = self.output_picker.path()
@@ -4082,6 +4316,7 @@ if GUI_AVAILABLE:
                 self.status_changed.emit("A feature operation is already running.")
                 return
             try:
+                self._ensure_vehicle_editable()
                 self._pull_values()
                 adapter = coerce_feature_workflow(self._service)
             except Exception as exc:
@@ -4103,6 +4338,166 @@ if GUI_AVAILABLE:
                 cooperative=True,
             )
 
+        def _add_wing_sections(self) -> None:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Choose 2-D wing section geometry",
+                "",
+                "GHOST 2-D geometry (*.geo);;All files (*)",
+            )
+            for path in paths:
+                row = self.wing_table.rowCount()
+                self.wing_table.insertRow(row)
+                # Root and tip start at the origin; the default normal is +z (up).
+                cells = [_clean_path(path)] + ["0"] * 8 + ["1"]
+                for column, text in enumerate(cells):
+                    self.wing_table.setItem(row, column, QTableWidgetItem(text))
+
+        def _remove_wing_sections(self) -> None:
+            rows = {index.row() for index in self.wing_table.selectedIndexes()}
+            for row in sorted(rows, reverse=True):
+                self.wing_table.removeRow(row)
+
+        def _wing_sections_from_table(self) -> list[dict[str, Any]]:
+            sections = []
+            for row in range(self.wing_table.rowCount()):
+
+                def cell(column: int) -> str:
+                    item = self.wing_table.item(row, column)
+                    return "" if item is None else item.text().strip()
+
+                geometry = _clean_path(cell(0))
+                if not geometry:
+                    raise ValueError(f"Wing section {row + 1}: choose a .geo file.")
+                try:
+                    numbers = [float(cell(column)) for column in range(1, 10)]
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Wing section {row + 1}: root, tip and normal must be numbers."
+                    ) from exc
+                sections.append(
+                    {
+                        "geometry": geometry,
+                        "root": tuple(numbers[0:3]),
+                        "tip": tuple(numbers[3:6]),
+                        "normal": tuple(numbers[6:9]),
+                    }
+                )
+            if not sections:
+                raise ValueError("Add at least one wing section.")
+            return sections
+
+        def _add_wing_corner(self) -> None:
+            row = self.wing_corner_table.rowCount()
+            self.wing_corner_table.insertRow(row)
+            # Default: a horizontal wing (+z face) meeting a body side (+x face).
+            cells = ["0"] * 6 + ["0", "0", "1"] + ["1", "0", "0"] + ["1"]
+            for column, text in enumerate(cells):
+                self.wing_corner_table.setItem(row, column, QTableWidgetItem(text))
+
+        def _remove_wing_corners(self) -> None:
+            rows = {index.row() for index in self.wing_corner_table.selectedIndexes()}
+            for row in sorted(rows, reverse=True):
+                self.wing_corner_table.removeRow(row)
+
+        def _wing_corners_from_table(self) -> list[dict[str, Any]]:
+            corners = []
+            for row in range(self.wing_corner_table.rowCount()):
+                try:
+                    numbers = [
+                        float(self.wing_corner_table.item(row, column).text())
+                        for column in range(13)
+                    ]
+                except (AttributeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Wing corner {row + 1}: every cell must be a number."
+                    ) from exc
+                corners.append(
+                    {
+                        "fold_start": tuple(numbers[0:3]),
+                        "fold_end": tuple(numbers[3:6]),
+                        "n_wing": tuple(numbers[6:9]),
+                        "n_body": tuple(numbers[9:12]),
+                        "face_width": numbers[12],
+                    }
+                )
+            return corners
+
+        @staticmethod
+        def _wing_samples(text: str, label: str) -> tuple[float, ...] | None:
+            """Blank, an increasing list, or an inclusive start:stop:step sweep."""
+
+            raw = str(text).strip()
+            if ":" not in raw:
+                return parse_study_samples(raw)
+            try:
+                start, stop, step = (float(part) for part in raw.split(":"))
+            except ValueError as exc:
+                raise ValueError(f"{label} sweep must be start:stop:step.") from exc
+            if (
+                not all(math.isfinite(value) for value in (start, stop, step))
+                or step <= 0.0
+                or stop < start
+            ):
+                raise ValueError(
+                    f"{label} sweep needs a positive step and stop ≥ start."
+                )
+            count = int(math.floor((stop - start) / step + 1.0e-9)) + 1
+            return tuple(start + index * step for index in range(count))
+
+        @Slot()
+        def expand_wing_and_save(self) -> None:
+            """Line-expand the listed 2-D sections onto the Body dataset."""
+
+            if self.job_is_running():
+                self.status_changed.emit("A feature operation is already running.")
+                return
+            try:
+                sections = self._wing_sections_from_table()
+                units = str(self.coordinate_units.currentData() or "")
+                if not units:
+                    raise ValueError("Choose the placement units above the tabs.")
+                output = self.wing_output_picker.path()
+                if not output:
+                    raise ValueError("Choose an output dataset for the wing expansion.")
+                arguments = dict(
+                    output_grim=output,
+                    coordinate_units=units,
+                    geometry_units=str(self.wing_geometry_units.currentData()),
+                    body_grim=self.base_picker.path() or None,
+                    mirror=self.wing_mirror.isChecked(),
+                    section_angle_step_deg=self.wing_angle_step.value(),
+                    shadow=self.wing_shadow.isChecked(),
+                    oblique=self.wing_oblique.isChecked(),
+                    corners=self._wing_corners_from_table(),
+                    base_dir=self.model.values.base_dir,
+                    **{
+                        key: self._wing_samples(
+                            control.text(), key.split("_")[0].capitalize()
+                        )
+                        for key, control in self.wing_grid_fields.items()
+                    },
+                )
+                from GRIM_Backend.integrations.ghost import load_ghost_module
+
+                expand = load_ghost_module(
+                    "ghost_backend.assembly.expand_wing_sections"
+                ).expand_wing_sections
+            except Exception as exc:
+                self._show_error(str(exc))
+                return
+            self.wing_result_label.clear()
+            self._start_operation(
+                "wing",
+                lambda cancel_check, progress_callback: expand(
+                    sections,
+                    cancel_check=cancel_check,
+                    progress_callback=progress_callback,
+                    **arguments,
+                ),
+                cooperative=True,
+            )
+
         def _validated_build_work_estimate(self) -> AssemblyWorkEstimate:
             plan = self.model.prepared_plan
             if plan is None:
@@ -4115,6 +4510,7 @@ if GUI_AVAILABLE:
             if self.job_is_running():
                 return
             try:
+                self._ensure_vehicle_editable()
                 self._pull_values()
                 current = self.model.validated_plan_is_current(self._service, verify_sources=True)
             except Exception as exc:
@@ -4134,6 +4530,7 @@ if GUI_AVAILABLE:
                 self.status_changed.emit("A feature operation is already running.")
                 return
             try:
+                self._ensure_vehicle_editable()
                 self._pull_values()
                 adapter = coerce_feature_workflow(self._service)
                 if not self._validated_plan_current:
@@ -4250,6 +4647,7 @@ if GUI_AVAILABLE:
             self.load_recipe_button.setEnabled(not busy)
             self.save_recipe_as_button.setEnabled(not busy)
             self.create_variant_button.setEnabled(not busy)
+            self.clear_all_button.setEnabled(not busy and not self._placement_editors)
             if busy:
                 self.scan_button.setEnabled(False)
                 self.input_preview_button.setEnabled(False)
@@ -4257,10 +4655,17 @@ if GUI_AVAILABLE:
                 self.build_button.setEnabled(False)
                 self.save_recipe_button.setEnabled(False)
                 self.operation_progress.setVisible(True)
-                if self._active_kind in {"preview", "build"}:
+                if self._active_kind in {"preview", "build", "wing"}:
                     self.operation_progress.setRange(0, 100)
                     self.operation_progress.setValue(0)
-                    if self._active_kind == "preview":
+                    if self._active_kind == "wing":
+                        self.operation_progress.setFormat(
+                            "0% · Preparing wing expansion"
+                        )
+                        self.cancel_operation_button.setText(
+                            "Cancel wing expansion"
+                        )
+                    elif self._active_kind == "preview":
                         self.operation_progress.setFormat(
                             "0% · Checking Assembly inputs"
                         )
@@ -4321,13 +4726,14 @@ if GUI_AVAILABLE:
                 ),
                 "preview": "Validating placements and preparing preview…",
                 "build": "Assembling coherent feature responses…",
+                "wing": "Solving 2-D sections and expanding the wing…",
             }[kind]
             self.status_changed.emit(status)
             thread.start()
 
         @Slot(int, str)
         def _operation_progress(self, percent: int, message: str) -> None:
-            if self._active_kind not in {"preview", "build"}:
+            if self._active_kind not in {"preview", "build", "wing"}:
                 return
             value = max(0, min(100, int(percent)))
             self.operation_progress.setRange(0, 100)
@@ -4367,7 +4773,39 @@ if GUI_AVAILABLE:
 
         def _apply_operation_result(self, result: Any) -> None:
             kind = self._active_kind
-            if kind in {"binding_check", "binding_write"}:
+            if kind == "wing":
+                output = str(result["output"])
+                warnings = [str(value) for value in result.get("warnings", ())]
+                self.wing_result_label.setText(
+                    "\n".join(
+                        [str(value) for value in result.get("stations", ())]
+                        + ["⚠ " + value for value in warnings]
+                    )
+                )
+                self.feature_built.emit(output)
+                body_text = ""
+                if self.wing_use_as_body.isChecked():
+                    # The new Body dataset already contains these sections, so
+                    # a second expansion onto it would count them twice.
+                    self.wing_use_as_body.setChecked(False)
+                    self.set_base_grim(output)
+                    body_text = (
+                        " It is now the Body dataset: add point and line "
+                        "features on top, and do not expand these sections "
+                        "onto it again."
+                    )
+                self.status_changed.emit(
+                    f"Saved body-plus-wing response: {output}."
+                    + body_text
+                    + (
+                        f" ⚠ {len(warnings)} sampling warning(s) are listed on "
+                        "the Wing Sections tab."
+                        if warnings
+                        else ""
+                    )
+                    + " The result is ready in GRIM for plotting."
+                )
+            elif kind in {"binding_check", "binding_write"}:
                 try:
                     values = self.model.values
                     current_base = _resolved_user_path(
@@ -4519,7 +4957,7 @@ if GUI_AVAILABLE:
                     getattr(result, "validation_warnings", ()) or ()
                 )
                 warning_text = (
-                    f" {warning_count} {'release warnings' if self._validation_warning_count else 'advisories'} in Review."
+                    f" {warning_count} {'release warnings' if self._validation_warning_count else 'advisories'} in Build."
                     if warning_count
                     else ""
                 )
