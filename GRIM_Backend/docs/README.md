@@ -152,8 +152,9 @@ own sampled coordinates within the selected spans. Disconnected selections
 remain separate selections; no interpolation or nearest-cut substitution is
 performed. Point-by-point bands and difference calculations still use aligned
 samples. Select several polarizations to draw separate labeled curves in
-azimuth, frequency, elevation, CDF, or Sector Stats plots. Standard HH/VV/HV/VH
-channels have distinct line styles, and PBP keeps separate polarization bands.
+azimuth, frequency, elevation, CDF, or Sector Stats plots. All data curves
+default to solid lines; use the line-type controls to choose another style.
+PBP keeps separate polarization bands.
 
 The current row is the active dataset: its parameter lists and axis units are
 the display reference. Other selected datasets may use compatible Hz/kHz/MHz/

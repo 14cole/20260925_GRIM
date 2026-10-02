@@ -240,9 +240,6 @@ def plot_datasets(
         for pol in polarizations
     ]
 
-    def polarization_style(pol):
-        return plot_common.polarization_linestyle(pol)
-
     figure = Figure(figsize=(10.0, 6.0), dpi=100, facecolor="white")
     FigureCanvasAgg(figure)
     if mode_key == "azimuth_polar":
@@ -304,7 +301,7 @@ def plot_datasets(
                     lines = axes.plot(
                         x,
                         y,
-                        linestyle=polarization_style(polarization),
+                        linestyle="-",
                         label=(
                             f"{name} | {polarization}, "
                             f"{float(plot_common.values_for_display(reference, dataset, 'frequency', [dataset.frequencies[fi]])[0]):g} "
@@ -371,7 +368,7 @@ def plot_datasets(
                 lines = axes.plot(
                     np.asarray(x)[order],
                     np.asarray(y)[order],
-                    linestyle=polarization_style(polarization),
+                    linestyle="-",
                     label=(
                         f"{name} | {polarization}, "
                         f"{plot_common.angular_axis_name(reference, 'elevation')} "
@@ -433,7 +430,7 @@ def plot_datasets(
                 lines = axes.plot(
                     np.asarray(x)[order],
                     np.asarray(y)[order],
-                    linestyle=polarization_style(polarization),
+                    linestyle="-",
                     label=(
                         f"{name} | {polarization}, {frequency:g} "
                         f"{plot_common.axis_unit(reference, 'frequency')}"

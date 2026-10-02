@@ -1405,7 +1405,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         ))
 
     def _plot_bounded_line(self, ax, x_values, y_values, *args, dataset=None,
-                           trace_key=None, polarization=None, **kwargs):
+                           trace_key=None, **kwargs):
         limit = getattr(self, "_plot_line_point_limit", plot_common.MAX_LINE_POINTS)
         x_display, y_display, decimated = plot_common.decimate_line(
             x_values, y_values, max_points=limit
@@ -1448,8 +1448,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                     "Clear the plot before adding different cuts."
                 )
                 return []
-        if polarization is not None:
-            kwargs.setdefault("linestyle", plot_common.polarization_linestyle(polarization))
+        if dataset is not None:
+            kwargs.setdefault("linestyle", "-")
         lines = ax.plot(x_display, y_display, *args, **kwargs)
         for line in lines:
             line._grim_trace_key = trace_key

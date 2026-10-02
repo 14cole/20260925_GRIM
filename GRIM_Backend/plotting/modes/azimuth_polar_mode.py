@@ -76,8 +76,7 @@ def render(self) -> None:
                     x_values, "azimuth", angular_unit, "rad"
                 )
                 self._plot_bounded_line(self.plot_ax, theta, display, label=label,
-                                        dataset=dataset, trace_key=trace_key,
-                                        polarization=dataset.polarizations[selection[3][0]])
+                                        dataset=dataset, trace_key=trace_key)
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += candidates - candidate_index - 1

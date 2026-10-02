@@ -43,6 +43,17 @@ def _harness(left, right, *, start, end, show_all=False, phase=False):
 
 
 class CompareWrappedSectorTests(unittest.TestCase):
+    def test_curves_default_to_solid_and_respect_explicit_styles(self):
+        angles = np.arange(-180.0, 181.0, 5.0)
+        left, right = _sweep(angles), _sweep(angles)
+        owner = _harness(left, right, start=-180.0, end=180.0)
+        self.addCleanup(owner.plot_figure.clear)
+        compare_mode.render(owner)
+        self.assertEqual([line.get_linestyle() for line in owner.plot_figure.axes[0].lines], ["-", "-"])
+        owner._dataset_plot_styles = {owner._dataset_plot_key(right): {"linestyle": "--"}}
+        compare_mode.render(owner)
+        self.assertEqual([line.get_linestyle() for line in owner.plot_figure.axes[0].lines], ["-", "--"])
+
     def test_signed_seam_sector_is_contiguous_and_counts_endpoint_once(self):
         angles = np.arange(-180.0, 181.0, 5.0)
         left, right = _sweep(angles), _sweep(angles)

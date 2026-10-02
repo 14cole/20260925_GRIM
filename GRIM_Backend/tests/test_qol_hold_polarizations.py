@@ -21,8 +21,8 @@ BAND_MODES = (azimuth_rect_mode, azimuth_polar_mode, frequency_mode)
 
 
 class HoldPolarizationTests(unittest.TestCase):
-    def harness(self, polarizations, *, bands=False):
-        datasets = [("A", grid())]
+    def harness(self, polarizations, *, bands=False, available_polarizations=("HH", "VV")):
+        datasets = [("A", grid(polarizations=available_polarizations))]
         if bands:
             datasets.append(("B", grid(scale=2)))
         owner = _RendererHarness(datasets, selections={
@@ -63,10 +63,9 @@ class HoldPolarizationTests(unittest.TestCase):
                     mode.render(owner)
                     self.assertEqual(len(owner.plot_ax.lines), 2)
                     for line in owner.plot_ax.lines:
-                        expected = "--" if "Pol VV" in line.get_label() else "-"
-                        self.assertEqual(line.get_linestyle(), expected)
+                        self.assertEqual(line.get_linestyle(), "-")
 
-    def test_single_polarization_additions_keep_distinct_styles(self):
+    def test_single_polarization_additions_stay_solid(self):
         for first, second in (("HH", "VV"), ("VV", "HH")):
             owner = self.harness((first,))
             azimuth_rect_mode.render(owner)
@@ -74,9 +73,18 @@ class HoldPolarizationTests(unittest.TestCase):
             owner._selections[owner.list_pol] = (second,)
             azimuth_rect_mode.render(owner)
             self.assertEqual(len(owner.plot_ax.lines), 2)
-            self.assertEqual({line.get_linestyle() for line in owner.plot_ax.lines}, {"-", "--"})
+            self.assertEqual({line.get_linestyle() for line in owner.plot_ax.lines}, {"-"})
 
-    def test_explicit_dataset_style_overrides_polarization_default(self):
+    def test_all_polarizations_default_to_solid_in_each_line_mode(self):
+        polarizations = ("HH", "VV", "HV", "VH")
+        for mode in LINE_MODES:
+            with self.subTest(mode=mode.__name__):
+                owner = self.harness(polarizations, available_polarizations=polarizations)
+                mode.render(owner)
+                self.assertEqual(len(owner.plot_ax.lines), 4)
+                self.assertEqual({line.get_linestyle() for line in owner.plot_ax.lines}, {"-"})
+
+    def test_explicit_dataset_style_overrides_solid_default(self):
         owner = self.harness(("HH", "VV"))
         key = owner._dataset_plot_key(owner.active_dataset)
         owner._dataset_plot_styles = {key: {"linestyle": ":", "color": "#ff0000"}}

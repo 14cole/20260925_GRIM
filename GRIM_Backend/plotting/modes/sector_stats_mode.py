@@ -164,7 +164,7 @@ def render(self) -> None:
                 self._plot_bounded_line(
                     self.plot_ax, np.asarray(x_points), np.asarray(y_points),
                     label=label, dataset=dataset, trace_key=trace_key,
-                    linewidth=2.5, solid_capstyle="butt", polarization=pol_value,
+                    linewidth=2.5, solid_capstyle="butt",
                 )
                 rendered += 1
 

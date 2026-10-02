@@ -103,7 +103,7 @@ def render(self) -> None:
         )
         self._plot_bounded_line(
             self.plot_ax, values, percent, label=label, dataset=dataset,
-            trace_key=trace_key, drawstyle="steps-post", polarization=pol_value,
+            trace_key=trace_key, drawstyle="steps-post",
         )
         rendered += 1
         low = values[0] if low is None else min(low, values[0])

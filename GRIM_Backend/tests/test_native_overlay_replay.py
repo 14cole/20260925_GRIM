@@ -66,7 +66,7 @@ class NativeOverlayReplayTests(unittest.TestCase):
                     factor = 1.0 if index % 2 == 0 else 4.0
                     np.testing.assert_allclose(line.get_ydata(), (80.0 + az ** 2) * factor)
                     self.assertIn("HH" if index % 2 == 0 else "VV", line.get_label())
-                    self.assertEqual(line.get_linestyle(), "-" if index % 2 == 0 else "--")
+                    self.assertEqual(line.get_linestyle(), "-")
 
     def test_frequency_keeps_native_frequency_samples_and_separate_p50(self):
         axis = self._plot("frequency")
@@ -94,7 +94,17 @@ class NativeOverlayReplayTests(unittest.TestCase):
                 axis = self._plot(mode)
                 self.assertEqual(len(axis.lines), 3)
                 self.assertIn("fine | VV", axis.lines[-1].get_label())
-                self.assertEqual(axis.lines[-1].get_linestyle(), "--")
+                self.assertEqual(axis.lines[-1].get_linestyle(), "-")
+
+    def test_all_polarizations_default_to_solid(self):
+        polarizations = ("HH", "VV", "HV", "VH")
+        self.coarse = _grid(polarizations=polarizations)
+        self.fine = _grid(fine=True, converted=True, polarizations=polarizations)
+        for mode in ("azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep"):
+            with self.subTest(mode=mode):
+                axis = self._plot(mode, polarization=polarizations)
+                self.assertEqual(len(axis.lines), 8)
+                self.assertEqual({line.get_linestyle() for line in axis.lines}, {"-"})
 
     def test_disconnected_selections_do_not_include_unselected_native_intervals(self):
         axis = self._plot("azimuth_rect", azimuths=[-2.0, 2.0])
@@ -150,7 +160,7 @@ class NativeOverlayReplayTests(unittest.TestCase):
         for mode in ("azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep"):
             with self.subTest(mode=mode):
                 single_vv = self._plot(mode, polarization="VV")
-                self.assertTrue(all(line.get_linestyle() == "--" for line in single_vv.lines))
+                self.assertTrue(all(line.get_linestyle() == "-" for line in single_vv.lines))
 
 
 if __name__ == "__main__":

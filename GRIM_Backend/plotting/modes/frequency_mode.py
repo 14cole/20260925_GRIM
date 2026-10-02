@@ -221,8 +221,7 @@ def render(self) -> None:
                 rendered += 1
             elif rendered < common.MAX_LINE_SERIES:
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
-                                        dataset=dataset, trace_key=trace_key,
-                                        polarization=dataset.polarizations[selection[3][0]])
+                                        dataset=dataset, trace_key=trace_key)
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += candidates - candidate_index - 1

@@ -112,7 +112,8 @@ class NativeOverlayTests(unittest.TestCase):
                 hh, vv = owner.plot_ax.lines
                 self.assertIn("Pol HH", hh.get_label())
                 self.assertIn("Pol VV", vv.get_label())
-                self.assertNotEqual(hh.get_linestyle(), vv.get_linestyle())
+                self.assertEqual(hh.get_linestyle(), "-")
+                self.assertEqual(vv.get_linestyle(), "-")
                 first = hh.get_xdata() if mode is cdf_mode else hh.get_ydata()
                 second = vv.get_xdata() if mode is cdf_mode else vv.get_ydata()
                 valid = np.isfinite(first) & np.isfinite(second)

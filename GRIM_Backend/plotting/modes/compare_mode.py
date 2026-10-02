@@ -663,7 +663,7 @@ def render(self) -> None:
     )
     self._plot_bounded_line(
         top_ax, x_b, y_b, color="#ff8a65", linewidth=1.5,
-        linestyle="--", label=label_b, dataset=datasets[1][1],
+        label=label_b, dataset=datasets[1][1],
     )
     top_ax.set_ylabel(self._display_axis_label(datasets))
     self._update_legend_visibility()

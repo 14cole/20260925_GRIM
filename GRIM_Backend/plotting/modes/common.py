@@ -168,10 +168,6 @@ def native_axis_selection(reference, dataset, axis: str, requested):
     return indices if indices.size else None
 
 
-def polarization_linestyle(polarization: str) -> str:
-    return {"HH": "-", "VV": "--", "HV": ":", "VH": "-."}.get(str(polarization).upper(), "-")
-
-
 def finite_axis_limits(low, high):
     """Return explicit nonsingular limits; preserve intentional inversion."""
     low, high = float(low), float(high)
