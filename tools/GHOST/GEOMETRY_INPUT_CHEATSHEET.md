@@ -132,10 +132,26 @@ properties: TYPE N IBC_FLAG POS_MAT NEG_MAT
 
 `N = 0` is the usual choice. Production results should still pass the
 base/fine complex-field mesh-convergence check.
+It uses the same nominal density as `N = -20`, rather than searching for an
+optimal value of `N`. The actual panel count depends on primitive length,
+frequency, materials, and geometry refinement rules. The GUI's **Certify mesh
+convergence** option is enabled by default and provides a separate accuracy
+check. Eligible 2D monostatic cases can adapt the mesh and element order;
+BoR compares a base mesh with a finer one. These checks preserve the drawn
+geometry, so they do not repair an overly coarse polygon used to represent
+a curved surface.
 There is no longer an implicit 2,000-element-per-primitive cap; explicit
 global panel limits and resource checks still apply. **Find corners/junctions**
-and **Refine selected 2x** help adjust local density in Geometry. Refinement is
-manual; it does not change the material syntax.
+and **Refine selected 2x** help adjust local density in Geometry. These buttons
+apply manual refinements without changing the material syntax.
+
+In the Geometry table, select one or more rows and click **Reverse selected**
+to reverse their traversal direction and normals. **Show Normals** displays
+the resulting orientation. The shape and material callouts stay the same;
+start/end-defined impedance tapers follow the new direction. Reverse the same
+rows again to restore their original direction, and save to keep the change.
+Scrolling over a closed table dropdown scrolls the table without changing
+its value. Open the dropdown or use the keyboard to deliberately change it.
 
 ## Thin dielectric layer material (2D only)
 

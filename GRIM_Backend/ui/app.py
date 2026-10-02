@@ -52,6 +52,7 @@ from GRIM_Backend.integrations.freddy import FreddyIntegrationWidget
 from GRIM_Backend.integrations.ghost import GhostIntegrationWidget, load_ghost_module
 from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.ui.analysis_controls import PlotAnalysisControls, PlotSliderBar
+from GRIM_Backend.ui.sector_statistics_dialog import SectorStatisticsDialog
 from GRIM_Backend.ui.dataset_sidebar import DatasetSidebar, DatasetTable
 from GRIM_Backend.ui.widgets import (
     ClickableLabel, CollapsibleSection, PlotSettingsPopup, initial_window_size,
@@ -115,7 +116,6 @@ PLOT_OPS_SPECS = {
             ("CDF", "cdf"),
             ("Sector Stats", "sector_stats"),
             ("Range–Freq", "range_freq"),
-            ("Δ Ref", "delta_ref"),
             ("Markers", "markers"),
             ("Slider", "slider"),
         ),
@@ -859,10 +859,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_dataset_selection_changed)
         self.table.itemChanged.connect(self._on_dataset_table_item_changed)
         self.table.customContextMenuRequested.connect(self._on_dataset_context_menu)
-        # Rows restored by Undo Delete carry whatever marker they had then.
-        self.table.model().rowsInserted.connect(
-            lambda *_: QTimer.singleShot(0, self._refresh_delta_reference_marker)
-        )
         self.table.horizontalHeader().sectionDoubleClicked.connect(self._on_dataset_header_double_clicked)
         for context in self._plot_contexts.values():
             context.delta_map_controls.changed.connect(self._on_delta_map_controls_changed)
@@ -925,10 +921,12 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 controls["cdf"].clicked.connect(self._plot_cdf)
             if "sector_stats" in controls:
                 controls["sector_stats"].clicked.connect(self._plot_sector_stats)
+                controls["sector_stats"].setContextMenuPolicy(Qt.CustomContextMenu)
+                controls["sector_stats"].customContextMenuRequested.connect(
+                    self._show_sector_statistics_settings
+                )
             if "range_freq" in controls:
                 controls["range_freq"].clicked.connect(self._plot_range_freq)
-            if "delta_ref" in controls:
-                controls["delta_ref"].toggled.connect(self._on_delta_ref_toggled)
             if "markers" in controls:
                 controls["markers"].toggled.connect(self._on_markers_toggled)
             if "slider" in controls:
@@ -1288,6 +1286,18 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+    def _show_sector_statistics_settings(self, _position=None) -> None:
+        controls = self._plot_contexts["plotting"].analysis_controls
+        reference = self.active_dataset
+        unit = self._plot_axis_unit(reference, "azimuth") if reference is not None else "deg"
+        dialog = SectorStatisticsDialog(
+            controls, self._selected_values(self.list_az), unit=unit, parent=self
+        )
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def _build_plot_left_context(self, panel: QWidget, tab_key: str) -> PlotContext:
         left_layout = QVBoxLayout(panel)
@@ -1822,7 +1832,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             btn = QToolButton(text=label)
             if role in (
                 "hold", "auto_plot", "auto_scale", "pbp", "phase", "zoom_box", "pan",
-                "markers", "slider", "delta_ref",
+                "markers", "slider",
             ):
                 btn.setCheckable(True)
             if role == "auto_scale":
@@ -1846,8 +1856,9 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 ),
                 "sector_stats": (
                     "Mean, median, max, min, or a percentile of linear power inside "
-                    "each azimuth sector, drawn over the sector. Set the sectors and "
-                    "statistic in Plot Settings; right-click to copy the table."
+                    "each azimuth sector, drawn over the sector. Right-click this "
+                    "button to edit sectors and percentiles. Right-click the plot "
+                    "to copy the results table."
                 ),
                 "range_freq": (
                     "Down-range profiles over sliding frequency sub-bands, averaged "
@@ -1863,13 +1874,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 "slider": (
                     "Show a slider that steps one parameter list (frequency, "
                     "elevation, or azimuth) and re-plots at each value."
-                ),
-                "delta_ref": (
-                    "Plot each selected dataset minus the Δ reference in dB on "
-                    "Azimuth (Rect), Frequency, and Elevation Sweep plots. Right-click "
-                    "a dataset and choose Set as Δ reference to pick it (marked Δ in "
-                    "the table); otherwise the active row is used. Set a ± tolerance "
-                    "band in Plot Settings."
                 ),
                 "pbp": (
                     "Point-by-point band across the selected series. Choose "
@@ -2044,7 +2048,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_pan = controls.get("pan")
         self.btn_markers = controls.get("markers")
         self.btn_slider = controls.get("slider")
-        self.btn_delta_ref = controls.get("delta_ref")
         self.btn_cdf = controls.get("cdf")
         self.btn_sector_stats = controls.get("sector_stats")
 

@@ -1104,8 +1104,14 @@ def parse_sectors(text: str, selected, *, period: float = 360.0) -> list[Sector]
         if start == stop:
             raise ValueError(f"sector {part!r} is empty")
         width = float(np.mod(stop - start, period))
+        # Unit conversion can leave a full revolution just above or below an
+        # exact multiple of the period. Keep that a full sector, not a sliver.
+        eps = 1.0e-9 * period
+        full_turn = abs(stop - start) >= period - eps and (
+            width <= eps or period - width <= eps
+        )
         sectors.append(Sector(
-            start, period if width == 0.0 else width, period, stop_value=stop,
+            start, period if full_turn else width, period, stop_value=stop,
         ))
     if len(sectors) > MAX_SECTORS:
         raise ValueError(f"{len(sectors)} sectors requested (limit {MAX_SECTORS})")

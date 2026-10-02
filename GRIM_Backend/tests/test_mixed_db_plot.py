@@ -8,7 +8,7 @@ from GRIM_Backend.plotting.modes import (
     azimuth_rect_mode, azimuth_polar_mode, frequency_mode, elevation_sweep_mode,
     cdf_mode, sector_stats_mode, waterfall_mode, compare_mode, common,
 )
-from test_plot_renderer_correctness import _Checked, _RendererHarness, _grid
+from test_plot_renderer_correctness import _RendererHarness, _grid
 
 
 class MixedDbPlotTests(unittest.TestCase):
@@ -167,11 +167,6 @@ class MixedDbPlotTests(unittest.TestCase):
         self.assertIn("mixed physical quantities", owner.status.message)
         self.assertEqual(len(owner.plot_ax.lines), 0)
         owner.combo_plot_scale.data = "dbsm"
-        owner.btn_delta_ref = _Checked(True)
-        azimuth_rect_mode.render(owner)
-        self.assertIn("mixed physical quantities", owner.status.message)
-        self.assertEqual(len(owner.plot_ax.lines), 0)
-        owner.btn_delta_ref.checked = False
         compare_mode.render(owner)
         self.assertIn("mixed physical quantities", owner.status.message)
         self.assertEqual(len(owner.plot_ax.lines), 0)

@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from PySide6.QtCore import QItemSelectionModel, QObject, QThread, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -203,26 +203,6 @@ _WINDOWS_RESERVED_FILENAMES = frozenset(
 DATASET_ID_ROLE = Qt.UserRole + 32
 DATASET_DIRTY_ROLE = Qt.UserRole + 33
 DATASET_PATH_ROLE = Qt.UserRole + 34
-_DELTA_REFERENCE_ICON = None
-
-
-def _delta_reference_icon() -> QIcon:
-    """A small amber Δ marking the picked Δ reference row."""
-
-    global _DELTA_REFERENCE_ICON
-    if _DELTA_REFERENCE_ICON is None:
-        pixmap = QPixmap(16, 16)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        font = painter.font()
-        font.setBold(True)
-        font.setPixelSize(14)
-        painter.setFont(font)
-        painter.setPen(QColor("#f2a33a"))
-        painter.drawText(pixmap.rect(), Qt.AlignCenter, "Δ")
-        painter.end()
-        _DELTA_REFERENCE_ICON = QIcon(pixmap)
-    return _DELTA_REFERENCE_ICON
 
 # Explicit output limits keep a typo such as a 1e-9 degree step from allocating
 # an axis (and then a dense four-dimensional result) before the user can react.
@@ -1120,53 +1100,6 @@ class DatasetOpsMixin:
             if callable(catalog_notify):
                 catalog_notify()
         return dataset_id
-
-    def _explicit_delta_reference(self):
-        """(name, dataset) picked with Set as Δ reference, while its row exists."""
-
-        reference_id = getattr(self, "_delta_reference_id", None)
-        if not reference_id:
-            return None
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item is not None and item.data(DATASET_ID_ROLE) == reference_id:
-                dataset = item.data(Qt.UserRole)
-                return (item.text(), dataset) if isinstance(dataset, RcsGrid) else None
-        return None
-
-    def _set_delta_reference_row(self, row: int | None) -> None:
-        """Pick (or with None, clear) the dataset every Δ Ref plot subtracts."""
-
-        item = self.table.item(row, 0) if row is not None else None
-        self._delta_reference_id = (
-            str(item.data(DATASET_ID_ROLE) or "") or None if item is not None else None
-        )
-        self._refresh_delta_reference_marker()
-        message = (
-            f"Δ reference set to {item.text()}; Δ Ref plots subtract it even when "
-            "its row is not selected."
-            if item is not None
-            else "Δ reference cleared; Δ Ref subtracts the active row again."
-        )
-        before = self.status.currentMessage()
-        if self._delta_reference_active():
-            self._on_delta_ref_toggled()
-        after = self.status.currentMessage()
-        # Keep the re-plot's own status (or block reason) after the confirmation.
-        self.status.showMessage(message if after == before else f"{message} {after}")
-
-    def _refresh_delta_reference_marker(self) -> None:
-        reference_id = getattr(self, "_delta_reference_id", None)
-        blocked = self.table.blockSignals(True)
-        try:
-            for row in range(self.table.rowCount()):
-                item = self.table.item(row, 0)
-                if item is None:
-                    continue
-                picked = bool(reference_id) and item.data(DATASET_ID_ROLE) == reference_id
-                item.setData(Qt.DecorationRole, _delta_reference_icon() if picked else None)
-        finally:
-            self.table.blockSignals(blocked)
 
     def _python_reference_for_dataset(
         self, dataset: RcsGrid
@@ -3510,7 +3443,6 @@ class DatasetOpsMixin:
                 self.table.selectRow(clicked.row())
             else:
                 return
-        reference_row = clicked.row() if clicked.isValid() else self.table.currentRow()
         menu = QMenu(self)
         action_save = menu.addAction("Save")
         export_menu = menu.addMenu("Export as…")
@@ -3521,19 +3453,7 @@ class DatasetOpsMixin:
         menu.addSeparator()
         action_color = menu.addAction("Text Color…")
         action_reset_color = menu.addAction("Reset Text Color")
-        menu.addSeparator()
-        action_set_reference = menu.addAction("Set as Δ reference")
-        action_set_reference.setEnabled(reference_row >= 0)
-        action_clear_reference = None
-        if self._explicit_delta_reference() is not None:
-            action_clear_reference = menu.addAction("Clear Δ reference")
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if action is not None and action is action_set_reference:
-            self._set_delta_reference_row(reference_row)
-            return
-        if action is not None and action is action_clear_reference:
-            self._set_delta_reference_row(None)
-            return
         if action == action_save:
             self._save_selected_datasets()
         elif action == action_export_pio:

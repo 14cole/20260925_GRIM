@@ -73,13 +73,16 @@ def render(self) -> None:
         return
 
     controls = getattr(self, "analysis_controls", None)
-    sector_text = controls.sector_text() if controls is not None else "30"
     statistic = controls.sector_statistic() if controls is not None else "mean"
     percentile = controls.sector_percentile() if controls is not None else 90.0
     period = float(common.convert_axis_values(
         [360.0], "azimuth", "deg", self._plot_axis_unit(reference, "azimuth")
     )[0])
     try:
+        sector_text = (
+            controls.sector_text(unit=self._plot_axis_unit(reference, "azimuth"))
+            if controls is not None else "30"
+        )
         sectors = common.parse_sectors(sector_text, az_values, period=period)
     except ValueError as exc:
         self.status.showMessage(f"Sector Stats blocked: {exc}.")
@@ -90,8 +93,6 @@ def render(self) -> None:
     )
     if not plans:
         self._show_plot_status("No compatible one-to-one coordinates for the selected plot.")
-        return
-    if self._delta_reference(plans, None) is False:
         return
     self._configure_line_budget(sum(len(sel[1]) * len(sel[2]) for _, _, sel in plans))
     if not self._prepare_line_plot_axes("sector_stats", "rectilinear", reference, datasets):

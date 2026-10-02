@@ -10,7 +10,7 @@ from GRIM_Backend.plotting.modes import (
     azimuth_rect_mode, azimuth_polar_mode, frequency_mode, elevation_sweep_mode,
     cdf_mode, sector_stats_mode, common,
 )
-from test_plot_renderer_correctness import _RendererHarness, _Checked
+from test_plot_renderer_correctness import _RendererHarness
 from GRIM_Backend.scripting.recorder import DatasetReference
 
 
@@ -147,14 +147,27 @@ class NativeOverlayTests(unittest.TestCase):
                 np.testing.assert_allclose(lines[2].get_ydata() - lines[0].get_ydata(), 20)
                 np.testing.assert_allclose(lines[3].get_ydata() - lines[1].get_ydata(), 20)
 
-    def test_delta_ref_keeps_strict_pairing_and_single_polarization(self):
-        owner = self.harness([("A", grid()), ("B", grid((0, 1, 2)))])
-        owner.btn_delta_ref = _Checked(True)
+    def test_native_grid_multi_polarization_mixed_db_overlay_keeps_all_values(self):
+        fine, coarse = grid(), grid((0, 1, 2))
+        coarse.units.update(rcs_linear_quantity="sigma_2d", rcs_log_unit="dBke")
+        datasets = [("Measured", fine), ("Analysis", coarse)]
+        owner = self.harness(datasets, polarizations=("HH", "VV"))
         azimuth_rect_mode.render(owner)
-        self.assertEqual(len(owner.plot_ax.lines), 0)
-        owner._selections[owner.list_pol] = ["HH", "VV"]
-        azimuth_rect_mode.render(owner)
-        self.assertIn("Select one polarization", owner.status.message)
+        self.assertIn("updated", owner.status.message)
+        self.assertEqual(owner.plot_ax.get_ylabel(), "Mixed dB")
+        self.assertEqual(len(owner.plot_ax.lines), 4)
+        for name, dataset in datasets:
+            for pol_index, pol in enumerate(dataset.polarizations):
+                (line,) = [line for line in owner.plot_ax.lines
+                           if line.get_label().startswith(name + " [")
+                           and f"Pol {pol}," in line.get_label()]
+                np.testing.assert_allclose(line.get_xdata(), dataset.azimuths)
+                expected = 10 * np.log10(dataset.rcs_power[:, 0, 0, pol_index])
+                if dataset is coarse:
+                    expected += 10 * np.log10(2 * np.pi * 9.0e9 / 299_792_458.0)
+                np.testing.assert_allclose(line.get_ydata(), expected)
+                self.assertIn(f"[{dataset.default_log_unit()}]", line.get_label())
+                self.assertEqual(line.get_linestyle(), "-")
 
     def test_native_selector_rejects_duplicate_coordinates(self):
         with self.assertRaisesRegex(ValueError, "duplicate source coordinates"):

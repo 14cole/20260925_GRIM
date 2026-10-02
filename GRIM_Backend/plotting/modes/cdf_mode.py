@@ -57,8 +57,6 @@ def render(self) -> None:
     if not plans:
         self._show_plot_status("No compatible one-to-one coordinates for the selected plot.")
         return
-    if self._delta_reference(plans, None) is False:
-        return
     cells = [len(sel[0]) * len(sel[1]) * len(sel[2]) for _name, _dataset, sel in plans]
     try:
         common.validate_synchronous_plot_workload(

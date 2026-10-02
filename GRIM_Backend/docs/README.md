@@ -156,6 +156,17 @@ azimuth, frequency, elevation, CDF, or Sector Stats plots. All data curves
 default to solid lines; use the line-type controls to choose another style.
 PBP keeps separate polarization bands.
 
+Right-click **Sector Stats** to open its settings. Choose uniform-width sectors
+or **Custom sectors** and enter one start/stop azimuth pair per table row.
+Custom sectors may have different widths, gaps, or overlaps; a stop below the
+start crosses the azimuth seam (for example, 170 to -170 degrees). Custom
+sectors include both endpoints. Uniform sectors count shared boundaries once.
+The window also contains Mean, Median, Min, Max, and Percentile controls; these
+settings no longer appear in Plot Settings. Apply saves the settings and
+refreshes an existing Sector Stats plot. With Hold enabled, click Sector Stats
+again to add the updated curves. Cancel discards changes made since the last
+Apply. Sector limits follow degree/radian unit changes during the session.
+
 The current row is the active dataset: its parameter lists and axis units are
 the display reference. Other selected datasets may use compatible Hz/kHz/MHz/
 GHz or degree/radian storage; GRIM converts selections and labels without
@@ -170,7 +181,7 @@ Removing curves updates these labels to reflect the remaining data. CDFs use
 **Mixed dB** on their level (horizontal) axis, sector tables identify each
 row's unit, and waterfall panels identify their native units. This display
 does not convert between 2-D width and 3-D RCS. Linear overlays, RF Compare,
-**Δ Ref**, and Delta Map still require compatible physical quantities;
+and Delta Map still require compatible physical quantities;
 logarithmic comparisons also require the same dB convention.
 
 RF Compare uses one explicit selected azimuth, elevation, or

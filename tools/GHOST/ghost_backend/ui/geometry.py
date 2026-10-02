@@ -10,6 +10,7 @@ from ghost_backend.geometry.materials import (
     show_material_guide,
     choose_thin_layer,
 )
+from ghost_backend.ui.table_editors import ScrollSafeComboBox
 
 try:
     from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QThread
@@ -51,6 +52,13 @@ from ghost_backend.geometry.io import (
 
 
 SEGMENT_TYPE_OPTIONS: 'List[Tuple[str, str]]' = segment_type_options()
+MESH_N_TOOLTIP = (
+    "0 uses a nominal 20 panels per controlling wavelength (the same as -20), "
+    "with sizing based on frequency, materials, and geometry. Positive N is "
+    "a panel count per primitive; negative N is panels per wavelength. "
+    "Certify mesh convergence separately checks accuracy and can refine "
+    "supported 2D cases; 0 alone does not choose an optimal density."
+)
 
 
 def _parse_mesh_n_token(token: 'Any') -> 'int':
@@ -182,6 +190,7 @@ class GeometryTab(QWidget):
             ["Name", "Type", "N (0=auto)", "IBC/Resistance",
              "pos_mat", "neg_mat"]
         )
+        self.table.horizontalHeaderItem(2).setToolTip(MESH_N_TOOLTIP)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         right_layout.addWidget(self.table)
@@ -190,11 +199,19 @@ class GeometryTab(QWidget):
         self.btn_find_refinement = QPushButton("Find corners / junctions")
         self.btn_refine_selected = QPushButton("Refine selected 2x")
         self.btn_refine_selected.setToolTip("Increase N only on selected segments. Auto N becomes 40 panels per material wavelength. Fine geometry can already be denser; mesh certification still compares realized meshes.")
+        self.btn_reverse_selected = QPushButton("Reverse selected")
+        self.btn_reverse_selected.setToolTip(
+            "Reverse the selected segments so their normals point the other way. "
+            "Material assignments stay the same; start/end impedance tapers "
+            "follow the new direction. Repeat to restore the original direction."
+        )
         mesh_actions.addWidget(self.btn_find_refinement)
         mesh_actions.addWidget(self.btn_refine_selected)
+        mesh_actions.addWidget(self.btn_reverse_selected)
         right_layout.addLayout(mesh_actions)
         self.btn_find_refinement.clicked.connect(self._select_refinement_candidates)
         self.btn_refine_selected.clicked.connect(self._refine_selected_segments)
+        self.btn_reverse_selected.clicked.connect(self._reverse_selected_segments)
 
         bottom_row = QHBoxLayout()
 
@@ -406,11 +423,13 @@ class GeometryTab(QWidget):
                 ["Name", "Type", "N (0=auto)", "IBC/Resistance",
                  "pos_mat", "neg_mat"]
             )
+            self.table.horizontalHeaderItem(2).setToolTip(MESH_N_TOOLTIP)
             for row, seg in enumerate(self.segments):
                 props = self._ensure_prop_len(seg.properties, 5)
                 n_value = props[1] if len(props) >= 2 else ""
                 self.table.setItem(row, 0, QTableWidgetItem(seg.name))
                 self.table.setItem(row, 2, QTableWidgetItem(n_value))
+                self.table.item(row, 2).setToolTip(MESH_N_TOOLTIP)
         finally:
             self._populating = False
 
@@ -536,7 +555,7 @@ class GeometryTab(QWidget):
         label.setText(f"{'Surface materials (IBC / sheets)' if title_prefix == 'IBCS/Resistances' else title_prefix} (n={len(rows)})")
 
     def _install_ibc_kind_combo(self, table: 'QTableWidget', row: 'int', current_kind: 'str') -> 'None':
-        cb = QComboBox()
+        cb = ScrollSafeComboBox()
         for kind in IBC_KINDS:
             cb.addItem(kind, userData=kind)
         target = (current_kind or "").strip().lower()
@@ -593,7 +612,7 @@ class GeometryTab(QWidget):
         prop_index: 'int',
     ) -> 'QComboBox':
         """Build a QComboBox for the segment table. Connects the change handler only after the initial index is set."""
-        cb = QComboBox()
+        cb = ScrollSafeComboBox()
         found_index = -1
         cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         cb.setMinimumContentsLength(8)
@@ -1179,6 +1198,55 @@ class GeometryTab(QWidget):
         for row, value in values:
             self.table.item(row, 2).setText(value)
         self.lbl_status.setText(f"Refined {len(values)} selected segments. Run the certified solve to measure the field change." if values else "Select segments in the table or use Find corners / junctions first.")
+
+    def _reverse_selected_segments(self):
+        selected = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not selected:
+            self.lbl_status.setText("Select segments in the table or preview to reverse their direction.")
+            return
+
+        updates = []
+        for row in selected:
+            seg = self.segments[row]
+            if len(seg.x) != len(seg.y) or len(seg.x) % 2:
+                QMessageBox.warning(
+                    self, "Reverse segment direction",
+                    f"Segment {seg.name} has incomplete coordinate pairs. "
+                    "No segments were changed.",
+                )
+                return
+            # Each consecutive pair is a directed line primitive. Reversing
+            # both arrays reverses the chain and each primitive's normal.
+            updates.append((row, list(reversed(seg.x)), list(reversed(seg.y))))
+
+        lookup = self._ibcs_lookup()
+        has_taper = False
+        for row in selected:
+            props = self._ensure_prop_len(self.segments[row].properties, 5)
+            info = lookup.get(self._parse_int_token(props[2], 0), {})
+            if (info.get("kind") in ("linear", "cosine", "exp")
+                    and info.get("z_start") != info.get("z_end")):
+                has_taper = True
+        for row, xs, ys in updates:
+            seg = self.segments[row]
+            seg.x, seg.y = xs, ys
+            if row < len(self.segment_lines):
+                self.segment_lines[row].set_data(*self._segment_plot_xy(seg))
+
+        self.issue_rows.clear()
+        self._set_dirty(True)
+        self._refresh_segment_styles()
+        self._render_normals()
+        self._render_impedance_overlay()
+        self._render_fills()
+        self.canvas.draw_idle()
+        message = (
+            f"Reversed {len(updates)} selected segment(s); normals now point the other way. "
+            "Repeat to restore the original direction."
+        )
+        if has_taper:
+            message += " Start/end impedance tapers now follow the reversed direction."
+        self.lbl_status.setText(message)
 
     def _on_table_selection_changed(self):
         if self._syncing_selection:

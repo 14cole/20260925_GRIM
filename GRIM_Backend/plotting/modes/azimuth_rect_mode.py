@@ -66,7 +66,7 @@ def _plan_series(self, reference, datasets, az_values, elev_values, freq_values,
 def render(self) -> None:
     self.last_plot_mode = "azimuth_rect"
     self._start_plot_render()
-    datasets = self._with_delta_reference(self._selected_datasets())
+    datasets = self._selected_datasets()
     if not datasets:
         self.status.showMessage("Select a dataset before plotting.")
         return
@@ -98,11 +98,6 @@ def render(self) -> None:
         self._show_plot_status("No compatible one-to-one coordinates for the selected plot.")
         return
     self._configure_line_budget(sum(len(sel[1]) * len(sel[2]) for _, _, sel in plans))
-    delta = self._delta_reference(
-        plans, lambda plan: _series(self, reference, plan[1], plan[0], plan[2], polarization)
-    )
-    if delta is False:
-        return
     if not self._prepare_line_plot_axes(
         "azimuth_rect",
         "rectilinear",
@@ -115,15 +110,11 @@ def render(self) -> None:
     omitted = 0
     bands = self._new_pbp_bands(datasets) if pbp_active else None
     for name, dataset, selection in plans:
-        if delta is not None and dataset is delta.dataset:
-            continue
         candidates = len(selection[1]) * len(selection[2])
         if bands is None and rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
             continue
         series = _series(self, reference, dataset, name, selection, polarization)
-        if delta is not None:
-            series = delta.apply(name, series)
         for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
             if not np.any(np.isfinite(display)):
                 continue
@@ -174,11 +165,7 @@ def render(self) -> None:
         )
 
     self.plot_ax.set_xlabel(self._plot_axis_label(reference, "azimuth"))
-    if delta is not None:
-        self.plot_ax.set_ylabel(self._delta_axis_label(delta))
-        self._finish_delta_plot(delta)
-    else:
-        self.plot_ax.set_ylabel(self._display_axis_label(datasets))
+    self.plot_ax.set_ylabel(self._display_axis_label(datasets))
     self._update_legend_visibility()
     self._apply_plot_limits()
     status = "Azimuth/Aspect (Rect) plot updated."

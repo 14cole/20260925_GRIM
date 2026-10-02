@@ -56,8 +56,6 @@ PBP_GROUP_COLORS = (
     "#4c9be8", "#f28e2b", "#59a14f", "#e15759", "#b07aa1",
     "#76b7b2", "#edc948", "#ff9da7", "#9c755f", "#bab0ac",
 )
-# Line-plot modes that can show each dataset as a difference from the active one.
-DELTA_REFERENCE_MODES = ("azimuth_rect", "frequency", "elevation_sweep")
 NATIVE_DB_LINE_MODES = (
     "azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep",
     "cdf", "sector_stats",
@@ -157,51 +155,6 @@ class _PbpBands:
             for artist in owner._plot_item_artists(key):
                 artist._grim_pbp_identity = identity
                 owner._tag_native_db_artist(artist, self._db_quantities.get(identity, set()))
-
-
-class _DeltaReference:
-    """Turns each dataset's series into its difference from the reference."""
-
-    def __init__(self, name: str, dataset, key, series, *, phase: bool, tolerance: float):
-        self.name = name
-        self.dataset = dataset
-        self.key = key
-        self._series = series
-        self._phase = phase
-        self._tolerance = float(tolerance)
-        self.within = 0
-        self.finite = 0
-
-    def apply(self, name: str, series):
-        for index, (x_values, display, label, trace_key) in enumerate(series):
-            if index >= len(self._series):
-                return
-            reference = self._series[index]
-            display = np.asarray(display, dtype=float)
-            if display.shape != reference.shape:
-                continue
-            difference = display - reference
-            if self._phase:
-                difference = plot_common.wrap_phase_degrees(difference)
-            finite = np.isfinite(difference)
-            self.finite += int(np.count_nonzero(finite))
-            if self._tolerance > 0.0:
-                self.within += int(np.count_nonzero(
-                    np.abs(difference[finite]) <= self._tolerance
-                ))
-            head, _separator, tail = label.partition(" | ")
-            label = f"{head} − {self.name}" + (f" | {tail}" if tail else "")
-            yield x_values, difference, label, ("delta", self.key, trace_key)
-
-    def summary(self) -> str:
-        if self._tolerance <= 0.0 or not self.finite:
-            return ""
-        unit = "deg" if self._phase else "dB"
-        share = 100.0 * self.within / self.finite
-        return (
-            f"{share:.1f}% of compared samples are within ±{self._tolerance:g} {unit} "
-            f"of {self.name}."
-        )
 
 
 def _selected_polarization_axis_availability(
@@ -361,21 +314,14 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if renderer is not None:
             renderer()
 
-    def _on_delta_ref_toggled(self, _checked: bool = False) -> None:
-        if self._button_checked(getattr(self, "btn_hold", None)):
-            return
-        if self.last_plot_mode in DELTA_REFERENCE_MODES:
-            self._render_plot_mode(self.last_plot_mode)
-
     def _on_analysis_setting_changed(self, kind: str) -> None:
-        """Re-render when a Plot Settings analysis option affects this plot."""
+        """Re-render when an analysis setting affects this plot."""
         mode = self.last_plot_mode
         affected = {
             "pbp": mode in ("azimuth_rect", "azimuth_polar", "frequency")
             and self._button_checked(getattr(self, "btn_pbp", None)),
             "cdf": mode == "cdf",
             "sector": mode == "sector_stats",
-            "delta": mode in DELTA_REFERENCE_MODES and self._delta_reference_active(),
             "range": mode == "range_freq",
         }.get(kind, False)
         if not affected or getattr(self, "_active_plot_tab", "plotting") != "plotting":
@@ -938,16 +884,12 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if not values:
             self.status.showMessage("Select one or more polarizations to plot.")
             return None
-        if self._delta_reference_active() and len(values) != 1:
-            self.status.showMessage("Select one polarization for Δ Ref; ordinary overlays can show several.")
-            return None
         return values
 
     def _native_sample_overlay_enabled(self) -> bool:
         mode = getattr(self, "last_plot_mode", None)
         return (
             mode in NATIVE_DB_LINE_MODES
-            and not self._delta_reference_active()
             and not (mode in ("azimuth_rect", "azimuth_polar", "frequency")
                      and self._button_checked(self.btn_pbp))
         )
@@ -1016,7 +958,6 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             getattr(self, "last_plot_mode", None) in (*NATIVE_DB_LINE_MODES, "waterfall")
             and not self._button_checked(self.btn_phase)
             and not self._plot_scale_is_linear()
-            and not self._delta_reference_active()
         )
 
     @staticmethod
@@ -1139,8 +1080,6 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             # Hold compares what is drawn on the axes. Phase provenance is
             # displayed as a warning, not treated as an ordinate incompatibility.
             ordinate = ("phase", "deg")
-        elif mode in DELTA_REFERENCE_MODES and self._delta_reference_active():
-            ordinate = ("difference", "dB")
         elif self._native_db_overlay_enabled():
             ordinate = ("native_logarithmic", "dB")
         else:
@@ -1151,8 +1090,6 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                 else str(datasets[0][1].default_log_unit())
             )
             ordinate = (quantity, display_unit)
-        if mode in DELTA_REFERENCE_MODES and self._delta_reference_active():
-            ordinate = (*ordinate, "vs", self._dataset_plot_key(self._delta_reference_target()[0]))
         if mode == "cdf":
             controls = getattr(self, "analysis_controls", None)
             exceedance = bool(controls is not None and controls.cdf_exceedance())
@@ -1287,111 +1224,6 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                 self._note_plot_render("Percentile PBP bands apply to magnitude; phase uses min–max arcs.")
                 percentiles = None
         return plot_common.StreamingEnvelope(phase_degrees=phase, percentiles=percentiles)
-
-    # --- difference from the active (reference) dataset -----------------
-
-    def _delta_reference_active(self) -> bool:
-        return self._button_checked(getattr(self, "btn_delta_ref", None))
-
-    def _explicit_delta_reference(self):
-        """(name, dataset) picked with Set as Δ reference; the table overrides this."""
-        return None
-
-    def _delta_reference_target(self):
-        """The dataset Δ Ref subtracts, and its name when it was picked explicitly."""
-        explicit = self._explicit_delta_reference()
-        if explicit is not None:
-            return explicit[1], explicit[0]
-        return self.active_dataset, None
-
-    def _with_delta_reference(self, datasets):
-        """Add a picked Δ reference to the plotted datasets when it is not selected."""
-        if not self._delta_reference_active():
-            return datasets
-        explicit = self._explicit_delta_reference()
-        if explicit is None or any(dataset is explicit[1] for _name, dataset in datasets):
-            return datasets
-        return [*datasets, explicit]
-
-    def _delta_tolerance(self) -> float:
-        controls = getattr(self, "analysis_controls", None)
-        return controls.delta_tolerance() if controls is not None else 0.0
-
-    def _delta_reference(self, plans, series_for):
-        """Return None when Δ Ref is off, False when blocked, else the reference.
-
-        ``plans`` are the renderer's ``(name, dataset, ...)`` tuples and
-        ``series_for(plan)`` yields that plan's ``(x, display, label, key)``
-        series. Every dataset's k-th series is the same requested cut, so
-        differences are taken series by series and sample by sample.
-        """
-        if not self._delta_reference_active():
-            return None
-        if self.last_plot_mode not in DELTA_REFERENCE_MODES:
-            self.status.showMessage(
-                "Δ Ref works on Azimuth (Rect), Frequency, and Elevation Sweep "
-                "plots. Turn off Δ Ref for this plot type."
-            )
-            return False
-        if self._plot_scale_is_linear():
-            self.status.showMessage(
-                "Δ Ref compares levels in dB. Switch Dataset dB unit to the dB "
-                "scale or turn off Δ Ref."
-            )
-            return False
-        target, picked_name = self._delta_reference_target()
-        match = next((plan for plan in plans if plan[1] is target), None)
-        if match is None and picked_name is not None:
-            self.status.showMessage(
-                f"The Δ reference {picked_name} has no data at the selected "
-                "coordinates. Select cuts it covers, or right-click the dataset "
-                "table to pick another Δ reference."
-            )
-            return False
-        if match is None:
-            self.status.showMessage(
-                "Δ Ref subtracts the active dataset (the current table row). "
-                "Select it with the datasets to compare, or right-click a dataset "
-                "and choose Set as Δ reference."
-            )
-            return False
-        if len(plans) < 2:
-            self.status.showMessage(
-                "Δ Ref needs at least one other selected dataset to compare "
-                "with the Δ reference."
-            )
-            return False
-        series = [np.asarray(display, dtype=float) for _x, display, *_ in series_for(match)]
-        return _DeltaReference(
-            match[0], match[1], self._dataset_plot_key(match[1]), series,
-            phase=self._button_checked(self.btn_phase),
-            tolerance=self._delta_tolerance(),
-        )
-
-    def _delta_axis_label(self, delta, tag: str = "") -> str:
-        if self._button_checked(self.btn_phase):
-            return f"Phase{tag} difference from {delta.name} (deg)"
-        return f"Level{tag} difference from {delta.name} (dB)"
-
-    def _finish_delta_plot(self, delta) -> None:
-        """Draw the zero line and tolerance band, and report the tolerance share."""
-        ax = self.plot_ax
-        for artist in [*ax.lines, *ax.patches]:
-            if getattr(artist, "_grim_delta_guide", False):
-                artist.remove()
-        zero = ax.axhline(
-            0.0, color=self._current_plot_text(), linewidth=0.8, alpha=0.6,
-            label="_nolegend_", zorder=1.8,
-        )
-        zero._grim_delta_guide = True
-        tolerance = self._delta_tolerance()
-        if tolerance > 0.0:
-            span = ax.axhspan(
-                -tolerance, tolerance, color="#59a14f", alpha=0.15, linewidth=0,
-                label="_nolegend_", zorder=0.8,
-            )
-            span._grim_delta_guide = True
-        self._note_plot_render(delta.summary())
 
     def _configure_line_budget(self, candidate_count):
         """Allocate a display target across this render's visible curves."""
@@ -2737,17 +2569,6 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                 "unsupported",
                 mode,
                 "PBP rendering does not yet have a matching headless implementation",
-            )
-            self.last_python_plot_spec = spec
-            if emit:
-                recorder.record_unsupported_plot(spec[1], spec[2])
-            return
-        if mode in DELTA_REFERENCE_MODES and self._delta_reference_active():
-            spec = (
-                "unsupported",
-                mode,
-                "Δ Ref difference plots do not yet have a matching headless "
-                "implementation",
             )
             self.last_python_plot_spec = spec
             if emit:

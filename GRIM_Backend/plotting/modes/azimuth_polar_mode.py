@@ -41,8 +41,6 @@ def render(self) -> None:
         self._show_plot_status("No compatible one-to-one coordinates for the selected plot.")
         return
     self._configure_line_budget(sum(len(sel[1]) * len(sel[2]) for _, _, sel in plans))
-    if self._delta_reference(plans, None) is False:
-        return
     angular_unit = self._plot_axis_unit(reference, "azimuth")
     self._polar_display_unit = angular_unit
     if not self._prepare_line_plot_axes(

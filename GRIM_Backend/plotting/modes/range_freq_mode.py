@@ -94,8 +94,6 @@ def render(self) -> None:
     if not plans:
         self._show_plot_status("No compatible one-to-one coordinates for the selected plot.")
         return
-    if self._delta_reference(plans, None) is False:
-        return
     if len(plans) > common.MAX_WATERFALL_PANELS:
         self.status.showMessage(
             f"Range–Freq blocked: select at most {common.MAX_WATERFALL_PANELS} datasets."

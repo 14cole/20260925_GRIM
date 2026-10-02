@@ -1,4 +1,4 @@
-"""CDF, sector statistics, PbP bands, Δ Ref, markers, slider, and time gate."""
+"""CDF, sector statistics, PbP bands, markers, slider, and time gate."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ import numpy as np
 from matplotlib.backend_bases import MouseButton, MouseEvent
 from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMenu
 
 import GRIM_Backend.ui.app as grim_cut_gui
-from GRIM_Backend.ui.dataset_actions import DATASET_ID_ROLE, DATASET_PATH_ROLE
+from GRIM_Backend.ui.dataset_actions import DATASET_PATH_ROLE
 from GRIM_Backend.datasets.constants import C0
 from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.datasets.transforms import (
@@ -126,16 +126,12 @@ class CdfTests(_WindowCase):
         self.assertIn("at or above", window.plot_ax.get_ylabel())
         self.assertEqual(window.plot_ax.get_ylim(), (0.0, 100.0))
 
-    def test_cdf_rejects_phase_and_delta_and_keeps_hold_overlays(self):
+    def test_cdf_rejects_phase_and_keeps_hold_overlays(self):
         window = self.window
         window.btn_phase.setChecked(True)
         self.plot("_plot_cdf")
         self.assertIn("Turn off Phase", window.status.currentMessage())
         window.btn_phase.setChecked(False)
-        window.btn_delta_ref.setChecked(True)
-        self.plot("_plot_cdf")
-        self.assertIn("Δ Ref works on", window.status.currentMessage())
-        window.btn_delta_ref.setChecked(False)
         self.select_rows(0)
         self.plot("_plot_cdf")
         window.btn_hold.setChecked(True)
@@ -148,11 +144,25 @@ class CdfTests(_WindowCase):
 
 
 class SectorStatisticsTests(_WindowCase):
+    def test_right_click_opens_sector_settings_with_selected_azimuths(self):
+        window = self.window
+        self.select_rows(0)
+        button = window.btn_sector_stats
+        self.assertEqual(button.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
+        with mock.patch.object(grim_cut_gui, "SectorStatisticsDialog") as dialog_type:
+            button.customContextMenuRequested.emit(QPoint(5, 5))
+        dialog_type.assert_called_once()
+        args, kwargs = dialog_type.call_args
+        self.assertIs(args[0], window.analysis_controls)
+        np.testing.assert_array_equal(args[1], self.datasets[0].azimuths)
+        self.assertEqual(kwargs["unit"], "deg")
+        self.assertIs(kwargs["parent"], window)
+        dialog_type.return_value.exec.assert_called_once_with()
+
     def test_sector_levels_use_linear_power_and_copy_table(self):
         window = self.window
         controls = window.analysis_controls
-        controls.edit_sectors.setText("-2:0, 0:2")
-        controls.edit_sectors.editingFinished.emit()
+        controls.set_sector_settings("-2:0, 0:2", "mean", 90.0)
         self.select_rows(0)
         self.plot("_plot_sector_stats")
         self.assertIn("2 sectors, mean", window.status.currentMessage())
@@ -164,8 +174,7 @@ class SectorStatisticsTests(_WindowCase):
         )
         self.assertEqual(window.plot_ax.get_ylabel(), "RCS mean (dBsm)")
 
-        controls.combo_sector_stat.setCurrentIndex(controls.combo_sector_stat.findData("percentile"))
-        controls.spin_sector_percentile.setValue(50.0)
+        controls.set_sector_settings("-2:0, 0:2", "percentile", 50.0)
         (line,) = self.lines(self.keys[0])
         np.testing.assert_allclose(line.get_ydata()[0], self.dbsm(np.median(POWER_SHAPE[:3])))
         table = window.plot_figure._grim_sector_table
@@ -178,12 +187,12 @@ class SectorStatisticsTests(_WindowCase):
         self.select_rows(0)
         self.plot("_plot_azimuth_rect")
         window.btn_hold.setChecked(True)
-        window.analysis_controls.edit_sectors.setText("2")
+        window.analysis_controls.set_sector_settings("2", "mean", 90.0)
         self.plot("_plot_sector_stats")
         self.assertNotIn("blocked", window.status.currentMessage().lower())
         self.assertEqual(len(self.lines(self.keys[0])), 2)
         window.btn_hold.setChecked(False)
-        window.analysis_controls.edit_sectors.setText("0:0")
+        window.analysis_controls.set_sector_settings("0:0", "mean", 90.0)
         self.plot("_plot_sector_stats")
         self.assertIn("Sector Stats blocked: sector '0:0' is empty", window.status.currentMessage())
 
@@ -248,115 +257,32 @@ class PbpBandTests(_WindowCase):
         self.assertEqual(self.legend_labels(), [])
 
 
-class DeltaReferenceTests(_WindowCase):
-    def test_each_dataset_minus_active_with_tolerance_share(self):
+class RemovedDeltaReferenceTests(_WindowCase):
+    def test_delta_reference_controls_and_menu_are_removed(self):
         window = self.window
-        window.analysis_controls.spin_delta_tolerance.setValue(7.0)
-        window.btn_delta_ref.setChecked(True)
-        self.plot("_plot_azimuth_rect")
-        self.assertEqual(self.lines(self.keys[0]), [])
-        (second,) = self.lines(self.keys[1])
-        (third,) = self.lines(self.keys[2])
-        np.testing.assert_allclose(second.get_ydata(), 10 * np.log10(4.0))
-        np.testing.assert_allclose(third.get_ydata(), 10 * np.log10(9.0))
-        self.assertTrue(second.get_label().startswith("Run 2 − Run 1 | Pol HH"))
-        self.assertEqual(window.plot_ax.get_ylabel(), "Level difference from Run 1 (dB)")
-        # Run 2 sits 6.0 dB above Run 1 (inside ±7 dB); Run 3 sits 9.5 dB above.
-        self.assertIn("50.0% of compared samples are within ±7 dB of Run 1",
-                      window.status.currentMessage())
-        guides = [a for a in [*window.plot_ax.lines, *window.plot_ax.patches]
-                  if getattr(a, "_grim_delta_guide", False)]
-        self.assertEqual(len(guides), 2)
+        self.assertFalse(hasattr(window, "btn_delta_ref"))
+        controls = window._plot_controls_by_tab["plotting"]
+        self.assertNotIn("delta_ref", controls)
+        self.assertIn("compare", controls)
+        self.assertIn("delta_map", controls)
+        self.assertFalse(hasattr(window.analysis_controls, "spin_delta_tolerance"))
+        self.assertNotIn("Δ Ref Tolerance", [label.text() for label in window.findChildren(QLabel)])
 
-        for method in ("_plot_frequency", "_plot_elevation_sweep"):
-            with self.subTest(method=method):
-                if method == "_plot_elevation_sweep":
-                    self.select_rows(0, 1, 2, freqs=(0, 1))
-                self.plot(method)
-                (second,) = self.lines(self.keys[1])[:1]
-                np.testing.assert_allclose(second.get_ydata(), 10 * np.log10(4.0))
+        menu_labels = []
 
-    def marked_rows(self):
-        return [row for row in range(self.window.table.rowCount())
-                if self.window.table.item(row, 0).data(Qt.DecorationRole) is not None]
+        class CaptureMenu(QMenu):
+            def exec(self, _position):
+                menu_labels.extend(action.text() for action in self.actions())
+                return None
 
-    def test_picked_reference_is_marked_used_unselected_and_cleared(self):
-        window = self.window
-        window._set_delta_reference_row(2)
-        self.assertEqual(self.marked_rows(), [2])
-        self.assertIn("Δ reference set to Run 3", window.status.currentMessage())
-        window.table.item(2, 0).setText("Run 3 renamed")
-        window.btn_delta_ref.setChecked(True)
-        self.select_rows(0, 1)
-        self.plot("_plot_azimuth_rect")
-        self.assertEqual(self.lines(self.keys[2]), [])
-        (first,) = self.lines(self.keys[0])
-        (second,) = self.lines(self.keys[1])
-        np.testing.assert_allclose(first.get_ydata(), 10 * np.log10(1.0 / 9.0))
-        np.testing.assert_allclose(second.get_ydata(), 10 * np.log10(4.0 / 9.0))
-        self.assertTrue(first.get_label().startswith("Run 1 − Run 3 renamed | "))
-        self.assertEqual(window.plot_ax.get_ylabel(), "Level difference from Run 3 renamed (dB)")
-
-        # Picking another row re-renders against it and moves the marker.
-        window._set_delta_reference_row(1)
-        self.assertEqual(self.marked_rows(), [1])
-        (first,) = self.lines(self.keys[0])
-        np.testing.assert_allclose(first.get_ydata(), 10 * np.log10(1.0 / 4.0))
-        self.assertEqual(self.lines(self.keys[2]), [])
-
-        window._set_delta_reference_row(None)
-        self.assertEqual(self.marked_rows(), [])
-        self.assertIn("subtracts the active row again", window.status.currentMessage())
-        (second,) = self.lines(self.keys[1])
-        np.testing.assert_allclose(second.get_ydata(), 10 * np.log10(4.0))
-
-    def test_deleted_reference_falls_back_and_undo_restores_marker(self):
-        window = self.window
-        window._set_delta_reference_row(2)
-        window.table.clearSelection()
-        window.table.selectRow(2)
-        with mock.patch(
-            "GRIM_Backend.ui.dataset_actions.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.Yes,
-        ):
-            window._delete_selected_datasets()
-        self.assertIsNone(window._explicit_delta_reference())
-        window._set_delta_reference_row(0)
-        window._undo_last_deleted_datasets()
-        self.app.processEvents()
-        self.assertEqual(self.marked_rows(), [0])
-        window._set_delta_reference_row(None)
-        window._delta_reference_id = window.table.item(2, 0).data(DATASET_ID_ROLE)
-        window._refresh_delta_reference_marker()
-        self.assertEqual(self.marked_rows(), [2])
-
-    def test_blocks_polar_linear_missing_reference_and_mixed_hold(self):
-        window = self.window
-        window.btn_delta_ref.setChecked(True)
-        self.plot("_plot_azimuth_polar")
-        self.assertIn("Δ Ref works on", window.status.currentMessage())
-        window.combo_plot_scale.setCurrentIndex(window.combo_plot_scale.findData("linear"))
-        self.plot("_plot_azimuth_rect")
-        self.assertIn("compares levels in dB", window.status.currentMessage())
-        window.combo_plot_scale.setCurrentIndex(window.combo_plot_scale.findData("dbsm"))
-        window.table.setCurrentCell(0, 0, QItemSelectionModel.NoUpdate)
-        window.table.selectionModel().select(
-            window.table.model().index(0, 0),
-            QItemSelectionModel.Deselect | QItemSelectionModel.Rows,
-        )
-        window.active_dataset = self.datasets[0]
-        self.plot("_plot_azimuth_rect")
-        self.assertIn("Select it with the datasets to compare", window.status.currentMessage())
-
-        window.btn_delta_ref.setChecked(False)
-        self.select_rows(0, 1)
-        self.plot("_plot_azimuth_rect")
-        window.btn_hold.setChecked(True)
-        window.btn_delta_ref.setChecked(True)
-        self.plot("_plot_azimuth_rect")
-        self.assertIn("Hold blocked", window.status.currentMessage())
-        window._record_python_plot("azimuth_rect", emit=False)
-        self.assertEqual(window.last_python_plot_spec[0], "unsupported")
+        self.select_rows(0)
+        position = window.table.visualItemRect(window.table.item(0, 0)).center()
+        with mock.patch("GRIM_Backend.ui.dataset_actions.QMenu", CaptureMenu):
+            window._on_dataset_context_menu(position)
+        self.assertIn("Save", menu_labels)
+        self.assertIn("Delete", menu_labels)
+        self.assertNotIn("Set as Δ reference", menu_labels)
+        self.assertNotIn("Clear Δ reference", menu_labels)
 
 
 class MarkerTests(_WindowCase):

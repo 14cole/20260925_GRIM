@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -9,12 +11,11 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QSlider,
     QToolButton,
 )
 
-from GRIM_Backend.plotting.modes.sector_stats_mode import STATISTICS
+from GRIM_Backend.plotting.modes import common
 
 
 def _percent_spin(value: float, tooltip: str) -> QDoubleSpinBox:
@@ -30,10 +31,10 @@ def _percent_spin(value: float, tooltip: str) -> QDoubleSpinBox:
 
 
 class PlotAnalysisControls(QObject):
-    """PBP band, CDF, sector-statistics, and Δ Ref settings.
+    """PBP band, CDF, sector-statistics, and range-frequency settings.
 
     ``changed`` carries which feature changed ("pbp", "cdf", "sector",
-    "delta") so only the matching plot type re-renders.
+    "range") so only the matching plot type re-renders.
     """
 
     changed = Signal(str)
@@ -54,33 +55,10 @@ class PlotAnalysisControls(QObject):
         self.combo_cdf.addItem("Cumulative: samples at or below level", "cdf")
         self.combo_cdf.addItem("Exceedance: samples at or above level", "exceedance")
 
-        self.edit_sectors = QLineEdit("30")
-        self.edit_sectors.setPlaceholderText("30   or   -180:30:180   or   -45:45, 45:135, 170:-170")
-        self.edit_sectors.setToolTip(
-            "A width (30) tiles the selected azimuths; start:step:stop tiles a range; "
-            "start:stop pairs separated by commas list sectors, wrapping through "
-            "±180 when stop is below start. Values use the azimuth list's units."
-        )
-        self.combo_sector_stat = QComboBox()
-        for key, label in STATISTICS:
-            self.combo_sector_stat.addItem(label, key)
-        self.combo_sector_stat.setToolTip(
-            "Statistic of linear power inside each sector, shown on the dB scale."
-        )
-        self.spin_sector_percentile = _percent_spin(90.0, "Percentile used by the Percentile statistic.")
-
-        self.spin_delta_tolerance = QDoubleSpinBox()
-        self.spin_delta_tolerance.setRange(0.0, 100.0)
-        self.spin_delta_tolerance.setDecimals(2)
-        self.spin_delta_tolerance.setSingleStep(0.5)
-        self.spin_delta_tolerance.setPrefix("± ")
-        self.spin_delta_tolerance.setSuffix(" dB")
-        self.spin_delta_tolerance.setSpecialValueText("Off")
-        self.spin_delta_tolerance.setKeyboardTracking(False)
-        self.spin_delta_tolerance.setToolTip(
-            "Shade ± this band around zero on Δ Ref plots and report the share of "
-            "samples inside it. Off at zero."
-        )
+        self._sector_text = "30"
+        self._sector_statistic = "mean"
+        self._sector_percentile = 90.0
+        self._sector_unit = "deg"
 
         self.spin_range_subband = QDoubleSpinBox()
         self.spin_range_subband.setRange(5.0, 100.0)
@@ -108,12 +86,7 @@ class PlotAnalysisControls(QObject):
         self.spin_pbp_low.valueChanged.connect(self._pbp_low_changed)
         self.spin_pbp_high.valueChanged.connect(self._pbp_high_changed)
         self.combo_cdf.currentIndexChanged.connect(lambda: self.changed.emit("cdf"))
-        self.edit_sectors.editingFinished.connect(lambda: self.changed.emit("sector"))
-        self.combo_sector_stat.currentIndexChanged.connect(self._sector_stat_changed)
-        self.spin_sector_percentile.valueChanged.connect(lambda: self.changed.emit("sector"))
-        self.spin_delta_tolerance.valueChanged.connect(lambda: self.changed.emit("delta"))
         self._pbp_band_changed(emit=False)
-        self._sector_stat_changed(emit=False)
 
     def add_rows(self, grid, row: int) -> int:
         """Add labelled rows to the Plot Settings grid; returns the next row."""
@@ -121,10 +94,6 @@ class PlotAnalysisControls(QObject):
             (("PbP Band", self.combo_pbp_band), ("Lower", self.spin_pbp_low),
              ("Upper", self.spin_pbp_high)),
             (("CDF", self.combo_cdf),),
-            (("Sectors", self.edit_sectors),),
-            (("Sector Statistic", self.combo_sector_stat),
-             ("Percentile", self.spin_sector_percentile)),
-            (("Δ Ref Tolerance", self.spin_delta_tolerance),),
             (("Range–Freq Sub-band", self.spin_range_subband),
              ("Window", self.combo_range_window), ("Range Unit", self.combo_range_unit)),
         )
@@ -151,17 +120,40 @@ class PlotAnalysisControls(QObject):
     def cdf_exceedance(self) -> bool:
         return self.combo_cdf.currentData() == "exceedance"
 
-    def sector_text(self) -> str:
-        return self.edit_sectors.text()
+    def sector_text(self, unit: str | None = None) -> str:
+        """Return the definition in the requested azimuth units."""
+        if unit is None or unit == self._sector_unit:
+            return self._sector_text
+        parts = re.split(r"([,:;])", self._sector_text)
+        for index in range(0, len(parts), 2):
+            if parts[index].strip():
+                value = common.convert_axis_values(
+                    [float(parts[index])], "azimuth", self._sector_unit, unit
+                )[0]
+                parts[index] = f"{value:.17g}"
+        return "".join(parts)
 
     def sector_statistic(self) -> str:
-        return str(self.combo_sector_stat.currentData())
+        return self._sector_statistic
 
     def sector_percentile(self) -> float:
-        return float(self.spin_sector_percentile.value())
+        return self._sector_percentile
 
-    def delta_tolerance(self) -> float:
-        return float(self.spin_delta_tolerance.value())
+    def set_sector_settings(
+        self, text: str, statistic: str, percentile: float, *, unit: str | None = None
+    ) -> None:
+        """Commit the editor's settings together, with a single plot refresh."""
+        values = (
+            str(text).strip(), str(statistic), float(percentile), unit or self._sector_unit
+        )
+        current = (
+            self._sector_text, self._sector_statistic, self._sector_percentile,
+            self._sector_unit,
+        )
+        if values != current:
+            (self._sector_text, self._sector_statistic,
+             self._sector_percentile, self._sector_unit) = values
+            self.changed.emit("sector")
 
     def range_subband_percent(self) -> float:
         return float(self.spin_range_subband.value())
@@ -200,13 +192,6 @@ class PlotAnalysisControls(QObject):
                 self.spin_pbp_high.setValue(self.spin_pbp_low.value() + 1.0)
                 return
         self.changed.emit("pbp")
-
-    def _sector_stat_changed(self, *_args, emit: bool = True) -> None:
-        self.spin_sector_percentile.setEnabled(
-            self.combo_sector_stat.currentData() == "percentile"
-        )
-        if emit:
-            self.changed.emit("sector")
 
 
 class PlotSliderBar(QFrame):

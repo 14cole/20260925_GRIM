@@ -104,7 +104,7 @@ def _frequency_series(
 def render(self) -> None:
     self.last_plot_mode = "frequency"
     self._start_plot_render()
-    datasets = self._with_delta_reference(self._selected_datasets())
+    datasets = self._selected_datasets()
     if not datasets:
         self.status.showMessage("Select a dataset before plotting.")
         return
@@ -186,9 +186,6 @@ def render(self) -> None:
         assert series is not None
         return series
 
-    delta = self._delta_reference(plans, series_for)
-    if delta is False:
-        return
     if not self._prepare_line_plot_axes(
         "frequency",
         "rectilinear",
@@ -202,15 +199,11 @@ def render(self) -> None:
     bands = self._new_pbp_bands(datasets) if pbp_active else None
     for plan in plans:
         name, dataset, selection = plan
-        if delta is not None and dataset is delta.dataset:
-            continue
         candidates = len(selection[2])
         if bands is None and rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
             continue
         series = series_for(plan)
-        if delta is not None:
-            series = delta.apply(name, series)
         for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
             if not np.any(np.isfinite(display)):
                 continue
@@ -259,11 +252,7 @@ def render(self) -> None:
         )
 
     self.plot_ax.set_xlabel(self._plot_axis_label(reference, "frequency"))
-    if delta is not None:
-        self.plot_ax.set_ylabel(self._delta_axis_label(delta, tag=" P50"))
-        self._finish_delta_plot(delta)
-    else:
-        self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=" P50"))
+    self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=" P50"))
     self._update_legend_visibility()
     self.spin_plot_xmin.blockSignals(True)
     self.spin_plot_xmax.blockSignals(True)
