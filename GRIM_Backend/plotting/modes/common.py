@@ -117,6 +117,61 @@ def unique_axis_selection(axis_values, requested, tolerance):
     return indices
 
 
+def native_axis_selection(reference, dataset, axis: str, requested):
+    """Select native samples inside each contiguous run selected on the reference.
+
+    Disconnected list selections remain disconnected. A single selected value
+    is still an exact cut, while a selected run defines an inclusive interval.
+    This is a display selection, with no interpolation or extrapolation.
+    """
+    attribute = {"azimuth": "azimuths", "elevation": "elevations", "frequency": "frequencies"}[axis]
+    requested, tolerance = selection_for_dataset(reference, dataset, axis, requested)
+    reference_values = convert_axis_values(
+        getattr(reference, attribute), axis, axis_unit(reference, axis), axis_unit(dataset, axis)
+    )
+    reference_values = np.sort(np.asarray(reference_values, dtype=float))
+    selected = unique_axis_selection(reference_values, requested, tolerance)
+    if selected is None or not len(selected):
+        return None
+    native = np.asarray(getattr(dataset, attribute), dtype=float)
+    if native.ndim != 1 or not np.all(np.isfinite(native)):
+        raise ValueError("source coordinates must be finite and one-dimensional")
+    order = np.argsort(native, kind="stable")
+    ordered = native[order]
+    if np.any(np.diff(ordered) == 0):
+        raise ValueError("duplicate source coordinates")
+    if not ordered.size:
+        return None
+    selected = np.sort(selected)
+    run_starts = np.r_[0, np.flatnonzero(np.diff(selected) > 1) + 1]
+    run_ends = np.r_[run_starts[1:] - 1, selected.size - 1]
+    spans = run_ends > run_starts
+    # Difference marks cover all intervals in one pass, even for a large
+    # selection with many disjoint runs; never scan the full axis per run.
+    marks = np.zeros(ordered.size + 1, dtype=np.int64)
+    lower = reference_values[selected[run_starts[spans]]] - tolerance
+    upper = reference_values[selected[run_ends[spans]]] + tolerance
+    np.add.at(marks, np.searchsorted(ordered, lower, side="left"), 1)
+    np.add.at(marks, np.searchsorted(ordered, upper, side="right"), -1)
+    keep = np.cumsum(marks[:-1]) > 0
+    singletons = reference_values[selected[run_starts[~spans]]]
+    if singletons.size:
+        positions = np.searchsorted(ordered, singletons)
+        lo = np.clip(positions - 1, 0, ordered.size - 1)
+        hi = np.clip(positions, 0, ordered.size - 1)
+        distance = np.minimum(np.abs(ordered[lo] - singletons), np.abs(ordered[hi] - singletons))
+        present = singletons[distance <= tolerance]
+        if present.size:
+            matched = unique_axis_selection(ordered, present, tolerance)
+            keep[matched] = True
+    indices = order[keep]
+    return indices if indices.size else None
+
+
+def polarization_linestyle(polarization: str) -> str:
+    return {"HH": "-", "VV": "--", "HV": ":", "VH": "-."}.get(str(polarization).upper(), "-")
+
+
 def finite_axis_limits(low, high):
     """Return explicit nonsingular limits; preserve intentional inversion."""
     low, high = float(low), float(high)
@@ -290,13 +345,16 @@ def coherent_metadata_plot_warnings(named_datasets) -> tuple[str, ...]:
     return tuple(notes)
 
 
-def validate_plot_datasets(named_datasets, *, phase: bool, linear: bool) -> None:
+def validate_plot_datasets(
+    named_datasets, *, phase: bool, linear: bool, allow_mixed_db: bool = False
+) -> None:
     """Fail before rendering incompatible physical quantities.
 
     Coordinate units may differ because the modes convert them. All angle axes
     are treated as azimuth/elevation; overlaying data from different angular
     coordinate systems is the user's responsibility. Unlike linear quantities
-    cannot share one ordinate.
+    cannot share one linear ordinate. Visual dB overlays may opt into mixed
+    native units, with explicit labels; calculations keep the strict default.
     """
 
     if not named_datasets:
@@ -308,13 +366,10 @@ def validate_plot_datasets(named_datasets, *, phase: bool, linear: bool) -> None
             except ValueError as exc:
                 raise ValueError(f"{name}: {exc}") from exc
 
-    # Magnitude ordinates must describe one physical quantity.  Phase itself is
-    # dimensionless, however, and the positive real normalization between
-    # sigma_3d and sigma_2d does not rotate it.  Blocking a phase-only overlay
-    # solely because those magnitude quantities differ prevented otherwise
-    # valid phase QA; the coherent convention checks below are the relevant
-    # safeguards for that view.
-    if not phase:
+    # Linear ordinates and physical comparisons require one quantity. Native
+    # dB overlays explicitly label unlike quantities. Phase is dimensionless;
+    # its provenance checks below apply regardless of magnitude normalization.
+    if not phase and (linear or not allow_mixed_db):
         quantities = {
             str(dataset.linear_quantity()).strip().lower()
             for _, dataset in named_datasets
@@ -327,10 +382,8 @@ def validate_plot_datasets(named_datasets, *, phase: bool, linear: bool) -> None
                 f"mixed physical quantities cannot share a plot ({details})"
             )
 
-    # Linear plots already share the same modeled physical quantity. In a dB
-    # plot, also require a common log convention so dB, dBsm, and dBke are not
-    # presented on one apparently uniform ordinate.
-    if not phase and not linear:
+    # Difference/comparison calculations still require a common log convention.
+    if not phase and not linear and not allow_mixed_db:
         log_units = {dataset.default_log_unit().lower() for _, dataset in named_datasets}
         if len(log_units) != 1:
             details = ", ".join(

@@ -277,6 +277,37 @@ def _determine_sweep_axis(azimuths, elevations, frequencies) -> str | None:
     return None
 
 
+def _azimuth_sector(start: float, stop: float, period: float) -> common.Sector:
+    """A start-to-end sector, advancing across the seam when end < start."""
+    width = stop - start
+    if width < 0.0:
+        width %= period
+        if width == 0.0:
+            width = period
+    return common.Sector(start, width, period, stop_value=stop)
+
+
+def _sector_sample_order(values, sector, *, tolerance):
+    """Return existing samples in continuous sector order, counting a seam once.
+
+    The two stored endpoints of a revolution (e.g. -180 and +180) describe
+    the same direction. Keep the first matched endpoint, without averaging
+    or inventing a sample, so its statistical weight is the same as any
+    other measured direction.
+    """
+    values = np.asarray(values, dtype=float)
+    offsets = np.mod(values - sector.start, sector.period)
+    offsets = np.where(offsets >= sector.period - tolerance, 0.0, offsets)
+    selected = np.flatnonzero(
+        np.isfinite(values) & (offsets <= sector.width + tolerance)
+    )
+    ordered = selected[np.argsort(offsets[selected], kind="stable")]
+    if ordered.size:
+        distinct = np.r_[True, np.diff(offsets[ordered]) > tolerance]
+        ordered = ordered[distinct]
+    return ordered, sector.start + offsets[ordered]
+
+
 def _comparison_azimuth_sector(self, reference, selected_azimuths):
     """Initialize/read the interactive statistics-sector controls.
 
@@ -323,6 +354,8 @@ def _comparison_azimuth_sector(self, reference, selected_azimuths):
             (maximum_control, selected_max),
         ):
             control.blockSignals(True)
+            if hasattr(control, "setDecimals"):
+                control.setDecimals(9 if unit == "rad" else 6)
             control.setRange(full_min, full_max)
             control.setSuffix(f" {unit}")
             control.setValue(value)
@@ -483,17 +516,17 @@ def render(self) -> None:
         return
 
     statistics_bounds = None
+    statistics_sector = None
+    sector_wraps = False
     show_all_azimuths = False
     highlight_statistics_range = False
     if sweep_axis == "azimuth":
         sector_min, sector_max, show_all_azimuths = _comparison_azimuth_sector(
             self, reference, azimuths
         )
-        if sector_min > sector_max:
-            self.status.showMessage(
-                "Compare: Min azimuth must be less than or equal to Max azimuth."
-            )
-            return
+        period = 2.0 * np.pi if self._plot_axis_unit(reference, "azimuth") == "rad" else 360.0
+        statistics_sector = _azimuth_sector(sector_min, sector_max, period)
+        sector_wraps = sector_min > sector_max
         reference_azimuths = np.asarray(reference.azimuths, dtype=float)
         reference_display = self._plot_axis_values(
             reference, reference, "azimuth", reference_azimuths
@@ -512,28 +545,29 @@ def render(self) -> None:
             dataset_common_mask = np.zeros(reference_azimuths.shape, dtype=bool)
             dataset_common_mask[reference_indices] = True
             common_reference_mask &= dataset_common_mask
-        sector_mask = (
-            (reference_display >= sector_min - tolerance)
-            & (reference_display <= sector_max + tolerance)
-            & common_reference_mask
+        common_indices = np.flatnonzero(common_reference_mask)
+        sector_order, _sector_positions = _sector_sample_order(
+            reference_display[common_indices], statistics_sector,
+            tolerance=tolerance,
         )
-        if np.count_nonzero(sector_mask) < 2:
+        sector_indices = common_indices[sector_order]
+        if sector_indices.size < 2:
             self.status.showMessage(
-                "Compare: the Min/Max azimuth sector contains fewer than 2 "
-                "reference samples."
+                "Compare: the start/end azimuth sector contains fewer than 2 "
+                "distinct matched samples."
             )
             return
         common_display = reference_display[common_reference_mask]
         common_min = float(np.min(common_display))
         common_max = float(np.max(common_display))
-        highlight_statistics_range = not (
+        highlight_statistics_range = sector_wraps or not (
             sector_min <= common_min + tolerance
             and sector_max >= common_max - tolerance
         )
         azimuths = (
             reference_azimuths[common_reference_mask]
             if show_all_azimuths
-            else reference_azimuths[sector_mask]
+            else reference_azimuths[sector_indices]
         )
         statistics_bounds = (sector_min, sector_max)
     else:
@@ -559,6 +593,16 @@ def render(self) -> None:
                 f"No compatible data in '{name}' for the selected comparison parameters."
             )
             return
+        if sector_wraps and not show_all_azimuths:
+            x, display, analysis, label = series
+            order, continuous_x = _sector_sample_order(
+                x, statistics_sector,
+                tolerance=common.axis_matching_tolerance(reference, "azimuth"),
+            )
+            series = (
+                continuous_x, display[order],
+                None if analysis is None else analysis[order], label,
+            )
         collected.append(series)
 
     (x_a, y_a, analysis_a, label_a), (x_b, y_b, analysis_b, label_b) = collected
@@ -590,14 +634,15 @@ def render(self) -> None:
                 "positive levels are not floored."
             )
     statistics_mask = np.ones(x_common.shape, dtype=bool)
-    if statistics_bounds is not None:
+    if statistics_sector is not None:
         statistics_tolerance = common.axis_matching_tolerance(
             reference, "azimuth"
         )
-        statistics_mask = (
-            (x_common >= statistics_bounds[0] - statistics_tolerance)
-            & (x_common <= statistics_bounds[1] + statistics_tolerance)
+        statistics_order, _statistics_positions = _sector_sample_order(
+            x_common, statistics_sector, tolerance=statistics_tolerance,
         )
+        statistics_mask[:] = False
+        statistics_mask[statistics_order] = True
     finite_statistics = finite_common & statistics_mask
     if np.count_nonzero(finite_statistics) < 2:
         self.status.showMessage(
@@ -650,10 +695,21 @@ def render(self) -> None:
         if phase_mode or self._plot_scale_is_linear() else "dB"
     )
     residual_ax.set_ylabel(f"Difference ({residual_unit})", fontsize=8)
-    residual_ax.set_xlabel(self._plot_axis_label(reference, sweep_axis))
+    axis_label = self._plot_axis_label(reference, sweep_axis)
+    if sector_wraps and not show_all_azimuths:
+        axis_label += " (continuous across seam)"
+    residual_ax.set_xlabel(axis_label)
 
     finite = finite_statistics & np.isfinite(residual)
     if np.count_nonzero(finite) > 1:
+        statistic_indices = np.flatnonzero(finite)
+        statistic_x = x_common[statistic_indices]
+        if statistics_sector is not None:
+            order, statistic_x = _sector_sample_order(
+                statistic_x, statistics_sector,
+                tolerance=common.axis_matching_tolerance(reference, "azimuth"),
+            )
+            statistic_indices = statistic_indices[order]
         sector_title = ""
         if statistics_bounds is not None:
             sector_title = (
@@ -663,7 +719,7 @@ def render(self) -> None:
             )
         if phase_mode:
             statistics = phase_agreement_statistics(
-                x_common[finite], left_values[finite], right_values[finite]
+                statistic_x, left_values[statistic_indices], right_values[statistic_indices]
             )
             phase_alignment = 50.0 * (1.0 + statistics.phasor_agreement)
             top_ax.set_title(
@@ -681,9 +737,9 @@ def render(self) -> None:
             )
         else:
             statistics = rf_agreement_statistics(
-                x_common[finite],
-                analysis_a[left_indices][finite],
-                analysis_b[right_indices][finite],
+                statistic_x,
+                analysis_a[left_indices][statistic_indices],
+                analysis_b[right_indices][statistic_indices],
             )
             axis_unit = self._plot_axis_unit(reference, sweep_axis)
             strong_return_agreement = 100.0 * float(
@@ -708,14 +764,14 @@ def render(self) -> None:
                 pad=4,
             )
         if statistics_bounds is not None and highlight_statistics_range:
-            residual_ax.axvspan(
-                statistics_bounds[0],
-                statistics_bounds[1],
-                color="#ffb74d",
-                alpha=0.12,
-                linewidth=0,
-                label="Statistics range",
-            )
+            pieces = [(statistics_sector.start, statistics_sector.start + statistics_sector.width)]
+            if show_all_azimuths:
+                pieces = statistics_sector.display_pieces(float(x_common.min()), float(x_common.max()))
+            for index, (start, stop) in enumerate(pieces):
+                residual_ax.axvspan(
+                    start, stop, color="#ffb74d", alpha=0.12, linewidth=0,
+                    label="Statistics range" if index == 0 else "_nolegend_",
+                )
 
     self.spin_plot_xmin.blockSignals(True)
     self.spin_plot_xmax.blockSignals(True)

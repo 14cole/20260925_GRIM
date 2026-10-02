@@ -223,15 +223,50 @@ def _assert_metadata_compatible(datasets: tuple[NamedGrid, ...]) -> None:
     _frequency_unit(reference.grid)
     for dataset in datasets[1:]:
         try:
-            reference.grid._assert_physical_metadata_compatible(dataset.grid)
+            # Report series remain independent visual overlays. They need
+            # compatible selector coordinates, but may display unlike native
+            # logarithmic quantities without converting or combining them.
+            reference.grid._assert_axis_metadata_compatible(dataset.grid)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"Dataset {dataset.name!r} is not physically compatible with "
+                f"Dataset {dataset.name!r} does not have compatible axes with "
                 f"{reference.name!r}: {exc}"
             ) from exc
         _angle_unit(dataset.grid, "azimuth")
         _angle_unit(dataset.grid, "elevation")
         _frequency_unit(dataset.grid)
+
+
+def _magnitude_unit(datasets: tuple[NamedGrid, ...]) -> str:
+    quantities = {
+        (item.grid.linear_quantity(), item.grid.default_log_unit())
+        for item in datasets
+    }
+    return next(iter(quantities))[1] if len(quantities) == 1 else "Mixed dB"
+
+
+def _quantity_axis_label(
+    datasets: tuple[NamedGrid, ...], quantity: Quantity, availability: PlotAvailability
+) -> str:
+    if quantity == "phase":
+        return "Phase (deg)"
+    if availability.rcs_unit == "Mixed dB":
+        return "Mixed dB"
+    name = {
+        "sigma_3d": "RCS",
+        "sigma_2d": "Scattering Width",
+        "power_ratio": "Power Ratio",
+        "ratio": "Power Ratio",
+    }.get(datasets[0].grid.linear_quantity(), "Value")
+    return f"{name} ({availability.rcs_unit})"
+
+
+def _series_label(
+    dataset: NamedGrid, quantity: Quantity, availability: PlotAvailability
+) -> str:
+    if quantity == "magnitude" and availability.rcs_unit == "Mixed dB":
+        return f"{dataset.name} [{dataset.grid.default_log_unit()}]"
+    return dataset.name
 
 
 def _exact_index(
@@ -412,7 +447,7 @@ def get_plot_availability(
         azimuth_unit=_angle_unit(reference, "azimuth"),
         elevation_unit=_angle_unit(reference, "elevation"),
         frequency_unit=_frequency_unit(reference),
-        rcs_unit=reference.default_log_unit(),
+        rcs_unit=_magnitude_unit(selected),
         phase_available=phase_available,
         phase_reference=phase_reference,
         phase_reason=phase_reason,
@@ -534,7 +569,7 @@ def build_azimuth_specs(
     )
     swept_axis_label = "Azimuth"
     fixed_angle_label = "Elevation"
-    y_label = "Phase (deg)" if plot_quantity == "phase" else f"RCS ({availability.rcs_unit})"
+    y_label = _quantity_axis_label(selected, plot_quantity, availability)
 
     # The swept azimuth axis, fixed-axis indices, and stable sort order do not
     # change between frequency panels.  Prepare them once per dataset and
@@ -637,7 +672,7 @@ def build_azimuth_specs(
                     PlotSeries(
                         x=x_values,
                         y=tuple(float(value) for value in y),
-                        label=dataset.name,
+                        label=_series_label(dataset, plot_quantity, availability),
                     )
                 )
 
@@ -741,11 +776,7 @@ def build_elevation_specs(
     )
     swept_axis_label = "Elevation"
     fixed_angle_label = "Azimuth"
-    y_label = (
-        "Phase (deg)"
-        if plot_quantity == "phase"
-        else f"RCS ({availability.rcs_unit})"
-    )
+    y_label = _quantity_axis_label(selected, plot_quantity, availability)
 
     prepared_datasets: list[
         tuple[
@@ -846,7 +877,7 @@ def build_elevation_specs(
                     PlotSeries(
                         x=x_values,
                         y=tuple(float(value) for value in y),
-                        label=dataset.name,
+                        label=_series_label(dataset, plot_quantity, availability),
                     )
                 )
 
@@ -1153,9 +1184,11 @@ def build_frequency_spec(
                     f"Dataset {dataset.name!r} has no finite magnitude samples "
                     "in the selected azimuth band."
                 )
-        series.append(PlotSeries.from_values(x, y, label=dataset.name))
+        series.append(PlotSeries.from_values(
+            x, y, label=_series_label(dataset, plot_quantity, availability)
+        ))
 
-    y_label = "Phase (deg)" if plot_quantity == "phase" else f"RCS ({availability.rcs_unit})"
+    y_label = _quantity_axis_label(selected, plot_quantity, availability)
     if band_request is None:
         azimuth_title = (
             f"{primary_angle_label} {_format_value(azimuth_display)} {angle_unit}"

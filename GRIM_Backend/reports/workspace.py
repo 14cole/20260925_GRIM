@@ -925,8 +925,8 @@ if GUI_AVAILABLE:
             plot_form.addRow(self.azimuth_band_label, self.azimuth_band_widget)
             self.quantity_label = QLabel("Magnitude (dB)", plot_group)
             self.quantity_label.setToolTip(
-                "The initial PPT workflow exports calibrated RCS magnitude. "
-                "No phase convention is altered by this tab."
+                "Each curve retains its native dB values. When units differ, "
+                "the axis reads Mixed dB and the legend identifies each unit."
             )
             plot_form.addRow("Quantity", self.quantity_label)
             plot_layout.addLayout(plot_form)
@@ -1006,10 +1006,10 @@ if GUI_AVAILABLE:
             self.scale_mode_combo.addItem("Shared automatic", "shared_auto")
             self.scale_mode_combo.addItem("Fixed and uniform", "fixed")
             self.scale_mode_combo.setToolTip(
-                "Every plot uses one vertical RCS scale. Fixed mode also anchors "
+                "Every plot uses one vertical scale. Fixed mode also anchors "
                 "major ticks at the supplied minimum using the selected step."
             )
-            scale_form.addRow("Vertical RCS axis", self.scale_mode_combo)
+            scale_form.addRow("Vertical axis", self.scale_mode_combo)
             self.fixed_scale_widget = QWidget(plot_group)
             fixed_scale_layout = QGridLayout(self.fixed_scale_widget)
             fixed_scale_layout.setContentsMargins(0, 0, 0, 0)
@@ -2107,7 +2107,7 @@ if GUI_AVAILABLE:
                 self.y_min_spin.value(),
                 self.y_max_spin.value(),
                 self.y_step_spin.value(),
-                axis_name="vertical RCS axis",
+                axis_name="vertical axis",
             )
             return x_limits, x_step, y_limits, y_step
 

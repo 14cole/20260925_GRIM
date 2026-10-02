@@ -1,6 +1,6 @@
 """Cumulative distribution (or exceedance) of levels over the selection.
 
-Each dataset contributes one curve pooled over every selected azimuth,
+Each dataset/polarization contributes one curve pooled over every selected azimuth,
 elevation, and frequency. Samples are converted to the display scale one by
 one (so frequency-dependent dBke is exact) before ranking; a ranking is the
 same in dB or linear power, so no statistic is taken across unlike scales.
@@ -47,7 +47,7 @@ def render(self) -> None:
         if values.size == 0:
             self.status.showMessage(f"Select one or more {axis} to plot.")
             return
-    polarization = self._single_selection_value(self.list_pol, "polarization")
+    polarization = self._overlay_polarizations()
     if polarization is None:
         return
 
@@ -73,7 +73,6 @@ def render(self) -> None:
 
     controls = getattr(self, "analysis_controls", None)
     exceedance = bool(controls is not None and controls.cdf_exceedance())
-    unit = self._display_unit(datasets)
     rendered = 0
     low = high = None
     for name, dataset, selection in plans:
@@ -90,6 +89,7 @@ def render(self) -> None:
         percent = 100.0 * ((1.0 - ranks / count) if exceedance else (ranks + 1.0) / count)
         pol_value = dataset.polarizations[selection[3][0]]
         median = float(np.median(values))
+        unit = self._display_unit([(name, dataset)])
         label = (
             f"{name} | Pol {pol_value}, {len(selection[0])} az × {len(selection[1])} el × "
             f"{len(selection[2])} freq, {count:,} samples, median {median:.4g} {unit}"
@@ -103,7 +103,7 @@ def render(self) -> None:
         )
         self._plot_bounded_line(
             self.plot_ax, values, percent, label=label, dataset=dataset,
-            trace_key=trace_key, drawstyle="steps-post",
+            trace_key=trace_key, drawstyle="steps-post", polarization=pol_value,
         )
         rendered += 1
         low = values[0] if low is None else min(low, values[0])

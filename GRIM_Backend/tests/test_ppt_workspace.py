@@ -377,6 +377,38 @@ class PptWorkspaceTests(unittest.TestCase):
         self.assertTrue(widget.previous_slide_button.isEnabled())
         self.assertFalse(widget.next_slide_button.isEnabled())
 
+    def test_mixed_db_catalog_builds_each_report_family_and_preserves_styles(self):
+        three_d = _grid(frequencies=(1.0, 2.0), elevations=(-20.0, 0.0, 20.0))
+        two_d = _grid(frequencies=(1.0, 2.0), elevations=(-20.0, 0.0, 20.0))
+        two_d.units.update(rcs_log_unit="dBke", rcs_linear_quantity="sigma_2d")
+        widget = self.workspace()
+        widget.set_dataset_catalog((
+            DatasetCatalogEntry("test", "Test", three_d),
+            DatasetCatalogEntry("analysis", "Analysis", two_d),
+        ))
+        self.assertIsNotNone(widget._availability)
+        self.assertEqual(widget._availability.rcs_unit, "Mixed dB")
+        self.assertEqual(widget.y_min_spin.suffix(), " Mixed dB")
+        widget.select_frequencies((2.0,))
+        widget._series_line_styles["analysis"] = "--"
+        widget._series_line_colors["analysis"] = "#ff0000"
+        for kind in ("azimuth_rect", "azimuth_polar", "elevation", "frequency"):
+            widget.plot_type_combo.setCurrentIndex(widget.plot_type_combo.findData(kind))
+            for frequency_mode in (("exact", "band") if kind == "frequency" else ("exact",)):
+                with self.subTest(kind=kind, frequency_mode=frequency_mode):
+                    widget.frequency_azimuth_mode_combo.setCurrentIndex(
+                        widget.frequency_azimuth_mode_combo.findData(frequency_mode)
+                    )
+                    plan = widget._build_plan()
+                    self.assertTrue(plan.slides)
+                    for slide in plan.slides:
+                        self.assertEqual([entry.label for entry in slide.master_legend],
+                                         ["Test [dBsm]", "Analysis [dBke]"])
+                        for placement in slide.plots:
+                            self.assertEqual(placement.plot.y_label, "Mixed dB")
+                            self.assertEqual(placement.plot.series[1].line_style, "--")
+                            self.assertEqual(placement.plot.series[1].color, "#ff0000")
+
     def test_vv_and_hh_choice_builds_separate_plots_in_one_report(self):
         widget = self.workspace()
         widget.set_dataset_catalog(self.entries())

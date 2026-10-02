@@ -35,6 +35,20 @@ DESCRIPTIVE_UNITS = (
     "Hz,deg,deg,dBsm,deg,dBsm,deg,dBsm,deg,dBsm,deg"
 )
 
+SCAT_INC_HEADER = (
+    "Frequency, Theta, Phi, RCS ThetaScat-ThetaInc  ,RCS PhiScat-ThetaInc, "
+    "RCS ThetaScat-PhiInc, RCS PhiScat-PhiInc, Phase Theta-Theta, "
+    "Phase Theta-Phi, Phase Phi-Theta, Phase Phi-Phi"
+)
+
+INC_SCAT_HEADER = (
+    "Frequency, Theta, Phi, RCS ThetaInc-ThetaScat , RCS ThetaInc-PhiScat, "
+    "RCS PhiInc-ThetaScat, RCS PhiInc-PhiScat, Phase ThetaInc-ThetaScat, "
+    "Phase ThetaInc-PhiScat, Phase PhiInc-ThetaScat, Phase PhiInc-PhiScat"
+)
+
+GROUPED_UNITS = "Hz, deg, deg, dBsm, dBsm, dBsm, dBsm, deg, deg, deg, deg"
+
 
 class SentriReaderTest(unittest.TestCase):
     def _write(
@@ -109,6 +123,86 @@ class SentriReaderTest(unittest.TestCase):
             10.0 ** (np.asarray([-10.0, -20.0, -30.0, 0.0]) / 10.0),
         )
         self.assertTrue(direct.extra["sentri_units_row_present"])
+
+    def test_descriptive_versions_pair_magnitudes_and_phases_by_label(self) -> None:
+        # Legacy phase labels are Scat-Inc; the new version explicitly uses
+        # Inc-Scat. Distinct cross-polar phases catch accidental slot matching.
+        for header, phases in (
+            (SCAT_INC_HEADER, "20,40,30,10"),
+            (INC_SCAT_HEADER, "20,30,40,10"),
+        ):
+            with self.subTest(header=header):
+                path = self._write(
+                    ".csv", header + "\n" + GROUPED_UNITS
+                    + "\n2000000000,100,10,-10,-20,-30,0," + phases + "\n",
+                )
+                self.assertTrue(RcsGrid.has_SENTRi_signature(path))
+                for reader in (read_SENTRi, load_dataset):
+                    with self.subTest(reader=reader.__name__):
+                        grid = reader(path)
+                        np.testing.assert_allclose(grid.frequencies, [2.0])
+                        np.testing.assert_allclose(grid.elevations, [100.0])
+                        np.testing.assert_allclose(grid.azimuths, [10.0])
+                        self.assertEqual(
+                            grid.polarizations.tolist(), ["VV", "HV", "VH", "HH"]
+                        )
+                        expected_power = np.asarray([0.1, 0.01, 0.001, 1.0])
+                        expected_phase = np.deg2rad([20.0, 30.0, 40.0, 10.0])
+                        np.testing.assert_allclose(
+                            grid.rcs_power[0, 0, 0, :], expected_power
+                        )
+                        np.testing.assert_allclose(
+                            grid.rcs_phase[0, 0, 0, :], expected_phase
+                        )
+                        np.testing.assert_allclose(
+                            grid.rcs[0, 0, 0, :],
+                            np.sqrt(expected_power) * np.exp(1j * expected_phase),
+                        )
+                        self.assertTrue(grid.extra["sentri_units_row_present"])
+
+    def test_inc_scat_columns_can_be_reordered_in_tab_delimited_file(self) -> None:
+        header = INC_SCAT_HEADER.split(",")[::-1]
+        units = GROUPED_UNITS.split(",")[::-1]
+        values = "1000000000,80,190,-10,-20,-30,0,20,30,40,10".split(",")[::-1]
+        path = self._write(
+            ".txt",
+            "\t".join(f'"{cell.strip().upper()}"' for cell in header)
+            + "\n" + "\t".join(units) + "\n" + "\t".join(values) + "\n",
+            bom=True,
+        )
+        grid = load_dataset(path)
+        np.testing.assert_allclose(grid.frequencies, [1.0])
+        np.testing.assert_allclose(grid.elevations, [80.0])
+        np.testing.assert_allclose(grid.azimuths, [-170.0])
+        np.testing.assert_allclose(grid.rcs_power[0, 0, 0, :], [0.1, 0.01, 0.001, 1.0])
+        np.testing.assert_allclose(
+            grid.rcs_phase[0, 0, 0, :], np.deg2rad([20.0, 30.0, 40.0, 10.0])
+        )
+
+    def test_inc_scat_dispatch_preserves_sentri_validation(self) -> None:
+        row = "1000000000,90,0,-10,-20,-30,0,20,30,40,10"
+        cases = (
+            (
+                INC_SCAT_HEADER.rsplit(",", 1)[0], GROUPED_UNITS, row,
+                "complete SENTRi RCS header",
+            ),
+            (
+                INC_SCAT_HEADER, GROUPED_UNITS.replace("Hz", "GHz"), row,
+                "invalid SENTRi units row",
+            ),
+            (
+                INC_SCAT_HEADER, GROUPED_UNITS, row.replace(",90,", ",200,"),
+                "theta must be in",
+            ),
+        )
+        for header, units, values, error in cases:
+            with self.subTest(error=error):
+                path = self._write(
+                    ".csv", header + "\n" + units + "\n" + values + "\n"
+                )
+                self.assertTrue(RcsGrid.has_SENTRi_signature(path))
+                with self.assertRaisesRegex(ValueError, error):
+                    load_dataset(path)
 
     def test_units_row_is_validated_instead_of_treated_as_data(self) -> None:
         wrong_units = self._write(

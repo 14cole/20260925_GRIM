@@ -224,12 +224,8 @@ class DatasetSidebar(QScrollArea):
             dataset_actions.setColumnStretch(column, 1)
         sec_datasets.addLayout(dataset_actions)
 
-        self.table = DatasetTable(0, 4)
-        self.table.setHorizontalHeaderLabels(["Name", "Source / Output", "History", "PbP Group"])
-        self.table.horizontalHeaderItem(3).setToolTip(
-            "Selected datasets that share a group name form one PbP band. "
-            "Double-click a cell to type a group; leave it empty for ungrouped."
-        )
+        self.table = DatasetTable(0, 3)
+        self.table.setHorizontalHeaderLabels(["Name", "Source / Output", "History"])
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(
@@ -238,7 +234,6 @@ class DatasetSidebar(QScrollArea):
             | QAbstractItemView.SelectedClicked
         )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.setMinimumHeight(160)
         sec_datasets.addWidget(self.table, 1)

@@ -169,7 +169,7 @@ class PptPlotDataTests(unittest.TestCase):
         )
         self.assertEqual(spec.series[0].x, (1.0, 2.0))
         np.testing.assert_allclose(spec.series[0].y, [0.0, 0.0], atol=1.0e-12)
-        self.assertEqual(spec.y_label, "RCS (dBke)")
+        self.assertEqual(spec.y_label, "Scattering Width (dBke)")
 
     def test_native_rad_and_hz_axes_convert_only_for_display(self):
         grid = _grid(
@@ -504,11 +504,15 @@ class PptPlotDataTests(unittest.TestCase):
                 polarization="VV",
             )
 
-    def test_physical_metadata_and_common_axis_mismatches_are_actionable(self):
+    def test_mixed_quantity_overlays_keep_common_axis_requirements(self):
         three_d = _grid(frequencies=(1.0,), log_unit="dBsm", quantity="sigma_3d")
         two_d = _grid(frequencies=(1.0,), log_unit="dBke", quantity="sigma_2d")
-        with self.assertRaisesRegex(ValueError, "physically compatible.*linear quantity mismatch"):
-            get_plot_availability([("3-D", three_d), ("2-D", two_d)])
+        availability = get_plot_availability([("3-D", three_d), ("2-D", two_d)])
+        self.assertEqual(availability.rcs_unit, "Mixed dB")
+        self.assertEqual(availability.frequencies, (1.0,))
+        # Plotting permission does not change the contract for arithmetic.
+        with self.assertRaisesRegex(ValueError, "linear quantity mismatch"):
+            three_d._assert_physical_metadata_compatible(two_d)
 
         radians = _grid(
             azimuths=(-np.pi / 2.0, 0.0, np.pi / 2.0),

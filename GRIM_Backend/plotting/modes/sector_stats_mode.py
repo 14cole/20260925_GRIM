@@ -68,7 +68,7 @@ def render(self) -> None:
         if values.size == 0:
             self.status.showMessage(f"Select one or more {axis} to plot.")
             return
-    polarization = self._single_selection_value(self.list_pol, "polarization")
+    polarization = self._overlay_polarizations()
     if polarization is None:
         return
 
@@ -104,9 +104,11 @@ def render(self) -> None:
     unit = self._display_unit(datasets)
     low, high = float(az_values[0]), float(az_values[-1])
     table = []
+    row_units = []
     rendered = 0
     omitted = 0
     for name, dataset, selection in plans:
+        native_unit = self._display_unit([(name, dataset)])
         az_indices, elev_indices, freq_indices, pol_indices = selection
         azimuths = self._plot_axis_values(reference, dataset, "azimuth", dataset.azimuths[az_indices])
         memberships = [sector.contains(azimuths) for sector in sectors]
@@ -141,6 +143,7 @@ def render(self) -> None:
                         stats["count"], shown["mean"], shown["median"], shown["min"],
                         shown["max"], shown["percentile"],
                     ))
+                    row_units.append(native_unit)
                     level = shown[statistic]
                     if not np.isfinite(level):
                         continue
@@ -161,7 +164,7 @@ def render(self) -> None:
                 self._plot_bounded_line(
                     self.plot_ax, np.asarray(x_points), np.asarray(y_points),
                     label=label, dataset=dataset, trace_key=trace_key,
-                    linewidth=2.5, solid_capstyle="butt",
+                    linewidth=2.5, solid_capstyle="butt", polarization=pol_value,
                 )
                 rendered += 1
 
@@ -169,6 +172,7 @@ def render(self) -> None:
         "unit": unit,
         "percentile": percentile,
         "rows": table,
+        "row_units": row_units,
     }
     if rendered == 0:
         detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
@@ -199,13 +203,20 @@ def render(self) -> None:
 def table_text(table) -> str:
     """Tab-separated sector table for the clipboard."""
     unit = table["unit"]
+    row_units = table.get("row_units", [])
+    mixed_units = len(set(row_units)) > 1
+    suffix = "" if mixed_units else f" ({unit})"
     header = (
         "Dataset", "Pol", "Frequency", "Elevation", "Sector", "Samples",
-        f"Mean ({unit})", f"Median ({unit})", f"Min ({unit})", f"Max ({unit})",
-        f"P{table['percentile']:g} ({unit})",
+        f"Mean{suffix}", f"Median{suffix}", f"Min{suffix}", f"Max{suffix}",
+        f"P{table['percentile']:g}{suffix}",
     )
+    if mixed_units:
+        header += ("Unit",)
     lines = ["\t".join(header)]
-    for row in table["rows"]:
+    for row_index, row in enumerate(table["rows"]):
         cells = [str(value) if not isinstance(value, float) else f"{value:.6g}" for value in row]
+        if mixed_units:
+            cells.append(row_units[row_index])
         lines.append("\t".join(cells))
     return "\n".join(lines)

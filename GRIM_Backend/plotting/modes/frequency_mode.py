@@ -10,10 +10,10 @@ from . import common
 def _frequency_selection(
     self, reference, dataset, freq_values, az_values, elev_values, polarization
 ):
-    freq_indices = self._axis_selection_for_dataset(
+    freq_indices = self._overlay_axis_selection(
         reference, dataset, "frequency", freq_values
     )
-    az_indices = self._axis_selection_for_dataset(
+    az_indices = self._overlay_axis_selection(
         reference, dataset, "azimuth", az_values
     )
     elev_indices = self._axis_selection_for_dataset(
@@ -124,7 +124,7 @@ def render(self) -> None:
     if elev_values.size == 0:
         self.status.showMessage("Select one or more elevations to plot.")
         return
-    polarization = self._single_selection_value(self.list_pol, "polarization")
+    polarization = self._overlay_polarizations()
     if polarization is None:
         return
 
@@ -135,7 +135,7 @@ def render(self) -> None:
     plans = []
     peak_slice_cells = 0
     total_cells = 0
-    for name, dataset in datasets:
+    for name, dataset, pol in ((name, ds, pol) for name, ds in datasets for pol in polarization):
         selection = _frequency_selection(
             self,
             reference,
@@ -143,10 +143,10 @@ def render(self) -> None:
             freq_values,
             az_values,
             elev_values,
-            polarization,
+            pol,
         )
         if selection is None:
-            skipped.append(name)
+            skipped.append(f"{name} | Pol {pol}")
             continue
         freq_indices, az_indices, elev_indices, _pol_indices = selection
         slice_cells = len(az_indices) * len(freq_indices)
@@ -215,11 +215,14 @@ def render(self) -> None:
             if not np.any(np.isfinite(display)):
                 continue
             if bands is not None:
-                bands.update(dataset, display)
+                bands.update(dataset, display, polarization=(
+                    dataset.polarizations[selection[3][0]]
+                ))
                 rendered += 1
             elif rendered < common.MAX_LINE_SERIES:
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
-                                        dataset=dataset, trace_key=trace_key)
+                                        dataset=dataset, trace_key=trace_key,
+                                        polarization=dataset.polarizations[selection[3][0]])
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += candidates - candidate_index - 1
@@ -235,9 +238,10 @@ def render(self) -> None:
             if elev_values.size > 1
             else f"{elev_values[0]:g} {elev_unit}"
         )
+        pol_label = f"Pol {polarization[0]}, " if len(polarization) == 1 else ""
         bands.draw(
             freq_values,
-            f"Pol {polarization}, {elev_name} {elev_label}, "
+            f"{pol_label}{elev_name} {elev_label}, "
             f"P50 over {az_name} ({az_values[0]:g},{az_values[-1]:g}) {az_unit}",
             polar=False,
         )

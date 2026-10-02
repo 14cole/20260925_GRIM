@@ -529,11 +529,15 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             "phase ramp per angle and frequency, levels unchanged. Needs phase."
         )
         self.btn_wedge_to_conic.setToolTip(
-            "Convert a vertical-turntable/body-y-wedge acquisition into the "
-            "normal tilted-pylon conic grid. Requires a full revolution, at "
-            "least two measured wedge tilts, finite complex phase, and VV/HH "
-            "plus VH or HV unless zero cross-pol is explicitly assumed. "
-            "Unsupported side-aspect/elevation combinations remain NaN."
+            "Convert full revolutions of a pitch-tilted vehicle on a vertical "
+            "turntable with horizontal radar line of sight to conic cuts. "
+            "A waterline-only (0° tilt) cut is relabeled exactly, preserving "
+            "samples and available polarizations; phase is optional. Tilted "
+            "cuts require at least two measured tilts in one dataset, "
+            "meaningful complex phase, and VV/HH plus VH or HV unless zero "
+            "cross-pol is explicitly assumed. Join separate tilt datasets "
+            "first. Unsupported directions, especially near side aspect, "
+            "remain blank. Input azimuth is signed mechanical turntable angle."
         )
         operation_tooltips = {
             "btn_coherent_add": (
@@ -1747,28 +1751,36 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         compare_sector_layout.setContentsMargins(8, 3, 8, 3)
         compare_sector_layout.setSpacing(6)
         compare_sector_layout.addWidget(QLabel("Statistics sector:"))
-        compare_sector_layout.addWidget(QLabel("Min azimuth"))
+        compare_sector_layout.addWidget(QLabel("Start azimuth"))
         spin_compare_az_min = QDoubleSpinBox()
         spin_compare_az_min.setObjectName("compareAzimuthMin")
         spin_compare_az_min.setRange(-1.0e9, 1.0e9)
         spin_compare_az_min.setDecimals(6)
         spin_compare_az_min.setMaximumWidth(130)
         spin_compare_az_min.setKeyboardTracking(False)
+        spin_compare_az_min.setToolTip(
+            "Start of the statistics sector. An end below the start crosses "
+            "the angular seam, such as 170 to -170 degrees."
+        )
         compare_sector_layout.addWidget(spin_compare_az_min)
-        compare_sector_layout.addWidget(QLabel("Max azimuth"))
+        compare_sector_layout.addWidget(QLabel("End azimuth"))
         spin_compare_az_max = QDoubleSpinBox()
         spin_compare_az_max.setObjectName("compareAzimuthMax")
         spin_compare_az_max.setRange(-1.0e9, 1.0e9)
         spin_compare_az_max.setDecimals(6)
         spin_compare_az_max.setMaximumWidth(130)
         spin_compare_az_max.setKeyboardTracking(False)
+        spin_compare_az_max.setToolTip(
+            "End of the statistics sector. An end below the start crosses "
+            "the angular seam, such as 350 to 10 degrees."
+        )
         compare_sector_layout.addWidget(spin_compare_az_max)
         chk_compare_show_all_azimuths = QCheckBox("Show all azimuths")
         chk_compare_show_all_azimuths.setObjectName("compareShowAllAzimuths")
         chk_compare_show_all_azimuths.setChecked(False)
         chk_compare_show_all_azimuths.setToolTip(
             "Display the complete common azimuth sweep while keeping RF agreement "
-            "statistics limited to the Min/Max azimuth sector."
+            "statistics limited to the start/end azimuth sector."
         )
         compare_sector_layout.addWidget(chk_compare_show_all_azimuths)
         compare_sector_layout.addStretch(1)
@@ -1860,9 +1872,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                     "band in Plot Settings."
                 ),
                 "pbp": (
-                    "Point-by-point band across the selected series. Datasets with a "
-                    "PbP Group in the table get one band per group; choose Min–Max or "
-                    "percentile bands in Plot Settings."
+                    "Point-by-point band across the selected series. Choose "
+                    "Min–Max or percentile bands in Plot Settings."
                 ),
             }
             if role in tooltips:

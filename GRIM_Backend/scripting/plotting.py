@@ -63,39 +63,29 @@ def _plot_selection_indices(
     elevations,
     frequencies,
     polarization,
+    *,
+    native_axes=(),
 ):
-    """Return converted requested indices, or ``None`` like the GUI policy."""
+    """Match fixed cuts exactly and preserve native samples along overlay sweeps."""
 
     from GRIM_Backend.plotting.modes import common as plot_common
 
     try:
-        native_azimuths, azimuth_tolerance = plot_common.selection_for_dataset(
-            reference, dataset, "azimuth", azimuths
-        )
-        native_elevations, elevation_tolerance = plot_common.selection_for_dataset(
-            reference, dataset, "elevation", elevations
-        )
-        native_frequencies, frequency_tolerance = plot_common.selection_for_dataset(
-            reference, dataset, "frequency", frequencies
-        )
-        return (
-            _indices(
-                dataset.azimuths,
-                native_azimuths,
-                tolerance=azimuth_tolerance,
-            ),
-            _indices(
-                dataset.elevations,
-                native_elevations,
-                tolerance=elevation_tolerance,
-            ),
-            _indices(
-                dataset.frequencies,
-                native_frequencies,
-                tolerance=frequency_tolerance,
-            ),
-            _indices(dataset.polarizations, [polarization], text=True)[0],
-        )
+        indices = []
+        for axis, requested, values in (
+            ("azimuth", azimuths, dataset.azimuths),
+            ("elevation", elevations, dataset.elevations),
+            ("frequency", frequencies, dataset.frequencies),
+        ):
+            if axis in native_axes:
+                matched = plot_common.native_axis_selection(reference, dataset, axis, requested)
+                if matched is None:
+                    return None
+                indices.append(matched.tolist())
+            else:
+                converted, tolerance = plot_common.selection_for_dataset(reference, dataset, axis, requested)
+                indices.append(_indices(values, converted, tolerance=tolerance))
+        return (*indices, _indices(dataset.polarizations, [polarization], text=True)[0])
     except (TypeError, ValueError):
         return None
 
@@ -106,11 +96,14 @@ def _plot_response_label(
     phase: bool,
     scale: str,
     p50: bool = False,
+    mixed_db: bool = False,
 ) -> str:
     """Match the GUI's response-quantity labels in generated plots."""
 
     if phase:
         return "Phase P50 (deg)" if p50 else "Phase (deg)"
+    if mixed_db:
+        return "Mixed dB"
     quantity_name, linear_unit = {
         "sigma_3d": ("RCS", "m²"),
         "sigma_2d": ("Scattering Width", "m"),
@@ -130,7 +123,7 @@ def plot_datasets(
     azimuths: Iterable[float],
     elevations: Iterable[float],
     frequencies: Iterable[float],
-    polarization: str,
+    polarization: str | Sequence[str],
     phase: bool = False,
     scale: str = "dbsm",
     colormap: str = "viridis",
@@ -152,6 +145,11 @@ def plot_datasets(
     The implementation uses :class:`~matplotlib.backends.backend_agg.FigureCanvasAgg`
     directly and never imports pyplot or Qt.  Returned figures support ordinary
     ``figure.savefig(...)`` calls in generated scripts.
+
+    Ordinary logarithmic overlays retain each dataset's native log convention;
+    mixed quantities use a "Mixed dB" ordinate and identify units in the legend.
+    Ordinary overlays accept one polarization or a sequence and preserve each
+    dataset's native sweep samples within the selected reference intervals.
     """
 
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -177,6 +175,14 @@ def plot_datasets(
         )
     if mode_key == "isar_image" and len(selected) != 1:
         raise ValueError("ISAR headless plotting requires exactly one dataset")
+    polarizations = tuple(dict.fromkeys(
+        [polarization] if isinstance(polarization, str) else polarization
+    ))
+    if not polarizations or not all(isinstance(value, str) and value for value in polarizations):
+        raise ValueError("polarization must contain one or more polarization names")
+    if mode_key in {"delta_map", "isar_image"} and len(polarizations) != 1:
+        raise ValueError(f"{mode_key} requires exactly one polarization")
+    polarization = polarizations[0]
     try:
         reference_position = int(reference_index)
     except (TypeError, ValueError) as exc:
@@ -216,6 +222,9 @@ def plot_datasets(
         selected,
         phase=bool(phase),
         linear=str(scale).strip().lower() == "linear",
+        allow_mixed_db=mode_key in {
+            "azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep"
+        },
     )
     az_values = [float(value) for value in azimuths]
     el_values = [float(value) for value in elevations]
@@ -224,6 +233,15 @@ def plot_datasets(
         raise ValueError("azimuths, elevations, and frequencies cannot be empty")
     compatible_count = 0
     style_axes = None
+    plotted_series = []
+    overlay_series = [
+        (name, dataset, pol)
+        for name, dataset in selected
+        for pol in polarizations
+    ]
+
+    def polarization_style(pol):
+        return plot_common.polarization_linestyle(pol)
 
     figure = Figure(figsize=(10.0, 6.0), dpi=100, facecolor="white")
     FigureCanvasAgg(figure)
@@ -241,7 +259,7 @@ def plot_datasets(
         axes = figure.add_subplot(111)
 
     if mode_key in {"azimuth_rect", "azimuth_polar"}:
-        for name, dataset in selected:
+        for name, dataset, polarization in overlay_series:
             indices = _plot_selection_indices(
                 reference,
                 dataset,
@@ -249,6 +267,7 @@ def plot_datasets(
                 el_values,
                 freq_values,
                 polarization,
+                native_axes=("azimuth",),
             )
             if indices is None:
                 continue
@@ -282,9 +301,10 @@ def plot_datasets(
                         phase=phase,
                         scale=scale,
                     )[order]
-                    axes.plot(
+                    lines = axes.plot(
                         x,
                         y,
+                        linestyle=polarization_style(polarization),
                         label=(
                             f"{name} | {polarization}, "
                             f"{float(plot_common.values_for_display(reference, dataset, 'frequency', [dataset.frequencies[fi]])[0]):g} "
@@ -294,13 +314,14 @@ def plot_datasets(
                             f"{plot_common.axis_unit(reference, 'elevation')}"
                         ),
                     )
+                    plotted_series.extend((line, dataset) for line in lines)
         axes.set_xlabel(plot_common.axis_label(reference, "azimuth"))
         axes.set_ylabel(
             _plot_response_label(reference, phase=phase, scale=scale)
         )
 
     elif mode_key == "frequency":
-        for name, dataset in selected:
+        for name, dataset, polarization in overlay_series:
             indices = _plot_selection_indices(
                 reference,
                 dataset,
@@ -308,6 +329,7 @@ def plot_datasets(
                 el_values,
                 freq_values,
                 polarization,
+                native_axes=("azimuth", "frequency"),
             )
             if indices is None:
                 continue
@@ -346,22 +368,24 @@ def plot_datasets(
                         [dataset.elevations[ei]],
                     )[0]
                 )
-                axes.plot(
+                lines = axes.plot(
                     np.asarray(x)[order],
                     np.asarray(y)[order],
+                    linestyle=polarization_style(polarization),
                     label=(
-                        f"{name} | "
+                        f"{name} | {polarization}, "
                         f"{plot_common.angular_axis_name(reference, 'elevation')} "
                         f"{elevation:g} {plot_common.axis_unit(reference, 'elevation')}"
                     ),
                 )
+                plotted_series.extend((line, dataset) for line in lines)
         axes.set_xlabel(plot_common.axis_label(reference, "frequency"))
         axes.set_ylabel(
             _plot_response_label(reference, phase=phase, scale=scale, p50=True)
         )
 
     elif mode_key == "elevation_sweep":
-        for name, dataset in selected:
+        for name, dataset, polarization in overlay_series:
             indices = _plot_selection_indices(
                 reference,
                 dataset,
@@ -369,6 +393,7 @@ def plot_datasets(
                 el_values,
                 freq_values,
                 polarization,
+                native_axes=("azimuth", "elevation"),
             )
             if indices is None:
                 continue
@@ -405,14 +430,16 @@ def plot_datasets(
                         [dataset.frequencies[fi]],
                     )[0]
                 )
-                axes.plot(
+                lines = axes.plot(
                     np.asarray(x)[order],
                     np.asarray(y)[order],
+                    linestyle=polarization_style(polarization),
                     label=(
-                        f"{name} | {frequency:g} "
+                        f"{name} | {polarization}, {frequency:g} "
                         f"{plot_common.axis_unit(reference, 'frequency')}"
                     ),
                 )
+                plotted_series.extend((line, dataset) for line in lines)
         axes.set_xlabel(plot_common.axis_label(reference, "elevation"))
         axes.set_ylabel(
             _plot_response_label(
@@ -712,8 +739,32 @@ def plot_datasets(
     if compatible_count == 0:
         figure.clear()
         raise ValueError(
-            "None of the selected datasets contains every requested plot axis value"
+            "None of the selected datasets has compatible samples for the requested cuts and polarizations"
         )
+
+    if plotted_series and not phase and str(scale).strip().lower() != "linear":
+        # Match the GUI's visible-artist policy: a selected dataset whose
+        # coordinates cannot be plotted must not change the axis or legend.
+        mixed_db = len({
+            (
+                str(dataset.linear_quantity()).strip().lower(),
+                dataset.default_log_unit().strip().lower(),
+            )
+            for _, dataset in plotted_series
+        }) > 1
+        axes.set_ylabel(_plot_response_label(
+            plotted_series[0][1], phase=False, scale=scale,
+            p50=mode_key == "frequency" or (
+                mode_key == "elevation_sweep" and len(az_values) > 1
+            ),
+            mixed_db=mixed_db,
+        ))
+        if mixed_db:
+            for line, dataset in plotted_series:
+                head, separator, tail = line.get_label().partition(" | ")
+                line.set_label(
+                    f"{head} [{dataset.default_log_unit()}]{separator}{tail}"
+                )
 
     for axis in (style_axes if style_axes is not None else figure.axes):
         axis.grid(bool(show_grid))

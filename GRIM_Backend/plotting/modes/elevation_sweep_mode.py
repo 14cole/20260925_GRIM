@@ -88,7 +88,7 @@ def render(self) -> None:
     if freq_values.size == 0:
         self.status.showMessage("Select one or more frequencies to plot.")
         return
-    polarization = self._single_selection_value(self.list_pol, "polarization")
+    polarization = self._overlay_polarizations()
     if polarization is None:
         return
 
@@ -97,21 +97,21 @@ def render(self) -> None:
     plans = []
     peak_slice_cells = 0
     total_cells = 0
-    for name, dataset in datasets:
+    for name, dataset, pol in ((name, ds, pol) for name, ds in datasets for pol in polarization):
         freq_indices = self._axis_selection_for_dataset(
             reference, dataset, "frequency", freq_values
         )
-        az_indices = self._axis_selection_for_dataset(
+        az_indices = self._overlay_axis_selection(
             reference, dataset, "azimuth", az_values
         )
-        elev_indices = self._axis_selection_for_dataset(
+        elev_indices = self._overlay_axis_selection(
             reference, dataset, "elevation", elev_values
         )
         pol_indices = self._indices_for_values(
-            dataset.polarizations, [polarization], tol=0.0
+            dataset.polarizations, [pol], tol=0.0
         )
         if any(value is None for value in (freq_indices, az_indices, elev_indices, pol_indices)):
-            skipped.append(name)
+            skipped.append(f"{name} | Pol {pol}")
             continue
         slice_cells = len(az_indices) * len(elev_indices)
         peak_slice_cells = max(peak_slice_cells, slice_cells)
@@ -167,7 +167,8 @@ def render(self) -> None:
                 continue
             if rendered < common.MAX_LINE_SERIES:
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
-                                        dataset=dataset, trace_key=trace_key)
+                                        dataset=dataset, trace_key=trace_key,
+                                        polarization=dataset.polarizations[plan[5][0]])
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += len(freq_indices) - candidate_index - 1

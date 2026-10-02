@@ -58,37 +58,75 @@ PBP_GROUP_COLORS = (
 )
 # Line-plot modes that can show each dataset as a difference from the active one.
 DELTA_REFERENCE_MODES = ("azimuth_rect", "frequency", "elevation_sweep")
+NATIVE_DB_LINE_MODES = (
+    "azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep",
+    "cdf", "sector_stats",
+)
 
 
 class _PbpBands:
-    """One streaming envelope per PBP group, drawn as separate bands.
+    """One streaming envelope per group and polarization.
 
-    Datasets without a group share the "" group. When every selected dataset
-    is ungrouped this is the classic single gray PBP band.
+    A single ungrouped band retains its classic appearance and item key.
+    Hold identifies each band by polarization even when the selection changes.
     """
 
     def __init__(self, owner, groups: dict[int, str]):
         self._owner = owner
         self._groups = groups
-        self._envelopes: dict[str, plot_common.StreamingEnvelope] = {}
+        self._envelopes: dict[tuple[str, str], plot_common.StreamingEnvelope] = {}
+        self._db_quantities: dict[tuple[str, str], set[tuple[str, str]]] = {}
 
-    def update(self, dataset, values) -> None:
+    def update(self, dataset, values, *, polarization=None) -> None:
         group = self._groups.get(id(dataset), "")
-        envelope = self._envelopes.get(group)
+        identity = (group, str(polarization or ""))
+        envelope = self._envelopes.get(identity)
         if envelope is None:
-            envelope = self._envelopes[group] = self._owner._new_pbp_envelope()
+            envelope = self._envelopes[identity] = self._owner._new_pbp_envelope()
         envelope.update(values)
+        if self._owner._native_db_overlay_enabled():
+            self._db_quantities.setdefault(identity, set()).add(
+                self._owner._native_db_quantity(dataset)
+            )
+
+    def _band_key(self, identity):
+        """Reuse held identity keys; reserve the legacy key for the first band."""
+        used = set()
+        for artist in (*self._owner.plot_ax.lines, *self._owner.plot_ax.collections):
+            key = getattr(artist, "_grim_dataset_key", None)
+            if is_pbp_band_key(key):
+                if getattr(artist, "_grim_pbp_identity", None) == identity:
+                    return key
+                used.add(key)
+        group = identity[0]
+        key = pbp_band_key(group)
+        if key not in used:
+            return key
+        name = " | ".join(value for value in identity if value) or "Ungrouped"
+        key = pbp_band_key(name)
+        suffix = 2
+        while key in used:
+            key = pbp_band_key(f"{name} ({suffix})")
+            suffix += 1
+        return key
 
     def draw(self, x_values, description: str, *, polar: bool, to_plot_x=None) -> None:
         owner = self._owner
-        grouped = any(self._envelopes)
+        identities = set(self._envelopes)
+        identities.update(
+            artist._grim_pbp_identity
+            for artist in (*owner.plot_ax.lines, *owner.plot_ax.collections)
+            if hasattr(artist, "_grim_pbp_identity")
+        )
+        identity_order = sorted(identities)
+        grouped = any(group for group, _pol in identities) or len(identities) > 1
         if grouped and owner.pbp_fill_mode in ("heatmap_rcs", "heatmap_density"):
             owner._note_plot_render(
                 "Grouped PBP bands use translucent group colours; heatmap fills "
                 "apply to a single ungrouped band."
             )
-        for index, group in enumerate(sorted(self._envelopes)):
-            envelope = self._envelopes[group]
+        for identity in sorted(self._envelopes):
+            envelope = self._envelopes[identity]
             if envelope.lower is None:
                 envelope.close()
                 continue
@@ -105,14 +143,20 @@ class _PbpBands:
                 else f"PBP P{percentiles[0]:g}–P{percentiles[1]:g}"
             )
             if grouped:
-                label = f"{prefix} [{group or 'Ungrouped'}] {description}"
-                color = PBP_GROUP_COLORS[index % len(PBP_GROUP_COLORS)]
+                group = " | ".join(value for value in identity if value)
+                band_description = description.removeprefix(f"Pol {identity[1]}, ")
+                label = f"{prefix} [{group or 'Ungrouped'}] {band_description}"
+                color = PBP_GROUP_COLORS[identity_order.index(identity) % len(PBP_GROUP_COLORS)]
             else:
                 label, color = f"{prefix} {description}", None
+            key = self._band_key(identity)
             owner._plot_pbp_band(
                 x_display, lower, upper, label, polar, density=density,
-                key=pbp_band_key(group), color=color,
+                key=key, color=color,
             )
+            for artist in owner._plot_item_artists(key):
+                artist._grim_pbp_identity = identity
+                owner._tag_native_db_artist(artist, self._db_quantities.get(identity, set()))
 
 
 class _DeltaReference:
@@ -692,7 +736,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                 self._register_plot_line(line, key)
 
     def _dataset_plot_group(self, dataset) -> str:
-        """PBP group of a dataset; the dataset table overrides this."""
+        """Keep selected datasets together in the default PBP band."""
         return ""
 
     def _new_pbp_bands(self, datasets) -> _PbpBands:
@@ -889,6 +933,35 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             return None
         return values[0]
 
+    def _overlay_polarizations(self):
+        values = tuple(dict.fromkeys(str(value) for value in self._selected_values(self.list_pol)))
+        if not values:
+            self.status.showMessage("Select one or more polarizations to plot.")
+            return None
+        if self._delta_reference_active() and len(values) != 1:
+            self.status.showMessage("Select one polarization for Δ Ref; ordinary overlays can show several.")
+            return None
+        return values
+
+    def _native_sample_overlay_enabled(self) -> bool:
+        mode = getattr(self, "last_plot_mode", None)
+        return (
+            mode in NATIVE_DB_LINE_MODES
+            and not self._delta_reference_active()
+            and not (mode in ("azimuth_rect", "azimuth_polar", "frequency")
+                     and self._button_checked(self.btn_pbp))
+        )
+
+    def _overlay_axis_selection(self, reference, dataset, axis: str, values):
+        if not self._native_sample_overlay_enabled():
+            return self._axis_selection_for_dataset(reference, dataset, axis, values)
+        try:
+            return plot_common.native_axis_selection(reference, dataset, axis, values)
+        except ValueError as exc:
+            self._plot_selection_failed = True
+            self._note_plot_render(f"Incompatible {axis} selection: {exc}.")
+            return None
+
     @staticmethod
     def _button_checked(button: QToolButton | None) -> bool:
         return bool(button.isChecked()) if button is not None else False
@@ -931,8 +1004,55 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if self._plot_scale_is_linear():
             quantity = datasets[0][1].linear_quantity()
             return self._linear_quantity_label_and_unit(quantity)[1]
-        units = {str(ds.default_log_unit()) for _, ds in datasets}
-        return next(iter(units)) if len(units) == 1 else "dB"
+        quantities = {self._native_db_quantity(ds) for _, ds in datasets}
+        return next(iter(quantities))[1] if len(quantities) == 1 else "Mixed dB"
+
+    @staticmethod
+    def _native_db_quantity(dataset) -> tuple[str, str]:
+        return (str(dataset.linear_quantity()).strip().lower(), str(dataset.default_log_unit()))
+
+    def _native_db_overlay_enabled(self) -> bool:
+        return (
+            getattr(self, "last_plot_mode", None) in (*NATIVE_DB_LINE_MODES, "waterfall")
+            and not self._button_checked(self.btn_phase)
+            and not self._plot_scale_is_linear()
+            and not self._delta_reference_active()
+        )
+
+    @staticmethod
+    def _tag_native_db_artist(artist, quantities) -> None:
+        if quantities:
+            artist._grim_db_quantities = frozenset(quantities)
+            artist._grim_db_base_label = artist.get_label()
+
+    def _refresh_native_db_labels(self, ax) -> None:
+        """Label the actual displayed curves, including retained Hold curves."""
+        value_axis = getattr(ax, "_grim_db_value_axis", None)
+        if value_axis is None:
+            return
+        artists = [
+            artist for artist in (*ax.lines, *ax.collections)
+            if getattr(artist, "_grim_db_quantities", None)
+        ]
+        quantities = {entry for artist in artists for entry in artist._grim_db_quantities}
+        if not quantities:
+            return
+        mixed = len(quantities) > 1
+        if mixed:
+            axis_label = "Mixed dB"
+        else:
+            quantity, unit = next(iter(quantities))
+            name, _ = self._linear_quantity_label_and_unit(quantity)
+            tag = getattr(ax, "_grim_db_label_tag", "")
+            axis_label = f"{name}{tag} ({unit})"
+        (ax.set_xlabel if value_axis == "x" else ax.set_ylabel)(axis_label)
+        for artist in artists:
+            label = artist._grim_db_base_label
+            if mixed and isinstance(label, str) and label and not label.startswith("_"):
+                units = ", ".join(sorted({entry[1] for entry in artist._grim_db_quantities}))
+                head, separator, tail = label.partition(" | ")
+                label = f"{head} [{units}]{separator}{tail}"
+            artist.set_label(label)
 
     @staticmethod
     def _linear_quantity_label_and_unit(quantity) -> tuple[str, str]:
@@ -955,6 +1075,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         quantity_name, linear_unit = self._linear_quantity_label_and_unit(quantity)
         if self._plot_scale_is_linear():
             return f"{quantity_name}{tag} ({linear_unit})"
+        if getattr(self, "last_plot_mode", None) in NATIVE_DB_LINE_MODES:
+            self.plot_ax._grim_db_label_tag = tag
+        if self._display_unit(datasets) == "Mixed dB":
+            return "Mixed dB"
         return f"{quantity_name}{tag} ({self._display_unit(datasets)})"
 
     # --- renderer preflight, unit conversion, and display bounding ----------
@@ -969,7 +1093,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if self.last_plot_mode != 'isar_image' and getattr(self.plot_figure, '_grim_isar_layout', False):
             self.plot_figure.set_layout_engine(None)
             self.plot_figure._grim_isar_layout = False
-        self._plot_render_notes = []
+        selection_notice = getattr(self, "_pending_parameter_selection_notice", None)
+        self._plot_render_notes = [selection_notice] if selection_notice else []
+        self._pending_parameter_selection_notice = None
         self._plot_line_point_limit = plot_common.MAX_LINE_POINTS
         self._plot_selection_failed = False
         self._plot_render_generation = (
@@ -995,6 +1121,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                 datasets,
                 phase=self._button_checked(self.btn_phase),
                 linear=self._plot_scale_is_linear(),
+                allow_mixed_db=self._native_db_overlay_enabled(),
             )
         except ValueError as exc:
             self.status.showMessage(f"Plot blocked: {exc}.")
@@ -1014,6 +1141,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             ordinate = ("phase", "deg")
         elif mode in DELTA_REFERENCE_MODES and self._delta_reference_active():
             ordinate = ("difference", "dB")
+        elif self._native_db_overlay_enabled():
+            ordinate = ("native_logarithmic", "dB")
         else:
             quantity = str(datasets[0][1].linear_quantity()).strip().lower()
             display_unit = (
@@ -1055,9 +1184,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
         Hold is an overlay operation, so it may retain only a line plot (and
         its PBP band) with the same x-coordinate and ordinate contract.
-        Images, multi-panel layouts, phase/scale changes, and unlike physical
-        quantities must be cleared rather than silently sharing mislabeled
-        axes.
+        Images, multi-panel layouts, phase/scale changes, and unlike linear
+        quantities require a fresh canvas. Native dB overlays share a numeric
+        scale and identify mixed units on the axis and individual curves.
         """
 
         hold = self._button_checked(self.btn_hold)
@@ -1092,6 +1221,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             self.plot_ax.clear()
             self._style_plot_axes()
         figure._grim_line_plot_signature = signature
+        self.plot_ax._grim_db_value_axis = (
+            ("x" if mode == "cdf" else "y")
+            if self._native_db_overlay_enabled() else None
+        )
+        self.plot_ax._grim_db_label_tag = ""
         if self._button_checked(self.btn_phase):
             prior_phase_datasets = (
                 list(getattr(figure, "_grim_held_phase_datasets", []))
@@ -1271,7 +1405,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         ))
 
     def _plot_bounded_line(self, ax, x_values, y_values, *args, dataset=None,
-                           trace_key=None, **kwargs):
+                           trace_key=None, polarization=None, **kwargs):
         limit = getattr(self, "_plot_line_point_limit", plot_common.MAX_LINE_POINTS)
         x_display, y_display, decimated = plot_common.decimate_line(
             x_values, y_values, max_points=limit
@@ -1314,12 +1448,16 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                     "Clear the plot before adding different cuts."
                 )
                 return []
+        if polarization is not None:
+            kwargs.setdefault("linestyle", plot_common.polarization_linestyle(polarization))
         lines = ax.plot(x_display, y_display, *args, **kwargs)
         for line in lines:
             line._grim_trace_key = trace_key
         if dataset is not None:
             for line in lines:
                 self._register_dataset_line(line, dataset)
+                if self._native_db_overlay_enabled():
+                    self._tag_native_db_artist(line, {self._native_db_quantity(dataset)})
         return lines
 
     def _bounded_plot_envelope(self, x_values, lower, upper, count=None):
@@ -2455,6 +2593,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._update_current_python_plot_style(show_legend=show)
         axes = self.plot_axes or [self.plot_ax]
         for ax in axes:
+            self._refresh_native_db_labels(ax)
             legend = ax.get_legend()
             handles, labels = ax.get_legend_handles_labels()
             if not show or not handles:
@@ -2651,9 +2790,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         polarization = override.pop("polarization", None)
         if polarization is None:
             selected_pol = self._selected_values(self.list_pol)
-            if len(selected_pol) != 1:
+            if not selected_pol or (mode in ("isar_image", "delta_map") and len(selected_pol) != 1):
                 return
-            polarization = selected_pol[0]
+            polarization = selected_pol[0] if len(selected_pol) == 1 else tuple(selected_pol)
 
         parameters: dict[str, object] = {
             "azimuths": list(azimuths),

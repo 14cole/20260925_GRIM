@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -171,6 +172,110 @@ class WedgePhysicsTests(unittest.TestCase):
             "missing VH=HV=0",
             assumed.extra["wedge_to_conic_cross_pol_treatment"],
         )
+
+    def test_waterline_relabels_power_only_samples_in_degrees_and_radians(self):
+        for unit in ("deg", "rad"):
+            with self.subTest(unit=unit):
+                angles = np.asarray([90.0, 270.0, 0.0, 180.0])
+                expected_angles = np.asarray([-180.0, -90.0, 0.0, 90.0])
+                if unit == "rad":
+                    angles = np.deg2rad(angles)
+                    expected_angles = np.deg2rad(expected_angles)
+                power = np.asarray([9.0, np.nan, 3.0, 18.0], dtype=np.float32)
+                source = RcsGrid(
+                    angles, [-0.0], [10.0], ["HH"],
+                    rcs_power=power.reshape(4, 1, 1, 1),
+                    units={"azimuth": unit, "elevation": unit},
+                    history="Measured waterline", source_path="waterline.csv",
+                )
+                # Exact relabeling must not materialize a complex field from
+                # unavailable phase, nor require other polarization channels.
+                with mock.patch.object(RcsGrid, "rcs", new_callable=mock.PropertyMock) as field:
+                    field.side_effect = AssertionError("waterline requested complex field")
+                    converted = source.convert_wedge_to_conic()
+                    replayed = scripted_wedge_to_conic(source)
+                for result in (converted, replayed):
+                    np.testing.assert_allclose(result.azimuths, expected_angles)
+                    np.testing.assert_array_equal(result.elevations, [0.0])
+                    np.testing.assert_array_equal(
+                        result.rcs_power[:, 0, 0, 0], [18.0, 9.0, 3.0, np.nan]
+                    )
+                    self.assertEqual(result.rcs_power.dtype, np.float32)
+                    self.assertTrue(np.all(np.isnan(result.rcs_phase)))
+                    self.assertEqual(result.polarizations.tolist(), ["HH"])
+                    self.assertEqual(result.units["azimuth"], unit)
+                    self.assertEqual(result.units["elevation"], unit)
+                    self.assertEqual(result.source_path, "waterline.csv")
+                    self.assertIn("no interpolation or polarization rotation", result.history)
+                    self.assertEqual(result.extra["wedge_to_conic_mode"], "waterline_relabel")
+                np.testing.assert_array_equal(source.azimuths, angles)
+                np.testing.assert_array_equal(source.rcs_power[:, 0, 0, 0], power)
+                self.assertEqual(source.history, "Measured waterline")
+                self.assertFalse(np.shares_memory(source.rcs_power, converted.rcs_power))
+
+    def test_waterline_preserves_phase_raw_fields_and_aligned_provenance(self):
+        shape = (4, 1, 2, 2)
+        measured = (np.arange(16).reshape(shape) + 1.0) * (1.0 + 0.25j)
+        source = RcsGrid(
+            [0.0, 90.0, 180.0, 270.0], [0.0], [9.0, 10.0], ["VV", "HH"],
+            rcs=measured,
+            units={"azimuth": "deg", "elevation": "deg"},
+            extra={
+                "rcs_amp_real": measured.real.copy(),
+                "rcs_amp_imag": measured.imag.copy(),
+                "raw_complex_amplitude_preserved": True,
+                "sample_provenance": np.arange(32).reshape(shape + (2,)),
+                "solver_metadata_json": "stale",
+                "requested_radar_grid_json": "stale",
+                "assembly_base_response_sha256": "source-digest",
+                "assembly_angular_coordinate_contract": "source-frame",
+            },
+        )
+        result = source.convert_wedge_to_conic()
+        order = [2, 1, 0, 3]
+        np.testing.assert_array_equal(result.rcs_power, source.rcs_power[order])
+        np.testing.assert_array_equal(result.rcs_phase, source.rcs_phase[order])
+        np.testing.assert_array_equal(result.rcs, source.rcs[order])
+        for key in ("rcs_amp_real", "rcs_amp_imag", "sample_provenance"):
+            np.testing.assert_array_equal(result.extra[key], source.extra[key][order])
+            self.assertFalse(np.shares_memory(result.extra[key], source.extra[key]))
+        for key in (
+            "solver_metadata_json", "requested_radar_grid_json",
+            "assembly_base_response_sha256", "assembly_angular_coordinate_contract",
+        ):
+            self.assertNotIn(key, result.extra)
+            self.assertIn(key, source.extra)
+        self.assertEqual(result.extra["assembly_source_base_response_sha256"], "source-digest")
+        self.assertEqual(result.units["polarization_basis"], CONIC_VH_BASIS_CONVENTION)
+
+    def test_waterline_drops_incomplete_raw_pair_without_losing_power(self):
+        source = RcsGrid(
+            [0.0, 90.0, 180.0, 270.0], [0.0], [10.0], ["VV"],
+            rcs_power=np.ones((4, 1, 1, 1)),
+            extra={"rcs_amp_real": np.ones((4, 1, 1, 1)),
+                   "raw_complex_amplitude_preserved": True},
+        )
+        result = source.convert_wedge_to_conic()
+        self.assertNotIn("rcs_amp_real", result.extra)
+        self.assertNotIn("raw_complex_amplitude_preserved", result.extra)
+        np.testing.assert_array_equal(result.rcs_power, source.rcs_power)
+        self.assertTrue(np.all(np.isnan(result.rcs_phase)))
+
+    def test_waterline_exception_keeps_axis_validation(self):
+        for angles, tilt, error in (
+            ([0, 90, 180, 270], 1.0e-8, "One fixed wedge tilt"),
+            ([0, 90, 180, 270], np.nan, "finite.*tilt"),
+            ([0, 10, 20, 30], 0.0, "complete.*revolution"),
+            ([0, 90, 180, 270, 360], 0.0, "duplicate or seam-alias"),
+            ([0, 90, 180, np.nan], 0.0, "finite turntable angles"),
+        ):
+            with self.subTest(angles=angles, tilt=tilt):
+                source = RcsGrid(
+                    angles, [tilt], [10.0], ["VV"],
+                    rcs_power=np.ones((len(angles), 1, 1, 1)),
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    source.convert_wedge_to_conic()
 
     def test_headless_replay_uses_the_same_physical_converter(self):
         source, _matrix = self._constant_jones_grid()

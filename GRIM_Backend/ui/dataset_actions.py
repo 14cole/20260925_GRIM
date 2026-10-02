@@ -203,7 +203,6 @@ _WINDOWS_RESERVED_FILENAMES = frozenset(
 DATASET_ID_ROLE = Qt.UserRole + 32
 DATASET_DIRTY_ROLE = Qt.UserRole + 33
 DATASET_PATH_ROLE = Qt.UserRole + 34
-DATASET_GROUP_COLUMN = 3
 _DELTA_REFERENCE_ICON = None
 
 
@@ -1114,13 +1113,6 @@ class DatasetOpsMixin:
             self.table.setItem(row, 0, name_item)
             self.table.setItem(row, 1, file_item)
             self.table.setItem(row, 2, history_item)
-            if self.table.columnCount() > DATASET_GROUP_COLUMN:
-                group_item = QTableWidgetItem("")
-                group_item.setToolTip(
-                    "PbP group: selected datasets that share a group name form one "
-                    "PbP band. Double-click to edit; leave empty for ungrouped."
-                )
-                self.table.setItem(row, DATASET_GROUP_COLUMN, group_item)
         finally:
             self.table.blockSignals(signals_were_blocked)
         if notify:
@@ -1128,17 +1120,6 @@ class DatasetOpsMixin:
             if callable(catalog_notify):
                 catalog_notify()
         return dataset_id
-
-    def _dataset_plot_group(self, dataset) -> str:
-        """PbP group typed in the dataset table ("" when ungrouped)."""
-
-        for row in range(self.table.rowCount()):
-            name_item = self.table.item(row, 0)
-            if name_item is None or name_item.data(Qt.UserRole) is not dataset:
-                continue
-            group_item = self.table.item(row, DATASET_GROUP_COLUMN)
-            return group_item.text().strip() if group_item is not None else ""
-        return ""
 
     def _explicit_delta_reference(self):
         """(name, dataset) picked with Set as Δ reference, while its row exists."""
@@ -1424,13 +1405,87 @@ class DatasetOpsMixin:
 
     def _populate_params(self, dataset: RcsGrid) -> None:
         from GRIM_Backend.ui.isar_controls import sync_frequency_controls
+        previous = self._capture_param_selection()
         sync_frequency_controls((getattr(self, "_plot_contexts", {}) or {}).get("isar"), dataset)
         self._update_parameter_headers(dataset)
         self._fill_list(self.list_pol, dataset.polarizations)
         self._fill_list(self.list_freq, dataset.frequencies)
         self._fill_list(self.list_elev, dataset.elevations)
         self._fill_list(self.list_az, dataset.azimuths)
-        self._apply_default_param_selection()
+        self._param_list_units = dict(dataset.units or {})
+        self._saved_param_selection = None
+        self._apply_default_param_selection(previous)
+
+    def _capture_param_selection(self) -> dict | None:
+        """Remember physical cuts without retaining an old dataset's arrays."""
+
+        units = getattr(self, "_param_list_units", None)
+        if units is None:
+            return getattr(self, "_saved_param_selection", None)
+        selections = {}
+        ranges = set()
+        for axis, widget in (
+            ("polarization", self.list_pol), ("frequency", self.list_freq),
+            ("elevation", self.list_elev), ("azimuth", self.list_az),
+        ):
+            selections[axis] = self._selected_values(widget)
+            rows = sorted(widget.row(item) for item in widget.selectedItems())
+            if axis != "polarization" and len(rows) > 1:
+                if rows[-1] - rows[0] + 1 == len(rows):
+                    ranges.add(axis)
+        return {"units": dict(units), "selections": selections, "ranges": ranges}
+
+    @staticmethod
+    def _param_axis_scale(axis: str, units: dict) -> float:
+        if axis == "frequency":
+            unit = _canonical_frequency_unit(units.get(axis, "GHz"))
+            return _FREQUENCY_TO_HZ[unit.lower()] / 1.0e9
+        unit = _canonical_angle_unit(units.get(axis, "deg"))
+        return 180.0 / np.pi if unit == "rad" else 1.0
+
+    def _restore_param_selection(self, axis: str, widget, previous: dict) -> str:
+        """Match fixed cuts exactly; retain native samples inside a selected span."""
+
+        wanted = previous["selections"].get(axis, [])
+        if not wanted:
+            widget.clearSelection()
+            return ""
+        available = [widget.item(row).data(Qt.UserRole) for row in range(widget.count())]
+        if axis == "polarization":
+            wanted_names = {str(value).strip().casefold() for value in wanted}
+            matched = [row for row, value in enumerate(available)
+                       if str(value).strip().casefold() in wanted_names]
+            complete = len(matched) == len(wanted_names)
+        else:
+            try:
+                old_scale = self._param_axis_scale(axis, previous["units"])
+                new_scale = self._param_axis_scale(axis, self._param_list_units)
+            except ValueError:
+                return f"{axis} units unavailable; using default"
+            source = np.asarray(wanted, dtype=float) * old_scale
+            target = np.asarray(available, dtype=float) * new_scale
+            tolerance = 1.0e-6  # degrees or GHz, independent of storage units
+            if axis in previous["ranges"]:
+                lower, upper = float(np.min(source)), float(np.max(source))
+                matched = np.flatnonzero(
+                    (target >= lower - tolerance) & (target <= upper + tolerance)
+                ).tolist()
+                complete = bool(target.size and target.min() <= lower + tolerance
+                                and target.max() >= upper - tolerance)
+            else:
+                matched = []
+                complete = True
+                for value in source:
+                    rows = np.flatnonzero(np.isclose(target, value, rtol=0, atol=tolerance))
+                    matched.extend(rows.tolist())
+                    complete = complete and bool(rows.size)
+        if not matched:
+            return f"{axis} unavailable; using default"
+        widget.clearSelection()
+        for row in matched:
+            widget.item(row).setSelected(True)
+        widget.setCurrentItem(widget.item(matched[0]), QItemSelectionModel.NoUpdate)
+        return "" if complete else f"{axis} limited to available values"
 
     def _update_parameter_headers(self, dataset: RcsGrid | None) -> None:
         """Label selectors from the active grid's actual coordinate metadata."""
@@ -1472,22 +1527,61 @@ class DatasetOpsMixin:
         first.setSelected(True)
         widget.setCurrentItem(first)
 
-    def _apply_default_param_selection(self) -> None:
+    def _apply_default_param_selection(self, previous: dict | None = None) -> None:
+        self._pending_parameter_selection_notice = ""
         widgets = (self.list_pol, self.list_freq, self.list_elev, self.list_az)
-        for widget in widgets:
-            widget.blockSignals(True)
+        old_signal_states = [widget.blockSignals(True) for widget in widgets]
+        adjustments = []
         try:
             self._select_first_item(self.list_pol)
             self._select_first_item(self.list_freq)
             self._select_first_item(self.list_elev)
             if self.list_az.count() > 0:
                 self.list_az.selectAll()
+            if previous is not None:
+                for axis, widget in zip(
+                    ("polarization", "frequency", "elevation", "azimuth"), widgets
+                ):
+                    adjustment = self._restore_param_selection(axis, widget, previous)
+                    if adjustment:
+                        adjustments.append(adjustment)
         finally:
-            for widget in widgets:
-                widget.blockSignals(False)
+            for widget, blocked in zip(widgets, old_signal_states):
+                widget.blockSignals(blocked)
 
+        counts_before_filter = [widget.count() for widget in widgets[1:]]
         # Refresh availability masks from selected polarization and trigger one autoplot update.
         self._on_polarization_selection_changed()
+        # Availability filtering can remove a coordinate that exists in the
+        # grid but has no samples for the restored polarization(s).
+        for axis, widget, old_count in zip(
+            ("frequency", "elevation", "azimuth"), widgets[1:], counts_before_filter
+        ):
+            wanted = previous is None or bool(previous["selections"].get(axis))
+            if previous is not None and wanted and widget.count() != old_count:
+                blocked = widget.blockSignals(True)
+                try:
+                    adjustment = self._restore_param_selection(axis, widget, previous)
+                finally:
+                    widget.blockSignals(blocked)
+                if adjustment:
+                    adjustments.append(adjustment if widget.count() else
+                                       f"{axis} unavailable for selected polarization")
+            if wanted and widget.count() and not widget.selectedItems():
+                blocked = widget.blockSignals(True)
+                try:
+                    if axis == "azimuth":
+                        widget.selectAll()
+                    else:
+                        self._select_first_item(widget)
+                finally:
+                    widget.blockSignals(blocked)
+                if previous is not None:
+                    adjustments.append(f"{axis} unavailable; using default")
+        if adjustments:
+            notice = "Selection adjusted: " + "; ".join(dict.fromkeys(adjustments)) + "."
+            self._pending_parameter_selection_notice = notice
+            self.status.showMessage(notice)
 
     def _fill_list(self, widget: QListWidget, values, indices=None) -> None:
         widget.setUpdatesEnabled(False)
@@ -1512,8 +1606,16 @@ class DatasetOpsMixin:
             widget.setUpdatesEnabled(True)
 
     def _clear_param_lists(self) -> None:
+        # Qt may briefly clear the table selection while moving to another
+        # row. Keep the cut through that intermediate empty selection.
+        self._saved_param_selection = self._capture_param_selection()
+        self._param_list_units = None
         for widget in (self.list_pol, self.list_freq, self.list_elev, self.list_az):
-            widget.clear()
+            blocked = widget.blockSignals(True)
+            try:
+                widget.clear()
+            finally:
+                widget.blockSignals(blocked)
         self._update_parameter_headers(None)
 
     def _on_param_item_changed(self, item: QListWidgetItem, axis_name: str, widget: QListWidget) -> None:
@@ -4968,6 +5070,13 @@ class DatasetOpsMixin:
             attest_wedge_axes=False,
             assume_missing_cross_pol_zero=assume_missing_cross_pol_zero,
         )
+        if result.extra.get("wedge_to_conic_mode") == "waterline_relabel":
+            return (
+                result,
+                "waterline conic",
+                "; exact waterline azimuth relabel; no interpolation or "
+                "polarization rotation",
+            )
         return result, "normal conic", "; inverse-mapped complex Jones re-grid"
 
     def _medianize_selected(self) -> None:

@@ -141,6 +141,8 @@ def render(self) -> None:
             panel_data.append(
                 {
                     "dataset_name": dataset_name,
+                    "dataset": dataset,
+                    "display_unit": self._display_unit([(dataset_name, dataset)]),
                     "elevation": display_elevation,
                     "azimuths": bounded_az,
                     "frequencies": bounded_freq,
@@ -187,6 +189,7 @@ def render(self) -> None:
     )
     elev_name = self._plot_axis_name(reference, "elevation")
     elev_unit = self._plot_axis_unit(reference, "elevation")
+    mixed_units = len({panel["display_unit"] for panel in panel_data}) > 1
     meshes = []
     xmins: list[float] = []
     xmaxs: list[float] = []
@@ -213,8 +216,13 @@ def render(self) -> None:
             coordinates[0, :, 0], coordinates[:, 0, 1], mesh.get_array().reshape(display.T.shape),
         )
         meshes.append(mesh)
+        panel_title = (
+            f"{panel['dataset_name']} | {elev_name} {panel['elevation']:g} {elev_unit}"
+        )
+        if mixed_units:
+            panel_title += f" | {panel['display_unit']}"
         ax.set_title(
-            f"{panel['dataset_name']} | {elev_name} {panel['elevation']:g} {elev_unit}",
+            panel_title,
             color=self._current_plot_text(),
         )
         ax.set_xlabel(self._plot_axis_label(reference, "azimuth"))
@@ -228,15 +236,17 @@ def render(self) -> None:
         if shared_scale:
             colorbar = self.plot_figure.colorbar(meshes[-1], ax=self.plot_axes)
             self.plot_colorbars = [colorbar]
+            colorbar_datasets = [[(panel["dataset_name"], panel["dataset"]) for panel in panel_data]]
         else:
             self.plot_colorbars = [
                 self.plot_figure.colorbar(mesh, ax=ax)
                 for ax, mesh in zip(self.plot_axes, meshes)
             ]
-        for colorbar in self.plot_colorbars:
+            colorbar_datasets = [[(panel["dataset_name"], panel["dataset"])] for panel in panel_data]
+        for colorbar, sources in zip(self.plot_colorbars, colorbar_datasets):
             self._apply_colorbar_ticks(colorbar)
             colorbar.set_label(
-                self._display_axis_label(datasets), color=self._current_plot_text()
+                self._display_axis_label(sources), color=self._current_plot_text()
             )
             colorbar.ax.tick_params(colors=self._current_plot_text())
             for label in colorbar.ax.get_yticklabels():

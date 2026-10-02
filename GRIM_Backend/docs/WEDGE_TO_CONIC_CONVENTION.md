@@ -3,16 +3,18 @@
 ## Configurations
 
 The source acquisition is a vertical-axis turntable with the article pitched
-relative to the pylon. With turntable angle `phi` and body-y wedge pitch `tau`,
-the body-to-world attitude is
+relative to the vertical pylon and a horizontal radar line of sight. With signed
+mechanical turntable angle `phi` and body-y wedge pitch `tau`, the body-to-world
+attitude is
 
 ```text
 R_source = Rz(phi) Ry(tau).
 ```
 
-The desired normal-range configuration tilts the article and pylon together,
-then rotates the assembly. Its data are represented in ordinary conic
-longitude/elevation coordinates with the spherical vertical/horizontal basis.
+The output represents look directions in body-relative conic longitude/elevation
+coordinates with the spherical vertical/horizontal basis. Each output elevation
+row describes a constant-elevation conic cut wherever the measurements provide
+coverage.
 
 For a fixed world line of sight along `+x`, the source look direction expressed
 in body coordinates is
@@ -31,7 +33,39 @@ latitude  = asin(r_z).
 This direction mapping was checked independently against the complete attitude
 matrix `R_source.T @ (1,0,0)`.
 
+Positive `phi` is a right-handed rotation about fixed world `+z`; positive `tau`
+is a right-handed pitch about body `+y` before the turntable rotation. Input
+azimuth must follow that mechanical-angle convention, rather than already being
+body-relative conic longitude.
+
+For each fixed `tau`, the direction traces a great circle on the body sphere.
+Its elevation varies during the revolution, crossing waterline at the two side
+aspects. At zero tilt, that great circle is the waterline conic cut itself.
+
+## Waterline-only conversion
+
+A dataset with a single tilt exactly equal to zero (including signed `-0`) uses
+an exact azimuth relabel:
+
+```text
+conic azimuth   = wrap(-phi)
+conic elevation = 0.
+```
+
+The output azimuths are sorted and samples are reordered with them. Magnitudes,
+phases, and the available polarization channels are preserved; no interpolation
+or polarization rotation is performed. Phase may be unknown and a single
+polarization channel is sufficient. A full turntable revolution is still
+required. A small nonzero tilt is not treated as zero.
+
+The result records `wedge_to_conic_mode = waterline_relabel`. In the dataset
+table, its name includes `waterline conic` and its history identifies the exact
+relabel.
+
 ## Polarization transformation
+
+For acquisitions with multiple measured tilts, conversion uses the following
+coherent polarization transformation.
 
 The range V/H basis in the source body frame is obtained by transforming fixed
 world vertical and horizontal vectors:
@@ -55,17 +89,24 @@ query. It never interpolates dB values or wrapped phase.
 
 ## Data requirements and limitations
 
-- A complete turntable revolution and at least two measured wedge tilts are
-  required.
-- A single fixed wedge tilt is a curved, pinched path on the body sphere. It
-  cannot determine a constant-elevation normal azimuth cut.
-- Finite phase is required for every finite sample.
-- VV and HH plus at least one of VH/HV are required. For monostatic reciprocal
+- A complete turntable revolution is required at every measured tilt.
+- Except for the waterline-only case above, at least two measured wedge tilts
+  must be present in one dataset. Join separate tilt datasets before converting;
+  selecting multiple datasets converts each independently.
+- A single nonzero fixed tilt traces a great circle, not a constant-elevation
+  conic azimuth cut. It cannot determine a complete conic grid.
+- For tilted data, meaningful finite phase is required for every finite sample.
+  VV and HH plus at least one of VH/HV are required. For monostatic reciprocal
   data, one measured cross-pol supplies the other. Co-pol-only conversion is
   permitted only when the user explicitly assumes missing cross-pol is zero.
+  These phase and polarization requirements do not apply to the exact
+  waterline-only relabel.
 - The wedge acquisition cannot cover every normal conic look. In particular,
   nonzero-elevation side aspects require wedge pitch approaching +/-90 degrees.
   Unsupported output cells remain `NaN`; there is no extrapolation.
+  For a typical -20 to +20 degree pitch sweep, all measured great circles cross
+  waterline at side aspect, so nonzero-elevation conic cuts have gaps near the
+  sides even when every tilt was measured over a complete revolution.
 - Selecting Wedge-to-Conic states the requested axis interpretation, and the
   converted dataset records that interpretation as an assumption. GRIM does
   not tag datasets with a coordinate system, so the user is responsible for

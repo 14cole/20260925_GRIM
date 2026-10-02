@@ -1258,7 +1258,7 @@ class AxisUnitsDialog(QDialog):
         }
 
 class WedgeConicDialog(QDialog):
-    """Confirm the physical conventions for a wedge-to-conic re-grid.
+    """Confirm the physical conventions for a wedge-to-conic conversion.
 
     Geometry: vertical-axis turntable (axis = world-z, fixed), target tilted
     by a foam wedge with ridge along body-y (pitch wedge). The current
@@ -1272,24 +1272,37 @@ class WedgeConicDialog(QDialog):
         self.setWindowTitle("Wedge → Conic")
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel(
-            "Input axes: azimuth = turntable angle φ, elevation = wedge tilt τ.\n"
-            "Output axes: normal-range conic azimuth/elevation. The converter "
-            "uses the full complex Jones matrix, rotates V/H, and leaves "
-            "unsupported normal-range looks as NaN.\n\n"
-            "A single wedge tilt cannot produce a normal constant-elevation "
-            "azimuth sweep; two or more measured tilts are required."
-        ))
+        explanation = QLabel(
+            "Input axes: azimuth = signed mechanical turntable angle φ, "
+            "elevation = vehicle pitch tilt τ. Each tilt needs a full 360° "
+            "turntable revolution. Output axes are conic azimuth/elevation.\n\n"
+            "Waterline only (exactly 0° tilt): conic azimuth = −φ, wrapped and "
+            "sorted. Samples and available polarizations are preserved, "
+            "without interpolation or polarization rotation. Phase is optional.\n\n"
+            "Tilted cuts: join at least two measured tilts into one dataset "
+            "first. Selecting several datasets converts each independently. "
+            "Conversion interpolates complex data and rotates V/H, requiring "
+            "meaningful phase and VV/HH plus VH or HV, unless missing cross-pol "
+            "is explicitly assumed zero.\n\n"
+            "Each fixed tilt traces a great circle. Limited tilt ranges leave "
+            "gaps in nonzero-elevation conic cuts near side aspect. Unsupported "
+            "directions remain blank (NaN); no extrapolation fills them."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        self.setMinimumWidth(540)
 
         axes_note = QLabel(
-            "Choosing this operation treats azimuth as rotation about fixed world "
-            "+z and elevation as article pitch about body +y. That assumption is "
-            "stored with the converted dataset."
+            "Assumed setup: horizontal radar line of sight along world +x, "
+            "a vertical pylon, positive turntable rotation about world +z, "
+            "and vehicle pitch about body +y before turntable rotation. "
+            "Turntable angles must follow this sign convention. These "
+            "assumptions are stored with the converted dataset."
         )
         axes_note.setWordWrap(True)
         layout.addWidget(axes_note)
         self._chk_cross_zero = QCheckBox(
-            "Assume missing VH/HV is exactly zero (only use when justified)."
+            "Tilted cuts only: assume missing VH/HV is exactly zero (when justified)."
         )
         layout.addWidget(self._chk_cross_zero)
 

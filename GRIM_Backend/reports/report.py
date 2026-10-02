@@ -1689,7 +1689,9 @@ def export_report_images(
                     units = {}
                     for axis, label in (('x', plot.x_label), ('y', plot.y_label)):
                         match = re.search(r'\(([^()]*)\)\s*$', label)
-                        units[axis] = match.group(1) if match else None
+                        units[axis] = match.group(1) if match else (
+                            "Mixed dB" if label == "Mixed dB" else None
+                        )
                     plot_record: dict[str, Any] = {
                         'plot_number': plot_index + 1, 'slot_number': placement.slot_index + 1,
                         'file': name, 'relative_path': (Path(folder) / name).as_posix(),

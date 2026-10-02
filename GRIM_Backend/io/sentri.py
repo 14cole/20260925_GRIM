@@ -17,8 +17,9 @@ class SentriFormatMixin:
         Supported header families:
 
         * compact ``freq_MHz`` / ``theta_deg`` / ``rcs_pp_dBsm`` columns;
-        * descriptive ``Frequency`` / ``Theta`` /
-          ``RCSPhiScat_PhiInc`` columns.
+        * descriptive ``Frequency`` / ``Theta`` columns with either
+          ``Scat-Inc`` RCS and legacy phase labels or explicit ``Inc-Scat``
+          labels for both RCS and phase.
 
         SENTRi's reported polar ``Theta`` is stored unchanged so importing a
         file never silently changes its geometry.  The explicit
@@ -65,6 +66,16 @@ class SentriFormatMixin:
             "phasephitheta": "phase_hv",
             "rcsthetascatphiinc": "rcs_vh",
             "phasethetaphi": "phase_vh",
+            # Newer exports name the incident component first. GRIM keeps
+            # scattered/received polarization first (HV = PhiScat/ThetaInc).
+            "rcsphiincphiscat": "rcs_hh",
+            "phasephiincphiscat": "phase_hh",
+            "rcsthetaincthetascat": "rcs_vv",
+            "phasethetaincthetascat": "phase_vv",
+            "rcsthetaincphiscat": "rcs_hv",
+            "phasethetaincphiscat": "phase_hv",
+            "rcsphiincthetascat": "rcs_vh",
+            "phasephiincthetascat": "phase_vh",
         }
         required = {
             "frequency", "theta", "phi",
@@ -101,7 +112,7 @@ class SentriFormatMixin:
                 "Could not find a complete SENTRi RCS header. Expected either "
                 "freq_MHz/theta_deg/phi_deg with pp/tt/pt/tp magnitude and "
                 "phase columns, or Frequency/Theta/Phi with the four "
-                "Scat/Inc magnitude and phase pairs."
+                "Scat/Inc or Inc/Scat magnitude and phase pairs."
             )
 
         def _canonical_sentri_unit(raw_value):
@@ -534,7 +545,9 @@ class SentriFormatMixin:
                 for token in tokens
             )
             descriptive_family = {"frequency", "theta", "phi"}.issubset(tokens) and any(
-                token.startswith(("rcsphiscat", "rcsthetascat"))
+                token.startswith((
+                    "rcsphiscat", "rcsthetascat", "rcsphiinc", "rcsthetainc",
+                ))
                 for token in tokens
             )
             if compact_family or descriptive_family:

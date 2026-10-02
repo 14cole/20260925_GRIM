@@ -231,28 +231,21 @@ class PbpBandTests(_WindowCase):
         controls.spin_pbp_high.setValue(20.0)
         self.assertLess(controls.spin_pbp_low.value(), controls.spin_pbp_high.value())
 
-    def test_groups_draw_one_coloured_band_each_and_remove_separately(self):
+    def test_selected_datasets_draw_one_band_and_remove_together(self):
         window = self.window
-        window.table.item(0, 3).setText("Baseline")
-        window.table.item(1, 3).setText("Baseline")
-        window.table.item(2, 3).setText("Treated")
         window.btn_pbp.setChecked(True)
         self.plot("_plot_azimuth_rect")
-        baseline, baseline_edges = self.band("Baseline")
-        treated, treated_edges = self.band("Treated")
-        self.assertTrue(baseline and treated)
-        np.testing.assert_allclose(baseline_edges[1].get_ydata(), self.dbsm(POWER_SHAPE * 4))
-        np.testing.assert_allclose(treated_edges[0].get_ydata(), self.dbsm(POWER_SHAPE * 9))
+        artists, edges = self.band()
+        self.assertTrue(artists)
+        np.testing.assert_allclose(edges[0].get_ydata(), self.dbsm(POWER_SHAPE))
+        np.testing.assert_allclose(edges[1].get_ydata(), self.dbsm(POWER_SHAPE * 9))
         self.assertEqual(
             self.legend_labels(),
-            ["PBP [Baseline] Pol HH, Freq 9 GHz, Elevation 0 deg",
-             "PBP [Treated] Pol HH, Freq 9 GHz, Elevation 0 deg"],
+            ["PBP Pol HH, Freq 9 GHz, Elevation 0 deg"],
         )
-        self.assertNotEqual(baseline_edges[0].get_color(), treated_edges[0].get_color())
-        self.assertTrue(window._remove_plot_dataset(pbp_band_key("Baseline")))
-        self.assertEqual(self.band("Baseline")[0], [])
-        self.assertTrue(self.band("Treated")[0])
-        self.assertEqual(len(self.legend_labels()), 1)
+        self.assertTrue(window._remove_plot_dataset(pbp_band_key()))
+        self.assertEqual(self.band()[0], [])
+        self.assertEqual(self.legend_labels(), [])
 
 
 class DeltaReferenceTests(_WindowCase):

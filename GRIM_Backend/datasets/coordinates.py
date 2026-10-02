@@ -236,16 +236,19 @@ class GridCoordinatesMixin:
     ):
         """Convert a vertical-turntable/body-wedge acquisition to conic V/H.
 
-        This produces the normal-range grid for a pylon/article assembly that
-        is tilted together and then rotated.  Direction queries are inverse-
-        mapped into the measured ``(turntable phi, body wedge tau)`` grid,
+        This produces a body-relative conic azimuth/elevation grid. Direction
+        queries are inverse-mapped into the measured
+        ``(turntable phi, body wedge tau)`` grid,
         interpolated as a full complex Jones matrix, and congruence-rotated
         into the conic spherical V/H basis. Unsupported parts of the normal
         conic grid remain NaN; they are never extrapolated.
 
-        A single wedge tilt is only a curved one-dimensional cut and cannot
-        determine a constant-elevation normal azimuth cut, so at least two
-        measured wedge tilts and a complete turntable revolution are required.
+        A single nonzero wedge tilt traces a great circle and cannot determine
+        a constant-elevation normal azimuth cut, so at least two measured
+        tilts are needed for regridding. A zero-tilt-only sweep is already the
+        waterline conic cut: only its mechanical azimuth convention is changed,
+        preserving all samples without needing phase or additional channels.
+        Both paths require a complete turntable revolution.
         """
         from GRIM_Backend.datasets.grid import RcsGrid
 
@@ -266,14 +269,17 @@ class GridCoordinatesMixin:
             raise ValueError(
                 "Wedge-to-Conic requires at least four finite turntable angles"
             )
-        if tau.size < 2 or not np.all(np.isfinite(tau)):
+        if tau.size == 0 or not np.all(np.isfinite(tau)):
+            raise ValueError("Wedge-to-Conic requires finite measured wedge tilts")
+        phi_deg = np.rad2deg(phi) if az_unit == "rad" else phi
+        tau_deg = np.rad2deg(tau) if el_unit == "rad" else tau
+        waterline_only = tau_deg.size == 1 and tau_deg[0] == 0.0
+        if tau.size == 1 and not waterline_only:
             raise ValueError(
-                "One fixed wedge tilt traces a curved cut and cannot be "
+                "One fixed wedge tilt away from waterline traces a great circle and cannot be "
                 "converted into a normal constant-elevation azimuth sweep. "
                 "Supply at least two measured wedge tilts."
             )
-        phi_deg = np.rad2deg(phi) if az_unit == "rad" else phi
-        tau_deg = np.rad2deg(tau) if el_unit == "rad" else tau
         if np.any(np.abs(tau_deg) >= 90.0 - 1.0e-9):
             raise ValueError(
                 "Wedge-to-Conic requires body wedge tilts strictly between "
@@ -300,6 +306,11 @@ class GridCoordinatesMixin:
             raise ValueError(
                 "Wedge-to-Conic normal-azimuth conversion requires a complete "
                 "turntable revolution without a large unmeasured angular gap"
+            )
+
+        if waterline_only:
+            return self._convert_wedge_waterline_to_conic(
+                phi_deg, az_unit=az_unit, attest_wedge_axes=attest_wedge_axes
             )
 
         tau_order = np.argsort(tau_deg, kind="stable")
@@ -391,6 +402,7 @@ class GridCoordinatesMixin:
                 "source_angular_coordinate_system": "wedge_turntable",
                 "wedge_coordinate_convention": WEDGE_TURNTABLE_CONVENTION,
                 "polarization_basis": CONIC_VH_BASIS_CONVENTION,
+                "wedge_to_conic_mode": "complex_regrid",
                 "wedge_to_conic_cross_pol_treatment": cross_note,
             }
         )
@@ -432,6 +444,86 @@ class GridCoordinatesMixin:
             history=history,
             units=converted_units,
             extra=converted_extra,
+        )
+
+    def _convert_wedge_waterline_to_conic(self, phi_deg, *, az_unit, attest_wedge_axes):
+        """Exactly relabel a validated zero-tilt sweep, including aligned data."""
+        from GRIM_Backend.datasets.grid import RcsGrid
+
+        longitude = np.mod(-phi_deg + 180.0, 360.0) - 180.0
+        longitude[np.abs(longitude) <= 1.0e-12] = 0.0
+        order = np.argsort(longitude, kind="stable")
+        longitude = longitude[order]
+        if az_unit == "rad":
+            longitude = np.deg2rad(longitude)
+
+        # At tau=0 the range and conic polarization bases coincide. Going
+        # through complex amplitudes would discard valid power-only samples.
+        power = np.take(self.rcs_power, order, axis=0)
+        phase = np.take(self.rcs_phase, order, axis=0)
+        original_shape = tuple(self.rcs_power.shape)
+        stale_grid_metadata = {
+            "solver_metadata_json",
+            "production_mesh_certification_json",
+            "source_body_mesh_certification_json",
+            "requested_radar_grid_json",
+            "assembly_angular_coordinate_contract",
+        }
+        extra = {}
+        for key, value in (self.extra or {}).items():
+            if key in stale_grid_metadata:
+                continue
+            array = np.asarray(value)
+            if array.ndim >= 4 and tuple(array.shape[:4]) == original_shape:
+                extra[key] = np.take(array, order, axis=0)
+            else:
+                extra[key] = copy.deepcopy(value)
+        self._drop_malformed_raw_metadata(extra)
+        self._invalidate_assembly_sampling_hash(extra, "wedge-waterline-to-conic")
+
+        units = copy.deepcopy(self.units or {})
+        units["angular_coordinate_system"] = "conic"
+        units.pop("wedge_coordinate_convention", None)
+        if set(self.polarizations).issubset({"VV", "VH", "HV", "HH"}):
+            units["polarization_basis"] = CONIC_VH_BASIS_CONVENTION
+            extra["polarization_basis"] = CONIC_VH_BASIS_CONVENTION
+        extra.update({
+            "source_angular_coordinate_system": "wedge_turntable",
+            "wedge_coordinate_convention": WEDGE_TURNTABLE_CONVENTION,
+            "wedge_to_conic_mode": "waterline_relabel",
+            "wedge_to_conic_cross_pol_treatment": "not required: identity basis at waterline",
+            "wedge_axes_assumption_json": json.dumps(
+                {
+                    "schema": "grim.wedge-axes-assumption.v1",
+                    "operation_requested": True,
+                    "source_coordinate_declaration_missing": True,
+                    "assumed_axes": WEDGE_TURNTABLE_CONVENTION,
+                    "legacy_user_attested": bool(attest_wedge_axes),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        })
+        history_entry = (
+            "Wedge->Conic exact waterline relabel: azimuth=-turntable angle "
+            "wrapped to [-180,180) deg; elevation=0; stable-sorted sample arrays; "
+            "no interpolation or polarization rotation; phase unchanged; "
+            "source axes assumed from requested operation"
+        )
+        history = f"{self.history}\n{history_entry}" if self.history else history_entry
+        return RcsGrid(
+            longitude,
+            np.array(self.elevations, copy=True),
+            np.array(self.frequencies, copy=True),
+            np.array(self.polarizations, copy=True),
+            rcs_power=power,
+            rcs_phase=phase,
+            rcs_domain=self.rcs_domain,
+            source_path=self.source_path,
+            history=history,
+            units=units,
+            extra=extra,
+            _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
         )
 
     def convert_sentri_elevation_to_grim(self):

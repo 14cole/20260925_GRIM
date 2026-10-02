@@ -546,7 +546,12 @@ class UnifiedGuiShellTest(unittest.TestCase):
         )
         documented_order = "**" + " | ".join(labels) + "**"
         repository_root = Path(__file__).resolve().parents[2]
-        for readme in (repository_root / "README.md", Path(__file__).resolve().parents[1] / "docs" / "README.md"):
+        readmes = [Path(__file__).resolve().parents[1] / "docs" / "README.md"]
+        # Packaged workspaces keep the application guide under backend/docs;
+        # source checkouts may also provide a top-level overview.
+        if (repository_root / "README.md").is_file():
+            readmes.append(repository_root / "README.md")
+        for readme in readmes:
             documented_text = " ".join(
                 readme.read_text(encoding="utf-8").split()
             )
@@ -590,7 +595,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
         left_tabs = self.window.assembly_workspace.left_tabs
         self.assertEqual(
             [left_tabs.tabText(index) for index in range(left_tabs.count())],
-            ["Body", "Point Features", "Line Features", "Review"],
+            ["Body", "Points", "Line features", "Build", "Wing Sections"],
         )
         self.assertIs(
             left_tabs.currentWidget(),
@@ -1899,6 +1904,29 @@ class UnifiedGuiShellTest(unittest.TestCase):
         )
         np.testing.assert_array_equal(duplicate.extra["test_array"], [1.0, 2.0])
         self.assertIsNot(duplicate.extra["test_array"], dataset.extra["test_array"])
+
+    def test_wedge_button_converts_power_only_waterline_and_reports_exact_relabel(self):
+        dataset = RcsGrid(
+            [0.0, 90.0, 180.0, 270.0], [0.0], [10.0], ["HH"],
+            rcs_power=np.asarray([1.0, 2.0, 3.0, 4.0]).reshape(4, 1, 1, 1),
+            units={"azimuth": "deg", "elevation": "deg", "frequency": "GHz"},
+        )
+        start_row = self.window.table.rowCount()
+        with mock.patch.object(
+            self.window, "_selected_datasets_ordered", return_value=[("Waterline", dataset)]
+        ), mock.patch.object(WedgeConicDialog, "exec", return_value=QDialog.Accepted):
+            self.window._convert_wedge_to_conic_selected()
+            self._wait_for_background()
+        self.assertEqual(self.window.table.rowCount(), start_row + 1)
+        item = self.window.table.item(start_row, 0)
+        self.assertIn("waterline conic", item.text())
+        result = item.data(Qt.UserRole)
+        np.testing.assert_array_equal(result.azimuths, [-180.0, -90.0, 0.0, 90.0])
+        np.testing.assert_array_equal(result.rcs_power[:, 0, 0, 0], [3.0, 2.0, 1.0, 4.0])
+        self.assertTrue(np.all(np.isnan(result.rcs_phase)))
+        self.assertIn("exact waterline azimuth relabel", result.history)
+        self.assertNotIn("inverse-mapped complex Jones", result.history)
+        self.assertIn("created 1 dataset", self.window.status.currentMessage())
 
     def test_wedge_dialog_records_axis_assumption_and_only_offers_regrid(self):
         dialog = WedgeConicDialog()

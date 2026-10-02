@@ -29,7 +29,7 @@ def render(self) -> None:
     if elev_values.size == 0:
         self.status.showMessage("Select one or more elevations to plot.")
         return
-    polarization = self._single_selection_value(self.list_pol, "polarization")
+    polarization = self._overlay_polarizations()
     if polarization is None:
         return
 
@@ -67,14 +67,17 @@ def render(self) -> None:
             if not np.any(np.isfinite(display)):
                 continue
             if bands is not None:
-                bands.update(dataset, display)
+                bands.update(dataset, display, polarization=(
+                    dataset.polarizations[selection[3][0]]
+                ))
                 rendered += 1
             elif rendered < common.MAX_LINE_SERIES:
                 theta = common.convert_axis_values(
                     x_values, "azimuth", angular_unit, "rad"
                 )
                 self._plot_bounded_line(self.plot_ax, theta, display, label=label,
-                                        dataset=dataset, trace_key=trace_key)
+                                        dataset=dataset, trace_key=trace_key,
+                                        polarization=dataset.polarizations[selection[3][0]])
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += candidates - candidate_index - 1
@@ -94,8 +97,9 @@ def render(self) -> None:
             if elev_values.size > 1
             else f"{elev_values[0]:g} {elev_unit}"
         )
+        pol_label = f"Pol {polarization[0]}, " if len(polarization) == 1 else ""
         bands.draw(
-            az_values, f"Pol {polarization}, Freq {freq_label}, {elev_name} {elev_label}",
+            az_values, f"{pol_label}Freq {freq_label}, {elev_name} {elev_label}",
             polar=True,
             to_plot_x=lambda x: common.convert_axis_values(x, "azimuth", angular_unit, "rad"),
         )

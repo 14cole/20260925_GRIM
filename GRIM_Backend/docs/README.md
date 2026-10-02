@@ -141,6 +141,20 @@ legend and remain in effect when replotting or using Hold during the session.
 Each dataset has its own style, so lines and scatters can share a plot. Pan and
 Zoom Box retain their mouse controls while enabled.
 
+Switching the active dataset preserves available frequency, elevation,
+azimuth, and polarization selections, including equivalent Hz/GHz and
+degree/radian values. Selected spans adapt to the new dataset's spacing;
+individual cuts match their actual values. If a cut is unavailable, GRIM
+uses the available selection or defaults and reports the adjustment.
+
+Ordinary azimuth, frequency, and elevation overlays draw each dataset at its
+own sampled coordinates within the selected spans. Disconnected selections
+remain separate selections; no interpolation or nearest-cut substitution is
+performed. Point-by-point bands and difference calculations still use aligned
+samples. Select several polarizations to draw separate labeled curves in
+azimuth, frequency, elevation, CDF, or Sector Stats plots. Standard HH/VV/HV/VH
+channels have distinct line styles, and PBP keeps separate polarization bands.
+
 The current row is the active dataset: its parameter lists and axis units are
 the display reference. Other selected datasets may use compatible Hz/kHz/MHz/
 GHz or degree/radian storage; GRIM converts selections and labels without
@@ -148,9 +162,15 @@ changing their files. Every file loads with plain azimuth/elevation axes,
 whatever its format; GRIM does not classify datasets as conic, great-circle,
 or any other angular coordinate system and does not block overlays on that
 basis. Make sure the datasets you plot together share a coordinate system.
-Different physical quantities (`sigma_3d`, `sigma_2d`, or ratio) and different
-logarithmic conventions still cannot be overlaid as though they were the same
-ordinate.
+Logarithmic plots can overlay dBsm, dBke, and dB data, including curves added
+with **Hold**. Each curve keeps its native numeric levels; mixed plots label
+the level axis **Mixed dB** and identify each curve's unit in the legend.
+Removing curves updates these labels to reflect the remaining data. CDFs use
+**Mixed dB** on their level (horizontal) axis, sector tables identify each
+row's unit, and waterfall panels identify their native units. This display
+does not convert between 2-D width and 3-D RCS. Linear overlays, RF Compare,
+**Δ Ref**, and Delta Map still require compatible physical quantities;
+logarithmic comparisons also require the same dB convention.
 
 RF Compare uses one explicit selected azimuth, elevation, or
 frequency sector per dataset and matches coordinates one-to-one. Its 0–100 RF
@@ -167,12 +187,16 @@ weakest sub-sector, with wrap-safe calculations at the ±180° seam. A phase
 comparison with undeclared phase-center/time/basis metadata remains viewable
 for legacy data, but the status message states the physical assumption.
 
-For azimuth RF Compare, a compact row above the plot sets the Min and Max
+For azimuth RF Compare, a compact row above the plot sets the Start and End
 azimuth statistics bounds. The bounds initialize to the actual minimum and
 maximum selected in the Azimuth parameter list. **Show all azimuths** defaults
 off, so the plot initially shows only that sector. Turning it on displays the
 complete common azimuth sweep for both datasets and the residual, but every
-reported statistic remains restricted to the entered Min/Max sector.
+reported statistic remains restricted to the entered Start/End sector.
+An end below the start wraps across the angular seam: 170° to −170° and
+350° to 10° each select a 20° sector. The sector-only view uses a continuous
+angle axis across the seam; Show all azimuths highlights both pieces. Statistics
+follow the sector order and count a duplicated revolution endpoint once.
 The yellow region marks that entered statistics range only when it is narrower
 than the full common azimuth span; a full-span comparison has no highlight.
 
@@ -730,8 +754,11 @@ HH plots in the same report instead of requiring a second export:
 
 Selected datasets are overlaid within each plot. GRIM uses exact common fixed
 axes and performs no hidden interpolation or extrapolation. Report magnitude
-is taken from stored linear RCS power and converted with the dataset's dBsm or
-dBke convention. **Shared automatic** vertical scaling is the default and is
+is taken from stored linear power and converted with each dataset's native
+dBsm, dBke, or dB convention. Mixed report overlays label the axis **Mixed dB**
+and show each source's unit in both plot and slide-header legends. A report
+containing only 2-D data uses **Scattering Width (dBke)**.
+**Shared automatic** vertical scaling is the default and is
 calculated once across the complete report. Either axis can instead use one
 fixed minimum, maximum, and major-tick step across every plot. Horizontal
 settings are retained separately for azimuth degrees and frequency GHz, and
@@ -859,6 +886,9 @@ code. Use **Copy** or **Save As…** to run the same work headlessly. The record
 ignores selection gestures, tab changes, zoom/pan, and non-dataset tool
 workflows.
 
+Recorded ordinary line plots retain every selected polarization and each
+dataset's native sample spacing, including mixed dB overlays.
+
 Crop / Slice, Regrid, Stitch, and phase wrapping are replayed with explicit
 `crop_dataset`, `regrid_axis`, `stitch_datasets`, and `wrap_phase`/`RcsGrid`
 calls. Recorded crop ranges, explicit regrid coordinates, stitch operand order
@@ -906,9 +936,15 @@ applies the same rule. Other descending axes are accepted only when strictly
 monotonic and are reversed together with their sample matrix.
 
 `RcsGrid.read_SENTRi()` (also exposed as `GRIM_Backend.scripting.api.read_SENTRi()`) is the
-named CREATE-RF SENTRi entry point. It strictly recognizes the two schemas in
-the team's `READ_SENTRi.m`: compact MHz `pp/tt/pt/tp` columns and descriptive
-Hz `PhiScat/ThetaScat` columns. SENTRi is not treated as CST. Its mapping is
+named CREATE-RF SENTRi entry point. It recognizes compact MHz `pp/tt/pt/tp`
+columns and descriptive Hz columns from multiple SENTRi versions. Descriptive
+headers may use `Scat-Inc` RCS labels with legacy phases (for example,
+`RCS PhiScat-ThetaInc` and `Phase Phi-Theta`) or explicit `Inc-Scat` labels for
+both RCS and phase (for example, `RCS ThetaInc-PhiScat` and
+`Phase ThetaInc-PhiScat`). Both examples map to `HV`; the reciprocal pair maps
+to `VH`. Columns are matched by name, including when magnitudes and phases are
+grouped separately, and header spacing, case, hyphens, and underscores are
+normalized. SENTRi is not treated as CST. Its mapping is
 native `elevation=Theta`, and GRIM stores the reported coherent phase with its
 original sign. Phi sweeps contained within 0°–180° retain the positive 180°
 endpoint, so a 0°–180° import stays in that order in the GUI. Other sweeps use
