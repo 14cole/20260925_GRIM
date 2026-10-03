@@ -94,7 +94,7 @@ class DenseFactor:
         self.mixed = None
         self.hierarchical = None
         if rcs._SCIPY_LINALG is not None:
-            from ghost_backend.linalg.residual_spool import ResidualSpool, selected
+            from ghost_backend.linalg.residual_spool import ResidualSpool, selected, require_copy_capacity, copy_for_lu
             use_spool = (self._residual_spool is None and requested_precision() == 'double'
                          and selected(self.a, self._owned_matrix, self.factor_mode))
             if use_spool:
@@ -105,8 +105,11 @@ class DenseFactor:
                 try:
                     spool = ResidualSpool(self.a, temporary_directory(), self.checkpoint)
                 except OSError:
+                    # An automatic disk choice was made because the copy did
+                    # not fit. Disk failure must not bypass RAM admission.
                     if option('dense_residual_storage','auto') == 'disk':
                         raise
+                    require_copy_capacity(self.a.nbytes)
                 else:
                     original = self.a
                     try:
@@ -123,8 +126,9 @@ class DenseFactor:
                         original_matrix_buffer_bytes=spool.buffer_bytes)
                     self.event['factorizations'] += 1
                     return
+            lu_buffer = copy_for_lu(self.a)
             self.lu, self.piv = timed_stage('factorization')(rcs._SCIPY_LINALG.lu_factor)(
-                self.a, check_finite=False)
+                lu_buffer, overwrite_a=True, check_finite=False)
             self.event['factorizations'] += 1
 
     def _condition(self):

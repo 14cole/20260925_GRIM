@@ -23,7 +23,7 @@ block size, frequency and refinement).
 * larger admissible blocks are built by adaptive cross approximation of that
   stack: a pivot row is one tile of a node's two test elements against the
   block's sources and yields the row for every family and mode, a pivot
-  column likewise; one random unused row checks the result;
+  column likewise; spread and random unused rows check the result;
 * each family and mode slice of a block is then truncated to its own rank
   (at most 10 on the 10 GHz ogive, three on average, against a joint rank of
   about 16) and kept as two factors; EFIE blocks are built for the upper
@@ -277,9 +277,10 @@ def _cross(tiles, family, I, J, weights, tolerance, rng, max_rank=None):
 
     The stack is ``[p, 4 * modes * s]`` (slice ``(uv, m)`` scaled by
     ``weights[m]``).  Returns ``(U [p, r], V [r, 4 * modes * s])`` or None
-    when the rank reaches ``max_rank``.  After the usual stopping test (the
-    last cross below the tolerance) one random unused row is checked against
-    the approximation; a miss becomes the next pivot.
+    when the rank reaches ``max_rank``. After the usual stopping test, spread
+    and random unused rows check the approximation; a miss becomes the next
+    pivot. These probes strengthen detection of localized errors, but are not
+    a deterministic full-block error certificate.
     """
     max_rank = FAR_COMPRESSION_MAX_RANK if max_rank is None else int(max_rank)
     p, s = I[1] - I[0], J[1] - J[0]
@@ -303,7 +304,6 @@ def _cross(tiles, family, I, J, weights, tolerance, rng, max_rank=None):
         return columns[b]
 
     pivot = p // 2
-    checked = False
     while True:
         residual = row(pivot) - U[pivot, :rank] @ V[:rank]
         c = int(np.argmax(np.abs(residual)))
@@ -319,16 +319,26 @@ def _cross(tiles, family, I, J, weights, tolerance, rng, max_rank=None):
             converged = np.linalg.norm(u) * np.linalg.norm(residual) <= tolerance
         if converged:
             unseen = np.flatnonzero(~seen)
-            if checked or not unseen.size:
+            if not unseen.size:
                 break
-            # A posteriori check: one random unused row, scaled to the block.
-            checked = True
-            pivot = int(rng.choice(unseen))
-            probe = row(pivot) - U[pivot, :rank] @ V[:rank]
-            if np.linalg.norm(probe) * math.sqrt(p) <= tolerance:
+            # Cover both edges and the interior before independent random
+            # probes. A single random row can miss localized residuals.
+            spread = np.unique(np.linspace(0, p - 1, 5, dtype=int))
+            spread = spread[~seen[spread]]
+            remaining = np.setdiff1d(unseen, spread, assume_unique=True)
+            random = rng.choice(remaining, min(3, len(remaining)), replace=False)
+            failed = None
+            for candidate in np.r_[spread, random]:
+                candidate = int(candidate)
+                # Verification must not mark a row as a completed ACA pivot.
+                probe = row(candidate) - U[candidate, :rank] @ V[:rank]
+                seen[candidate] = False
+                if np.linalg.norm(probe) * math.sqrt(p) > tolerance:
+                    failed = candidate
+                    break
+            if failed is None:
                 break
-            checked = False
-            seen[pivot] = False     # sampled again as the next pivot
+            pivot = failed
             continue
         scores = np.abs(U[:, rank - 1])
         scores[seen] = -1.0

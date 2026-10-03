@@ -1,0 +1,721 @@
+{
+  "scope": "Measured GHOST backend updates on 2026-10-02. Research prototypes are not production implementations.",
+  "implemented_defaults": [
+    "CPU/RAM-admitted desktop frequency scheduling and checkpoint recovery",
+    "Run-owned compressed assembly workers with phase memory accounting",
+    "Verified admission tile reuse and completed-partner storage measurement",
+    "Stage work costs and conservative nearby timing calibration",
+    "Arithmetic-preserving native fixed-width far quadrature loops",
+    "Wider verified low-rank tile proposals with projected rank trimming",
+    "Exact same-operator regional index-map reuse and redundant map removal"
+  ],
+  "experimental_defaults_off": [
+    "compressed_far_method=verified_cur",
+    "frequency_preconditioner=reuse"
+  ],
+  "cross_frequency_mesh_reuse": false,
+  "accuracy_thresholds_relaxed": false,
+  "latest_airfoil_certified_benchmarks": [
+    {
+      "frequency_ghz": 3,
+      "status": "completed",
+      "angles": 181,
+      "cpu_threads": 4,
+      "ram_budget_gib": 12.0,
+      "before_seconds": [
+        15.379103999999643,
+        15.243171000001894
+      ],
+      "after_seconds": [
+        15.220119099998556,
+        15.194586300000083
+      ],
+      "before_median_seconds": 15.311137500000768,
+      "after_median_seconds": 15.20735269999932,
+      "time_reduction_percent": 0.6778385995256375,
+      "accuracy": {
+        "VV": {
+          "max_change_over_peak": 0.0,
+          "relative_l2": 0.0,
+          "max_absolute_change": 0.0
+        },
+        "HH": {
+          "max_change_over_peak": 0.0,
+          "relative_l2": 0.0,
+          "max_absolute_change": 0.0
+        }
+      },
+      "all_certified": true,
+      "stages": {
+        "compressed_assembly": {
+          "before_seconds": 0.0,
+          "after_seconds": 0.0,
+          "reduction_percent": null
+        },
+        "factorization": {
+          "before_seconds": 6.080544450000161,
+          "after_seconds": 5.958616799998708,
+          "reduction_percent": 2.005209418400844
+        },
+        "rhs_compression": {
+          "before_seconds": 1.282850249997864,
+          "after_seconds": 1.2866310500030522,
+          "reduction_percent": -0.29471873316426755
+        },
+        "compressed_memory_sampling": {
+          "before_seconds": 0.0,
+          "after_seconds": 0.0,
+          "reduction_percent": null
+        }
+      },
+      "memory": {
+        "peak_summed_working_set_bytes": {
+          "before": 2024939520.0,
+          "after": 2019915776.0,
+          "reduction_percent": 0.24809353318364646
+        },
+        "peak_private_committed_bytes": {
+          "before": 2259040256.0,
+          "after": 2243780608.0,
+          "reduction_percent": 0.675492522077481
+        },
+        "caveat": "50ms requested sampling interval. Summed working sets can double-count shared pages; private bytes are committed memory, not resident RAM."
+      }
+    },
+    {
+      "frequency_ghz": 10,
+      "status": "completed",
+      "angles": 181,
+      "cpu_threads": 4,
+      "ram_budget_gib": 12.0,
+      "before_seconds": [
+        92.54007219999767,
+        91.70682600000146
+      ],
+      "after_seconds": [
+        79.15739580000081,
+        79.5726580000046
+      ],
+      "before_median_seconds": 92.12344909999956,
+      "after_median_seconds": 79.3650269000027,
+      "time_reduction_percent": 13.849266744396049,
+      "accuracy": {
+        "VV": {
+          "max_change_over_peak": 1.2050386373983804e-13,
+          "relative_l2": 1.4146748740791773e-13,
+          "max_absolute_change": 5.574090256225652e-12
+        },
+        "HH": {
+          "max_change_over_peak": 3.943980711438764e-14,
+          "relative_l2": 4.899114930281665e-14,
+          "max_absolute_change": 1.7839717465460834e-12
+        }
+      },
+      "all_certified": true,
+      "stages": {
+        "compressed_assembly": {
+          "before_seconds": 55.87094364999939,
+          "after_seconds": 43.122920750003686,
+          "reduction_percent": 22.81690994849671
+        },
+        "factorization": {
+          "before_seconds": 16.889616249998653,
+          "after_seconds": 17.246387149996735,
+          "reduction_percent": -2.1123683020217277
+        },
+        "rhs_compression": {
+          "before_seconds": 7.000460100003693,
+          "after_seconds": 7.0087588999958825,
+          "reduction_percent": -0.11854649371096926
+        },
+        "compressed_memory_sampling": {
+          "before_seconds": 2.125862800003233,
+          "after_seconds": 1.8316498000021966,
+          "reduction_percent": 13.839698403894607
+        }
+      },
+      "memory": {
+        "peak_summed_working_set_bytes": {
+          "before": 2480130048.0,
+          "after": 2444085248.0,
+          "reduction_percent": 1.4533431433995547
+        },
+        "peak_private_committed_bytes": {
+          "before": 2982242304.0,
+          "after": 2942441472.0,
+          "reduction_percent": 1.3345941725330768
+        },
+        "caveat": "50ms requested sampling interval. Summed working sets can double-count shared pages; private bytes are committed memory, not resident RAM."
+      }
+    },
+    {
+      "frequency_ghz": 18,
+      "status": "completed",
+      "angles": 181,
+      "cpu_threads": 4,
+      "ram_budget_gib": 12.0,
+      "before_seconds": [
+        236.7529343999995
+      ],
+      "after_seconds": [
+        196.12254470000335
+      ],
+      "before_median_seconds": 236.7529343999995,
+      "after_median_seconds": 196.12254470000335,
+      "time_reduction_percent": 17.16151472545222,
+      "accuracy": {
+        "VV": {
+          "max_change_over_peak": 1.1911749775997602e-13,
+          "relative_l2": 1.4578238339589303e-13,
+          "max_absolute_change": 7.984353955469842e-12
+        },
+        "HH": {
+          "max_change_over_peak": 6.026097731330149e-14,
+          "relative_l2": 8.696352514648798e-14,
+          "max_absolute_change": 3.942091448443681e-12
+        }
+      },
+      "all_certified": true,
+      "stages": {
+        "compressed_assembly": {
+          "before_seconds": 139.74933689999307,
+          "after_seconds": 99.15742250000767,
+          "reduction_percent": 29.046230415414165
+        },
+        "factorization": {
+          "before_seconds": 45.03030929999659,
+          "after_seconds": 46.8441410000014,
+          "reduction_percent": -4.028024075786107
+        },
+        "rhs_compression": {
+          "before_seconds": 20.081132100000104,
+          "after_seconds": 20.379846799987718,
+          "reduction_percent": -1.4875391412200845
+        },
+        "compressed_memory_sampling": {
+          "before_seconds": 2.5188241000068956,
+          "after_seconds": 2.237679100006062,
+          "reduction_percent": 11.16175599558794
+        }
+      },
+      "memory": {
+        "peak_summed_working_set_bytes": {
+          "before": 4536778752,
+          "after": 4469137408,
+          "reduction_percent": 1.4909553164826672
+        },
+        "peak_private_committed_bytes": {
+          "before": 5021794304,
+          "after": 4954275840,
+          "reduction_percent": 1.3445087534991185
+        },
+        "caveat": "50ms requested sampling interval. Summed working sets can double-count shared pages; private bytes are committed memory, not resident RAM."
+      }
+    }
+  ],
+  "earlier_frequency_scheduling_benchmark": {
+    "frequencies_ghz": [
+      1.0,
+      1.5,
+      2.0,
+      2.5,
+      3.0
+    ],
+    "angles": 181,
+    "certified": true,
+    "total_cpu_budget": 4,
+    "memory_budget_gib": 12.0,
+    "timings": {
+      "1": [
+        40.85858249999728,
+        40.671180400000594
+      ],
+      "2": [
+        32.895109899996896,
+        32.79560099999799
+      ]
+    },
+    "mean_sequential_seconds": 40.76488144999894,
+    "mean_parallel_seconds": 32.84535544999744,
+    "time_reduction_fraction": 0.1942732498735551,
+    "maximum_normalized_complex_field_change": 4.91643259080574e-13,
+    "maximum_reserved_gib": 5.948961436748505
+  },
+  "subtraction": {
+    "configuration": {
+      "frequencies_ghz": [
+        3.0,
+        10.0,
+        15.0
+      ],
+      "angles": 181,
+      "angle_range_deg": [
+        0.0,
+        360.0
+      ],
+      "angle_step_deg": 2.0,
+      "polarizations": [
+        "VV",
+        "HH"
+      ],
+      "assembly_threads": 2,
+      "blas_threads": 2,
+      "ram_budget_gib": 6.0,
+      "cross_frequency_mesh_reuse": false,
+      "subtraction": "complex amplitude OPN minus FRD"
+    },
+    "cases": [
+      {
+        "label": "generated_03.000GHz",
+        "frequency_ghz": 3.0,
+        "width_inches": 0.5,
+        "depth_inches": 1.0,
+        "channels": {
+          "VV": {
+            "relative_l2_percent": 0.011323814890035077,
+            "peak_normalized_max_percent": 0.011251087487859269,
+            "peak_normalized_rms_percent": 0.006377391994886516,
+            "feature_peak_amplitude": 6.132540444527498,
+            "active_region": {
+              "floor_relative_to_reference_peak": 0.03,
+              "floor_db": -30.45757490560675,
+              "included_angles": 114,
+              "excluded_angles": 67,
+              "amplitude_rms_db": 0.0006165245786258054,
+              "amplitude_max_abs_db": 0.0009363823518067619,
+              "phase_rms_deg": 0.004905898774216025,
+              "phase_max_abs_deg": 0.00591034825301185
+            },
+            "whole_geometry_peak_normalized_max_percent": {
+              "FRD": 1.7660462624700254e-05,
+              "OPN": 0.0007060066269719026
+            }
+          },
+          "HH": {
+            "relative_l2_percent": 0.0643686044683434,
+            "peak_normalized_max_percent": 0.06514834987019102,
+            "peak_normalized_rms_percent": 0.02759930536670745,
+            "feature_peak_amplitude": 0.42987602906746697,
+            "active_region": {
+              "floor_relative_to_reference_peak": 0.03,
+              "floor_db": -30.45757490560675,
+              "included_angles": 79,
+              "excluded_angles": 102,
+              "amplitude_rms_db": 0.005445845504040677,
+              "amplitude_max_abs_db": 0.005658088875310587,
+              "phase_rms_deg": 0.002105543822652799,
+              "phase_max_abs_deg": 0.004375466554571275
+            },
+            "whole_geometry_peak_normalized_max_percent": {
+              "FRD": 8.040530843978625e-07,
+              "OPN": 0.0002760106812352337
+            }
+          }
+        }
+      },
+      {
+        "label": "generated_10.000GHz",
+        "frequency_ghz": 10.0,
+        "width_inches": 0.5,
+        "depth_inches": 1.0,
+        "channels": {
+          "VV": {
+            "relative_l2_percent": 0.0012333234521107411,
+            "peak_normalized_max_percent": 0.0013343780247677965,
+            "peak_normalized_rms_percent": 0.000536758866359325,
+            "feature_peak_amplitude": 8.085365122731316,
+            "active_region": {
+              "floor_relative_to_reference_peak": 0.03,
+              "floor_db": -30.45757490560675,
+              "included_angles": 102,
+              "excluded_angles": 79,
+              "amplitude_rms_db": 0.00011742797111969751,
+              "amplitude_max_abs_db": 0.00025638030864062733,
+              "phase_rms_deg": 0.0006461872283611311,
+              "phase_max_abs_deg": 0.001428775710242171
+            },
+            "whole_geometry_peak_normalized_max_percent": {
+              "FRD": 1.7068306220902415e-05,
+              "OPN": 0.00010847460589843077
+            }
+          },
+          "HH": {
+            "relative_l2_percent": 0.003403506915950618,
+            "peak_normalized_max_percent": 0.003665153074204896,
+            "peak_normalized_rms_percent": 0.0013544335166910616,
+            "feature_peak_amplitude": 7.733325399656403,
+            "active_region": {
+              "floor_relative_to_reference_peak": 0.03,
+              "floor_db": -30.45757490560675,
+              "included_angles": 75,
+              "excluded_angles": 106,
+              "amplitude_rms_db": 0.00020960486896502695,
+              "amplitude_max_abs_db": 0.00029217105464385723,
+              "phase_rms_deg": 0.0010086481762134809,
+              "phase_max_abs_deg": 0.0013203747556838092
+            },
+            "whole_geometry_peak_normalized_max_percent": {
+              "FRD": 6.685177584528127e-07,
+              "OPN": 0.0002628565827684902
+            }
+          }
+        }
+      },
+      {
+        "label": "generated_15.000GHz",
+        "frequency_ghz": 15.0,
+        "width_inches": 0.5,
+        "depth_inches": 1.0,
+        "channels": {
+          "VV": {
+            "relative_l2_percent": 0.0013317737860066054,
+            "peak_normalized_max_percent": 0.0010512632443178782,
+            "peak_normalized_rms_percent": 0.0005109503599580514,
+            "feature_peak_amplitude": 14.668822712802717,
+            "active_region": {
+              "floor_relative_to_reference_peak": 0.03,
+              "floor_db": -30.45757490560675,
+              "included_angles": 98,
+              "excluded_angles": 83,
+              "amplitude_rms_db": 4.9399078973139733e-05,
+              "amplitude_max_abs_db": 0.00012348930288209295,
+              "phase_rms_deg": 0.0012783736291695764,
+              "phase_max_abs_deg": 0.001869059982966252
+            },
+            "whole_geometry_peak_normalized_max_percent": {
+              "FRD": 1.3545773310580193e-05,
+              "OPN": 0.00015655182473511516
+            }
+          },
+          "HH": {
+            "relative_l2_percent": 0.0007717887092716425,
+            "peak_normalized_max_percent": 0.0006005335021568028,
+            "peak_normalized_rms_percent": 0.0002956180120486113,
+            "feature_peak_amplitude": 19.30391264102529,
+            "active_region": {
+              "floor_relative_to_reference_peak": 0.03,
+              "floor_db": -30.45757490560675,
+              "included_angles": 75,
+              "excluded_angles": 106,
+              "amplitude_rms_db": 1.8874368642344646e-05,
+              "amplitude_max_abs_db": 3.851387994231701e-05,
+              "phase_rms_deg": 0.0006582373202277125,
+              "phase_max_abs_deg": 0.0010018803538258258
+            },
+            "whole_geometry_peak_normalized_max_percent": {
+              "FRD": 6.067504749549279e-07,
+              "OPN": 0.00011927824456151459
+            }
+          }
+        }
+      },
+      {
+        "label": "narrow_10.000GHz",
+        "frequency_ghz": 10.0,
+        "width_inches": 0.01,
+        "depth_inches": 1.0,
+        "channels": {
+          "VV": {
+            "relative_l2_percent": 0.0065578602873253315,
+            "peak_normalized_max_percent": 0.007079909650686602,
+            "peak_normalized_rms_percent": 0.0033809268077186314,
+            "feature_peak_amplitude": 0.3712673157529709,
+            "active_region": {
+              "floor_relative_to_reference_peak": 0.03,
+              "floor_db": -30.45757490560675,
+              "included_angles": 112,
+              "excluded_angles": 69,
+              "amplitude_rms_db": 0.0008152184052239109,
+              "amplitude_max_abs_db": 0.002313762052718912,
+              "phase_rms_deg": 0.002883369747595251,
+              "phase_max_abs_deg": 0.01082503098907429
+            },
+            "whole_geometry_peak_normalized_max_percent": {
+              "FRD": 1.707864300394873e-05,
+              "OPN": 2.8526381465686046e-05
+            }
+          },
+          "HH": {
+            "relative_l2_percent": 0.6581148047605586,
+            "peak_normalized_max_percent": 0.6830021076037479,
+            "peak_normalized_rms_percent": 0.2841482768713738,
+            "feature_peak_amplitude": 0.0018118253117686664,
+            "active_region": {
+              "floor_relative_to_reference_peak": 0.03,
+              "floor_db": -30.45757490560675,
+              "included_angles": 79,
+              "excluded_angles": 102,
+              "amplitude_rms_db": 0.06405370958038238,
+              "amplitude_max_abs_db": 0.136444066998361,
+              "phase_rms_deg": 0.22209510821709127,
+              "phase_max_abs_deg": 0.9066510840303916
+            },
+            "whole_geometry_peak_normalized_max_percent": {
+              "FRD": 6.699532606476253e-07,
+              "OPN": 1.177914139936336e-05
+            }
+          }
+        }
+      }
+    ],
+    "finer_cubic_mesh": {
+      "VV": {
+        "relative_l2_percent": 0.0023870090648440297,
+        "peak_normalized_max_percent": 0.002806360587124518,
+        "active_region": {
+          "floor_relative_to_reference_peak": 0.03,
+          "floor_db": -30.45757490560675,
+          "included_angles": 112,
+          "excluded_angles": 69,
+          "amplitude_rms_db": 0.00018568744736019495,
+          "amplitude_max_abs_db": 0.0002933147211136439,
+          "phase_rms_deg": 0.00021313896151807304,
+          "phase_max_abs_deg": 0.0008656478131208611
+        }
+      },
+      "HH": {
+        "relative_l2_percent": 0.23523456097875717,
+        "peak_normalized_max_percent": 0.2360802918901535,
+        "active_region": {
+          "floor_relative_to_reference_peak": 0.03,
+          "floor_db": -30.45757490560675,
+          "included_angles": 79,
+          "excluded_angles": 102,
+          "amplitude_rms_db": 0.020720922312210437,
+          "amplitude_max_abs_db": 0.024567221483330796,
+          "phase_rms_deg": 0.008468583440412639,
+          "phase_max_abs_deg": 0.040424704944682234
+        }
+      }
+    },
+    "limitations": [
+      "These are convergence differences, not error bounds against an exact solution.",
+      "Generated 3, 10 and 15 GHz coupons have frequency-designed remote backing; this is not a sweep of one fixed coupon.",
+      "Cases are PEC groove coupons and do not establish accuracy for arbitrary material interfaces or every user geometry.",
+      "Narrow groove is a labeled synthetic stress geometry; user geometry files were not changed.",
+      "Complex error metrics include all 181 angles; dB and phase statistics require both fields above 3% of the cubic feature peak (-30.46 dB).",
+      "Other 10%, 1% active floors, full complex fields, all phase metadata and production gate evidence are saved in detailed files.",
+      "A shared null is not treated as an amplitude or phase accuracy measurement.",
+      "The experiment did not measure peak process-tree RAM; timings include observation overhead and are not optimization benchmarks."
+    ]
+  },
+  "optimized_subtraction": {
+    "case": "Synthetic 0.01-inch-wide, 1-inch-deep PEC groove, 10 GHz",
+    "actual_backend": "compressed",
+    "certified": true,
+    "channels": {
+      "VV": {
+        "relative_l2": 0.0,
+        "peak_normalized_max": 0.0,
+        "peak_normalized_rms": 0.0,
+        "maximum_absolute_change": 0.0,
+        "baseline_peak_amplitude": 0.3712673157506025,
+        "largest_change_angle_deg": 0.0
+      },
+      "HH": {
+        "relative_l2": 4.243403515856e-11,
+        "peak_normalized_max": 8.039475985922653e-11,
+        "peak_normalized_rms": 1.8321359564379342e-11,
+        "maximum_absolute_change": 1.4566126083082054e-13,
+        "baseline_peak_amplitude": 0.001811825311573509,
+        "largest_change_angle_deg": 90.0
+      }
+    }
+  },
+  "research_status": {
+    "same_frequency_nested_hp": {
+      "scope": "Same twelve single-polarization 96-panel cases and 37 angles, two warm repeats. Each measured path rebuilds both polynomial meshes and material preparation; the restricted path also includes its coarse layout and sparse prolongation construction. Both dense solves and field projections included. Existing shared near-moment cache enabled in the separate-assembly baseline. This is a dense pair experiment, not the full certified co-polarized production workflow.",
+      "sum_of_separate_case_medians_seconds": 5.551892899988161,
+      "sum_of_restricted_case_medians_seconds": 4.049888449993887,
+      "aggregate_time_reduction_percent": 27.05391615168724,
+      "individual_case_reduction_range_percent": [
+        11.4093634237166,
+        33.839978380947464
+      ],
+      "maximum_quadratic_field_change_over_peak": 1.2988992855802902e-13,
+      "maximum_cubic_field_change": 0.0,
+      "limitation": "Production also shares assembly across polarizations and has compressed factorization, quality gates, profiling, resource admission and metadata work; those costs are not represented by this dense microbenchmark. No full-airfoil gain is inferred."
+    },
+    "directional_h2_or_fmm": {
+      "status": "Working directional far-kernel interpolation proof of concept on actual airfoil nodes; no full H2/FMM operator or solver implemented.",
+      "reference_implementation_caveat": "Timing reference is direct scipy.special.hankel2 evaluation. This is not a speed comparison against GHOST native kernel tables or assembled Galerkin coefficients. Full reference validation is excluded from candidate timing; production needs independent error accounting to avoid evaluating the entire reference.",
+      "accuracy_caveat": "At 16 by 12 terms the 10 GHz error is 5.1e-15 and kernel-demo time is 39.0% lower, with 25% fewer representation array bytes. At 18 GHz the error plateaus near 1.5e-14, slightly above the current 1e-14 tile-compression tolerance. The 12 by 12 demonstration is therefore not a production-qualified replacement. There is no full-Galerkin, material, field or process-peak RAM result from this experiment, and existing tile compression already reduces storage relative to dense matrices."
+    },
+    "higher_order_bor": {
+      "status": "Architecture design only; not implemented or benchmarked here.",
+      "finding": "bor/kernels.py gauss_on_generatrix interpolates rho and z linearly between endpoints and carries T0=1-s, T1=s plus their radius-weighted derivatives. Raising quadrature alone does not add higher-order geometry or current degrees of freedom.",
+      "blockers": [
+        "Introduce higher-order current basis and radius-weighted derivatives consistently in every modal kernel family, DOF map, excitation and far-field projection.",
+        "Derive singular/self/near quadrature for the enriched basis, including axis endpoint regularity and modal constraints.",
+        "Preserve explicit input corners and material junctions. Curved geometry needs an explicit curve representation; silently smoothing polygon input changes the problem.",
+        "Compare DOFs, runtime, process-tree RAM and independent field accuracy on smooth bodies, sharp features, lossy layers and both polarizations."
+      ]
+    }
+  },
+  "verification_before_publish": {
+    "unique_test_cases": 208,
+    "passed": 208,
+    "failed": 0,
+    "skipped": 0,
+    "fixture_note": "First broad run had one new fixture under-resolution failure. Test panel count corrected; final affected module and new compression tests passed. No production change was needed."
+  },
+  "limitations": [
+    "Benchmarks use single frequencies, not a complete 1\u201318 GHz sweep.",
+    "Production and prototype savings cannot be added or multiplied.",
+    "Prototype nested hp results are small dense single-polarization solves, not the compressed production airfoil.",
+    "Directional prototype is a selected kernel calculation, not a qualified full solver.",
+    "Higher-order BoR remains a documented follow-on redesign, with no measured improvement."
+  ],
+  "source_sha256": {
+    "tools/GHOST/BOR_PERFORMANCE.md": "8052087921fb3282dc13665a4819efdda6dd097dbe239a002911e5eacda10448",
+    "tools/GHOST/ghost_backend/bor/compressed_far.py": "480a46305ada78324eda7c7edcdee7b90c535862afa3c5884b2a456fc85a8b1e",
+    "tools/GHOST/ghost_backend/bor/factor.py": "beb77ea91f9fb3f489311729b7cd2388aefeb433e2a4c1b8e667cb45c8085177",
+    "tools/GHOST/ghost_backend/bor/near_parallel.py": "6d8975ee1a7fc20b7e40e7722ceeb10b9d5c4d2f31b563b7cb9b255ee383c81b",
+    "tools/GHOST/ghost_backend/bor/options.py": "55c3735ce5a69c635dae0d40e15974db8e6f19051009d5b00bbcead89d32eada",
+    "tools/GHOST/ghost_backend/bor/solver.py": "5349c186cf734b264cd916215eb296d6940401c7929164ca14d5e2a54bc4e51b",
+    "tools/GHOST/ghost_backend/compressed/coefficients.py": "7619e9d03e2b46b1c05f1d46ce556f30818deb676997ed7886fc5173e99b108f",
+    "tools/GHOST/ghost_backend/compressed/factor.py": "04612e0b5ad10b6568ec400e777b4ab81816b782eae7681e658f3fc0558c2795",
+    "tools/GHOST/ghost_backend/compressed/memory.py": "9dccff5080605b197988397aad555f23a239b2a807a8f81c33b17b1cc20c1bed",
+    "tools/GHOST/ghost_backend/compressed/operator.py": "94f911e02cd602860461e8616106b9653c1c8aa9336aec979e91f5798215285f",
+    "tools/GHOST/ghost_backend/compressed/polarization_cache.py": "f2c46da97580fd897c3daf6d603434d447ce99667035fa8e8513002f4e0f8430",
+    "tools/GHOST/ghost_backend/compressed/regional_coefficients.py": "4f1c1844665d5bf68c5cd7e0e6ae590f455f52134bbe47e94a959f11e50d3e59",
+    "tools/GHOST/ghost_backend/compressed/runtime.py": "5f0b554897478d7d35daafafb4ebf048707a05928c9bf9608f30fbc1c5386253",
+    "tools/GHOST/ghost_backend/compressed/tile_processes.py": "33841879c61502d2b76623fe380d00ca7d5b1d214f76d5817bb99d19438840eb",
+    "tools/GHOST/ghost_backend/execution/cpu.py": "fb7951c49e96f12b93d9445faa8c3435b5d87aece5398a7a37d1190999ca3591",
+    "tools/GHOST/ghost_backend/execution/options.py": "87038b8c5fb9fabdd31d4d08956a02f282c364b326082cc0dc6799cd0524560c",
+    "tools/GHOST/ghost_backend/execution/policy.py": "c4fc118f0c522d398ee5965477948823f07a12341c7f4265305aab8039a887ec",
+    "tools/GHOST/ghost_backend/execution/selection.py": "45de375a81cdbc0291eef03dd8b61e601fbafb1c86ca6269a997f6e987a2c864",
+    "tools/GHOST/ghost_backend/execution/timing_history.py": "be216a94ff62d507ac4d074c14d15cbd941356e3751f51693e9f432c0ba0779c",
+    "tools/GHOST/ghost_backend/linalg/dense.py": "6c98120b2cd4a6e5340c21714247298c3290156fc72d566202cfbafd55777945",
+    "tools/GHOST/ghost_backend/linalg/residual_spool.py": "d9d0b27ee8953eda8021e4a702702d305028f480a84bffd387228ab0e5c7296f",
+    "tools/GHOST/ghost_backend/runs/quality.py": "c595540258b402780955ba948cb8e3e5d321a8910061ff9ac612febd6ef80053",
+    "tools/GHOST/ghost_backend/tests/test_bounded_factor_workspaces.py": "69ac581494936c4b3b8a185f2dfd4496ca4fcc607dd7cf0445b6a8057be69fcd",
+    "tools/GHOST/ghost_backend/tests/test_runtime_allocation_updates.py": "6e937d10e704fe64ad8f01cacfb862d7d81e45d37bd75f113fa40cfadbdc82ad",
+    "tools/GHOST/ghost_backend/twod/adaptivity.py": "a36700f097e3371cca5c6fca384d1586fd73adc9ffac0856e39d6324b8cce262",
+    "tools/GHOST/ghost_backend/twod/assembly/native/far.c": "ccbe2dea5c78aa1fda68a158884e8c9121b4448a3ea1e1f416a54d71cd79649b",
+    "tools/GHOST/ghost_backend/twod/assembly/native/ghost_far.dll": "769481c53cbf347c10b3da62b1af16e5860d6f21a06fd879c7a303e045aee4a7",
+    "tools/GHOST/ghost_backend/twod/assembly/session.py": "29eb5fb9787c569dd9e504913f096d7b352e0e9a943b0377ecc3b25fe7a38e9a",
+    "tools/GHOST/ghost_backend/twod/basis.py": "2fd8a7d7d85c79ddba0d3b75bd45fce1c3b8a580c43f797bde39e88ec53a8449",
+    "tools/GHOST/ghost_backend/twod/checkpoints.py": "6a86da9979139e6bec8ca47887e5352a517e939b714c1e883cbd4a86db7d3c9d",
+    "tools/GHOST/ghost_backend/twod/fields.py": "e8432d268ca7ce84045b86624dbcabda8adbd431032b41d8454259fbfee952e3",
+    "tools/GHOST/ghost_backend/twod/formulations/regions.py": "d63b761bde820c484b7e76fb4d1802b8c7b1e0abdd44b32b4330b2784b9460ba",
+    "tools/GHOST/ghost_backend/twod/preparation.py": "fc307b8ad53c10c919e5a49b9d168f5349cd09695b0c3d69a4fc5b5ea98fcf85",
+    "tools/GHOST/ghost_backend/twod/solver.py": "8ed66559acc8962a194396907cfbd1c05e9e520486696c09bf430417434594fe",
+    "tools/GHOST/ghost_backend/ui/bor_options.py": "d007449f4f2d3adfe163eb4694cf97279204992fc33e4dc3e9a45c3016ca25fc",
+    "tools/GHOST/ghost_backend/ui/solver.py": "828f429ddd071435efd282a9616ba08d63c55eb3a4c3689ddfc4fa82097ae390",
+    "tools/GHOST/NUMERICAL_METHODS.md": "7bbc0e2d262884addbba082436c259f6c465ec9daecd299a828d7699a3192ade",
+    "tools/GHOST/RUN_PROFILES.md": "146e8ac0db898405311d656d3a3798918cc0d086c77bf560378aec10ceb859a0",
+    "tools/GHOST/ghost_backend/bor/checkpoints.py": "d04c2789c2ebbed87f4dc5013de9e120b7644de7c4ed4d744b3b188cb463c329",
+    "tools/GHOST/ghost_backend/bor/quadrature.py": "bd01ef4dace3c3422b9ac20849ddf9211cfe4ddbf523b3b455d9dd089e7f9fea",
+    "tools/GHOST/ghost_backend/compressed/fast_far.py": "677ad5e008939f66125d893256f5004b48750090d001ac93b879edb85bb066f9",
+    "tools/GHOST/ghost_backend/compressed/pilots.py": "50e19d8fe1284deaa38531c358e03dcc50ebfa63c68a9c9da72ce0ea8eaab7d3",
+    "tools/GHOST/ghost_backend/compressed/recycling.py": "a26dbea07dcc0e3a23a5d156e36e00ab4a8c9f79e6b5fc02389b481574992393",
+    "tools/GHOST/ghost_backend/compressed/worker_pool.py": "19f0ff1d74d37a9fcd080cec3e85c281f5bf8a256717ef7c476f128a86485ff7",
+    "tools/GHOST/ghost_backend/execution/frequency_sweep.py": "365ff3ca73c7a0f055495dca7ff271a91d1c3681a4f0fdb262101ada234370ec",
+    "tools/GHOST/ghost_backend/execution/memory.py": "a7a2fec1722031b771dba710fb73063a62476fe5513f79b1efaf234bafbedeed",
+    "tools/GHOST/ghost_backend/execution/stage_timing.py": "12b14cc703bdf488f615df7a44ac0721ca52b29be9c41cad9f61fa41e9ceaa9f",
+    "tools/GHOST/ghost_backend/tests/test_admission_tile_reuse.py": "4b313f3eb78b7457294e2380c03ad5d1c9e591948425034c90c4d77257edfe4b",
+    "tools/GHOST/ghost_backend/tests/test_checkpoint_recovery.py": "a0c530d5defca5f726fea53e05e897c343d99ab6618418a529add7ec7fc58d33",
+    "tools/GHOST/ghost_backend/tests/test_checkpoint_recovery_gui.py": "cb937147f1c498210167720f0b52fc7f9145db833eaab95c8b42e477d7551ed7",
+    "tools/GHOST/ghost_backend/tests/test_compressed_review_safety.py": "204f3dc3b93ec5b99ea44296ce40beb6d255bfa142470c719e3679202adbfde3",
+    "tools/GHOST/ghost_backend/tests/test_compression_proposal_width.py": "fb9c9b6a18842890f7aaa42fd3e54dc99ce128581c9673f6932a1b699ec28215",
+    "tools/GHOST/ghost_backend/tests/test_fast_far_proposals.py": "4faa2be3826dfd8fa915ddb49cbb697f9060a8248127e19d6375dc550c2f10a6",
+    "tools/GHOST/ghost_backend/tests/test_frequency_preconditioner.py": "b44724fc3e15717d43fbd206e08ebe7452da866a42167e3e74d558bd7d1ca377",
+    "tools/GHOST/ghost_backend/tests/test_linear_recovery_review.py": "d77bb7ebc1cbb2cae0fee639a572f57cf5cf9aa84b1b3d73b46dfa79eb95333a",
+    "tools/GHOST/ghost_backend/tests/test_native_far_widths.py": "75f5b856c2b841b21f91192c19cfc66d362000e2deb4d3e3855e2848bd41829d",
+    "tools/GHOST/ghost_backend/tests/test_nearby_timing_history.py": "97e2e1b7e4a9b3897353ba46bec2f2e465c27e6f50a9478af34145f09192d389",
+    "tools/GHOST/ghost_backend/tests/test_october_bor_accuracy.py": "83fc4ea21a7880067ab94c9cd99d6bd0aab56208348be0e13774d92f43df7381",
+    "tools/GHOST/ghost_backend/tests/test_parallel_frequency_sweep.py": "1fb09d4916f85bd85d3c8ddd06dc975b910a5c3995ae8e1ce01ade404efc3e9a",
+    "tools/GHOST/ghost_backend/tests/test_regional_routing_plans.py": "aeec51fe8a042727c11075411de64d59a88884179a8daf4e7b52306aea1a874c",
+    "tools/GHOST/ghost_backend/tests/test_solver_resource_recovery.py": "77a9fa2695549ebf7f3b92a1978c6ae5d6b1505709d82efe09e219307da49c2a",
+    "tools/GHOST/ghost_backend/tests/test_stage_cost_model.py": "0baf55348ea5708c1024cf8eb8287d01f6ef254f97f3a678c741eb33722ae5be",
+    "tools/GHOST/ghost_backend/tests/test_sweep_preparation.py": "4cb6f56d3cc5be7f1269986c3032fafa70d3eac1984f3d40e94bd594e62bf6e7",
+    "tools/GHOST/ghost_backend/tests/test_windows_memory_fallback.py": "98cfbee30262f53be6a570cdd24011c84c083154b5644adf6458eb3de31de790"
+  },
+  "publication_verification": {
+    "scope": "Exact publishing checkout; desktop test groups run in isolated processes.",
+    "totals": {
+      "passed": 433,
+      "subtests_passed": 225,
+      "skipped": 6,
+      "failed": 0
+    },
+    "groups": [
+      {
+        "group": "headless",
+        "modules": [
+          "test_admission_tile_reuse.py",
+          "test_compressed_review_safety.py",
+          "test_frequency_preconditioner.py",
+          "test_fast_far_proposals.py",
+          "test_native_far_widths.py",
+          "test_stage_cost_model.py",
+          "test_parallel_frequency_sweep.py",
+          "test_compressed_memory.py",
+          "test_compressed_path.py",
+          "test_tile_processes.py",
+          "test_memory_safety.py",
+          "test_solver_resource_recovery.py",
+          "test_checkpoint_recovery.py",
+          "test_windows_memory_fallback.py",
+          "test_nearby_timing_history.py",
+          "test_automatic_backend.py",
+          "test_sweep_preparation.py",
+          "test_adaptive_polynomial.py",
+          "test_polynomial_basis.py",
+          "test_compact_multi_region.py",
+          "test_compact_quality.py",
+          "test_linear_recovery_review.py",
+          "test_runtime_allocation_updates.py",
+          "test_bounded_factor_workspaces.py",
+          "test_hpc_scheduling.py",
+          "test_rcs_physics_regression.py",
+          "test_bor_physics_regression.py",
+          "test_october_bor_accuracy.py",
+          "test_2d_capability_acceptance.py",
+          "test_assembly_equivalence.py",
+          "test_bor_execution_config.py",
+          "test_source_is_ascii.py",
+          "test_compression_proposal_width.py",
+          "test_regional_routing_plans.py"
+        ],
+        "summary": "404 passed, 188 subtests passed in 110.39s (0:01:50)"
+      },
+      {
+        "group": "test_checkpoint_recovery_gui",
+        "modules": [
+          "test_checkpoint_recovery_gui.py"
+        ],
+        "summary": "1 passed in 1.26s"
+      },
+      {
+        "group": "test_execution_options",
+        "modules": [
+          "test_execution_options.py"
+        ],
+        "summary": "12 passed, 30 subtests passed in 7.33s"
+      },
+      {
+        "group": "test_automatic_hpc",
+        "modules": [
+          "test_automatic_hpc.py"
+        ],
+        "summary": "4 passed in 12.73s"
+      },
+      {
+        "group": "test_hpc_solver_options",
+        "modules": [
+          "test_hpc_solver_options.py"
+        ],
+        "summary": "2 passed, 6 skipped, 5 subtests passed in 0.45s"
+      },
+      {
+        "group": "test_hpc_runtime",
+        "modules": [
+          "test_hpc_runtime.py"
+        ],
+        "summary": "10 passed, 2 subtests passed in 2.25s"
+      }
+    ]
+  }
+}

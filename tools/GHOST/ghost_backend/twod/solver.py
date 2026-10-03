@@ -1,5 +1,5 @@
 """2-D boundary-integral RCS solves and mesh certification."""
-from ghost_backend.twod.preparation import prepared_execution, prepare_geometry
+from ghost_backend.twod.preparation import prepared_execution, prepare_geometry, mesh_frequencies
 from ghost_backend.twod.meshing import segment_wavelengths
 from ghost_backend.execution.options import configured_execution, environment_value, current_options
 
@@ -1211,6 +1211,10 @@ def _process_rss_bytes() -> 'int':
         return max(0, int(psutil.Process(os.getpid()).memory_info().rss))
     except Exception:
         pass
+    if os.name == 'nt':
+        from ghost_backend.execution.memory import windows_process_memory
+        info = windows_process_memory()
+        return info.rss if info is not None else 0
     try:
         with open("/proc/self/statm") as stream:
             resident_pages = int(stream.read().split()[1])
@@ -1489,7 +1493,9 @@ def _estimate_memory_gb(
     kind = resources.get('formulation', formulation)
     count = max(1, int(n_rhs))
     if resources.get('analytic_zero'):
-        return (64*1024**2 + 1024*n + count*4096) / 1024**3
+        from ghost_backend.compressed.worker_pool import retained_bytes
+        from ghost_backend.compressed.recycling import capacity_bytes
+        return (64*1024**2 + 1024*n + count*4096 + retained_bytes() + capacity_bytes()) / 1024**3
     requested, threshold = _requested_dense_backend()
     from ghost_backend.linalg.hierarchical import factor_mode
     factorization = factor_mode()
@@ -1539,7 +1545,10 @@ def _estimate_memory_gb(
     extra = CACHE_BYTES + TABLE_BYTES if solver_method == EXPERIMENTAL_METHOD or current_state() is not None else 0
     from ghost_backend.twod.polynomial_quadrature import MOMENT_CACHE_BYTES
     extra += resources.get('moment_cache_bytes', MOMENT_CACHE_BYTES if resources.get('basis_width', 2) > 2 else 0)
-    return (max(assembly, solve) + extra + count*4096) / 1024**3
+    from ghost_backend.compressed.worker_pool import retained_bytes as retained_worker_bytes
+    from ghost_backend.compressed.recycling import capacity_bytes as recycling_capacity_bytes
+    return (max(assembly, solve) + extra + count*4096 + retained_worker_bytes()
+            + recycling_capacity_bytes()) / 1024**3
 
 
 def _solve_te_robin_mfie(mesh, infos, pol, k0, elevations_deg, obs_order=8, src_order=8,
@@ -2205,14 +2214,14 @@ def solve_monostatic_rcs_2d_single_polarization(
         ) = _conservative_mesh_wavelength_for_frequencies(
             geometry_snapshot,
             materials,
-            set(frequencies) | {mesh_ref_ghz},
+            set(mesh_frequencies(frequencies)) | {mesh_ref_ghz},
         )
         cached_mesh_wavelength = ref_lambda
         ref_k0 = 2.0 * math.pi * mesh_ref_ghz * 1e9 / C0
         cached_panels = _build_panels(
             geometry_snapshot, unit_scale, ref_lambda, max_panels=max_panels,
-            segment_wavelengths=segment_wavelengths(geometry_snapshot, materials, set(frequencies) | {mesh_ref_ghz}, unit_scale, ref_lambda),
-            materials=materials, frequencies_ghz=set(frequencies) | {mesh_ref_ghz},
+            segment_wavelengths=segment_wavelengths(geometry_snapshot, materials, set(mesh_frequencies(frequencies)) | {mesh_ref_ghz}, unit_scale, ref_lambda),
+            materials=materials, frequencies_ghz=set(mesh_frequencies(frequencies)) | {mesh_ref_ghz},
             **_panel_notice_kwargs(notices),
         )
 
@@ -2352,7 +2361,7 @@ def solve_monostatic_rcs_2d_single_polarization(
                 progress_floor[0] = max(progress_floor[0], done_steps + completed)
                 progress_callback(progress_floor[0], total_steps,
                     "{} {} of {} angles at {} GHz".format(batch_label, completed, total, freq_ghz))
-        select_formulation(resources, batch_progress)
+        select_formulation(resources, batch_progress, frequency_ghz=freq_ghz, polarization=pol)
         from ghost_backend.compressed.runtime import enabled as compressed_enabled
         if compressed_enabled() and pol == 'TE' and not any(int(i.seg_type) == 1 for i in coupled_infos):
             from ghost_backend.twod.assembly.session import current_session
@@ -3361,7 +3370,7 @@ def solve_bistatic_rcs_2d_single_polarization(
         conservative_mesh = _conservative_mesh_wavelength_for_frequencies(
             geometry_snapshot,
             materials,
-            set(frequencies) | {mesh_ref_ghz},
+            set(mesh_frequencies(frequencies)) | {mesh_ref_ghz},
         )
 
     def check_abort() -> 'None':
@@ -3405,7 +3414,7 @@ def solve_bistatic_rcs_2d_single_polarization(
             panels, mesh = cached_mesh[1:]
         else:
             panels = _build_panels(geometry_snapshot, unit_scale, lambda_min, max_panels=max_panels, materials=materials,
-                frequencies_ghz=[mesh_freq_ghz] if mesh_ref_ghz is None else set(frequencies) | {mesh_ref_ghz},
+                frequencies_ghz=[mesh_freq_ghz] if mesh_ref_ghz is None else set(mesh_frequencies(frequencies)) | {mesh_ref_ghz},
                 **_panel_notice_kwargs(notices))
             preview_infos = _build_coupled_panel_info(panels, materials, freq_ghz, pol, k0)
             mesh, _ = _build_linear_mesh_interface_aware(panels, preview_infos, polarization=pol)

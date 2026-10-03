@@ -204,6 +204,11 @@ class NativeOracle:
 
     def get(self,rows,cols):return self.get_with_error(rows,cols)[0]
 
+    def propose_fast_far(self, rows, cols, tolerance=1e-14):
+        """Experimental interpolation, excluding nonlocal thin-layer systems."""
+        from ghost_backend.compressed.fast_far import propose
+        return propose(self, rows, cols, tolerance)
+
 
 class PairedNativeOracle:
     """Cache shared primitive tiles only until both material laws consume them."""
@@ -211,6 +216,10 @@ class PairedNativeOracle:
         if first.n!=second.n:raise ValueError('Paired native layouts must match.')
         self.oracles=(first,second);self.n=first.n
         second.geometry=first.geometry
+
+    def propose_fast_far(self, rows, cols, tolerance=1e-14):
+        from ghost_backend.compressed.fast_far import propose
+        return propose(self, rows, cols, tolerance)
 
     def _shared(self,operation):
         cache={}

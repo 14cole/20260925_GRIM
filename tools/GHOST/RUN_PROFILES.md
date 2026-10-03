@@ -22,7 +22,10 @@ Monostatic runs:
   geometry, materials and angle count, and admitted against available RAM
   (90% of currently available memory). Compressed solves may keep up to 60%
   of that limit (at least 2 GiB) for both polarizations' operators and the
-  preconditioner.
+  preconditioner. The work model separates assembly, compression,
+  factorization and angle solves. Clean, repeated measurements can calibrate
+  nearby frequencies with compatible meshes and execution settings; ordinary
+  runs do not launch extra solves for calibration.
 - **Mesh.** An adaptive polynomial mesh: a quadratic candidate with a cubic
   accuracy check, local refinement when the comparison fails, and a global
   linear mesh as the final fallback.
@@ -39,6 +42,18 @@ Monostatic runs:
   2048, then the available reservation. Explicit integer `blas_threads` values
   are caps and are never widened. `linear_algebra_execution` records the actual
   library pools used; these thresholds are a policy, not a speed guarantee.
+- **Frequency scheduling.** Desktop checkpointed sweeps can run two
+  frequencies at once when the predicted work justifies startup and their
+  combined CPU and RAM reservations fit. Larger units run first; results
+  retain the requested frequency order. These workers share the total CPU
+  budget and do not start nested assembly workers. Small runs and runs that
+  cannot fit two frequencies remain sequential. A frequency that outgrows
+  its worker reservation is retried in the parent after the workers drain.
+- **Compressed assembly reuse.** Admission samples retain up to 32 MiB of
+  verified tiles for assembly of the identical operator. An already assembled
+  polarization partner supplies its actual storage size. Assembly workers
+  persist for the run and refresh their geometry and coefficients before each
+  operator; their retained memory is included in later phase forecasts.
 - **Checkpoints.** Completed frequencies are saved to the application cache
   and reused when an identical run is repeated or resumed. They require
   matching geometry, angles, material file contents, certification settings
@@ -81,9 +96,25 @@ fine mesh phases are identified separately. The percentage can remain fixed
 while a long stage runs. RAM is sampled every 50 ms and includes other work in
 the same process; it is not an exact allocation peak. Stage timings in exported
 metadata are inclusive and may overlap.
+For parallel frequency runs, the largest individual worker peak is reported
+separately from reserved RAM. It is not the simultaneous process-tree peak;
+aggregate sampled RAM is left unavailable when it was not measured.
 
 ## Python API
 
 Public 2D solve functions still accept `execution_options` for tests,
 benchmarks and diagnostics. Production runs do not need it; they use
 `ghost_backend.execution.options.automatic_run(scattering)`.
+
+`run_checkpointed(..., frequency_workers='auto')` enables the desktop frequency
+scheduler; its API default remains `1`. Direct solve calls retain their normal
+sequential frequency loop.
+
+Two explicit experimental execution options remain off in automatic runs:
+`compressed_far_method='verified_cur'` proposes low-rank far tiles but checks
+every coefficient before acceptance, and `frequency_preconditioner='reuse'`
+tries a bounded inverse cache for nearby frequencies with identical mesh and
+DOF ordering. Reuse always tests the current operator's residual and rebuilds
+the inverse if its short iteration allowance is exhausted. Changing the
+default adaptive mesh generally prevents inverse reuse. Neither option is a
+general speed guarantee.

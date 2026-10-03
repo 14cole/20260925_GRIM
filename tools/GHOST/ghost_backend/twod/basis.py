@@ -35,7 +35,9 @@ def values(x, degree=1, derivative=False):
 
 @lru_cache(maxsize=4)
 def derivative_matrix(degree):
-    return values(abscissae(degree), degree, True)
+    result = values(abscissae(degree), degree, True)
+    result.flags.writeable = False
+    return result
 
 
 def mesh_degree(mesh):
@@ -62,16 +64,33 @@ def enrich(mesh, stats=None):
 
 def mass_block(element):
     degree = len(element.node_ids) - 1
-    q, w = np.polynomial.legendre.leggauss(degree + 1)
-    phi = values((q + 1) / 2, degree)
-    return element.length * (phi.T * (w / 2)) @ phi
+    return element.length * _reference_blocks(degree)[0]
 
 
 def stiffness_block(element):
     degree = len(element.node_ids) - 1
+    return _reference_blocks(degree)[1] / element.length
+
+
+@lru_cache(maxsize=4)
+def _reference_blocks(degree):
     q, w = np.polynomial.legendre.leggauss(degree + 1)
+    phi = values((q + 1) / 2, degree)
     dphi = values((q + 1) / 2, degree, True)
-    return (dphi.T * (w / 2)) @ dphi / element.length
+    mass = (phi.T * (w / 2)) @ phi
+    stiffness = (dphi.T * (w / 2)) @ dphi
+    mass.flags.writeable = stiffness.flags.writeable = False
+    return mass, stiffness
+
+
+@lru_cache(maxsize=32)
+def _moment_quadrature(order, degree):
+    q, w = np.polynomial.legendre.leggauss(order)
+    t = (q + 1) / 2
+    phi = values(t, degree)
+    for value in (t, w, phi):
+        value.flags.writeable = False
+    return t, w, phi
 
 
 def integral_bounds(element):
@@ -89,9 +108,7 @@ def plane_wave_moments(centers, edges, lengths, k, dirs, degree):
     order = max(12, degree + 3 + int(np.ceil(phase_span)))
     if order > 256:
         raise ValueError('Polynomial excitation needs a finer wavelength mesh.')
-    q, w = np.polynomial.legendre.leggauss(order)
-    t = (q + 1) / 2
-    phi = values(t, degree)
+    t, w, phi = _moment_quadrature(order, degree)
     base = np.exp(1j * float(k) * (centers @ dirs.T)) * lengths[:, None]
     z = float(k) * (edges @ dirs.T)
     result = np.zeros((len(lengths), degree + 1, len(dirs)), complex)

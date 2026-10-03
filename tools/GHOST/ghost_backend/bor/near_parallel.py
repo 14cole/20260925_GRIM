@@ -141,6 +141,8 @@ class NearTask:
         self.gp, self.gq, self.k = gp, gq, k
         self.m_max, self.kinds, self.depth = m_max, kinds, depth
         self.pair_kind = pair_kind
+        from ghost_backend.bor.options import current_options
+        self.junction_refinement = current_options()['near_refinement']
         self.near_order, self.near_rtol, self.near_max_order = near_order, near_rtol, near_max_order
 
     def __call__(self, pair):
@@ -170,7 +172,7 @@ class NearTask:
             # Cross-surface pairs (pair_kind given) touch at a junction and use
             # the refined junction rule, exactly as the in-process path does.
             points = (_same_surface_points(self.gp, e, f, self.kinds, self.depth)
-                      if self.pair_kind is None else _junction_cell_points(cell))
+                      if self.pair_kind is None else _junction_cell_points(cell, self.junction_refinement))
             touching.append((index, (self.gp, e, self.gq, f, points)))
         pick = (lambda blocks: blocks[self.kinds[0]]) if self.pair_kind is None else (lambda blocks: blocks)
         if touching:

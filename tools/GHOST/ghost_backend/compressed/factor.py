@@ -27,7 +27,7 @@ COMPACT_PRECONDITIONER_TOLERANCE=1e-6
 
 class CompressedFactor:
     def __init__(self,operator,diagnostics=None,label='compressed system',evidence=None,checkpoint=None,
-                 storage_budget_bytes=None, check_precision=True, **kwargs):
+                 storage_budget_bytes=None, check_precision=True, recycling_key=None,recycling_frequency=None, **kwargs):
         from ghost_backend.compressed.runtime import storage_budget
         from ghost_backend.linalg.refined_lu import requested_precision
         if check_precision and requested_precision()!='double':raise ValueError('Compressed factorization requires double precision.')
@@ -36,27 +36,51 @@ class CompressedFactor:
         self.matrix_inf=max(float(np.max(operator.row_norm-operator.row_error)),0.)
         self.relative_residual=np.empty(0)
         self.factor=None;self.reported=0
+        self.recycling_key=recycling_key;self.frequency=recycling_frequency
+        self.original_frequency=recycling_frequency;self.recycled=False
         allowance = storage_budget() if storage_budget_bytes is None else int(storage_budget_bytes)
         self.budget=allowance-operator.bytes-getattr(operator,'reserved_partner_bytes',0)
+        from ghost_backend.compressed.recycling import take,live_bytes,reserve_current_inverse
+        borrowed=take(recycling_key,recycling_frequency,self.budget,self.checkpoint) if recycling_key is not None else None
+        from ghost_backend.compressed.memory import inverse_storage
+        needed=borrowed[0].bytes if borrowed is not None else inverse_storage(operator.n)[0]
+        reserve_current_inverse(needed,self.budget)
+        self.budget-=live_bytes()
         if self.budget<=0:raise MemoryError('No compressed inverse storage remains.')
         self.event=dict(unknowns=operator.n,factorizations=0,rhs_batches=0,max_rhs_columns=0,
             max_backward_error=0.,max_relative_residual=0.,compressed=operator.evidence,
             preconditioners=[],gmres_columns=0,max_refinements=0,refinement_steps=0)
         if evidence is not None:evidence.append(self.event)
+        if borrowed is not None and borrowed[0].bytes<=self.budget and borrowed[0].n==operator.n:
+            self.factor,self.original_frequency=borrowed
+            self.tolerance=self.factor.tolerance;self.recycled=True
+            self.event['frequency_preconditioner']=dict(reused=True,original_wavenumber=self.original_frequency)
+            self.event['preconditioners'].append(self.factor.evidence)
+        else:
+            borrowed=None
+            self._fresh_build()
+        borrowed=None
+        if diagnostics is not None:self._condition()
+
+    def _fresh_build(self):
         rejected=False
         try:
+            compact=False
             try:self._build(PRECONDITIONER_TOLERANCE)
             except MemoryError as exc:
                 self.event['compact_preconditioner']=str(exc)
-                self._build(COMPACT_PRECONDITIONER_TOLERANCE)
+                compact=True
+            # Leave the handler before rebuilding: its traceback otherwise
+            # retains the failed tree and its arrays throughout the retry.
+            if compact:self._build(COMPACT_PRECONDITIONER_TOLERANCE)
         except (HierarchicalRejected,np.linalg.LinAlgError,RuntimeWarning) as exc:
             self.event['coarse_rejection']=str(exc);rejected=True
         if rejected:self._build(2e-10)
-        if diagnostics is not None:self._condition()
 
     @timed_stage('factorization')
     def _build(self,tolerance):
         self.factor=None
+        self.recycled=False;self.original_frequency=self.frequency
         self.checkpoint()
         self.factor=CompressedSystem(self.a,self.a.coordinates,tolerance=tolerance,
             budget=self.budget,checkpoint=self.checkpoint,inverse_only=True)
@@ -95,7 +119,7 @@ class CompressedFactor:
                 self.event['max_refinements']=max(self.event['max_refinements'],step)
                 return x,-residual
             worst=float(np.max(errors))
-            if step==9 or not np.isfinite(worst) or step>1 and worst>previous*1.2:break
+            if step==(2 if self.recycled else 9) or not np.isfinite(worst) or step>1 and worst>previous*1.2:break
             previous=worst;x[:,bad]+=self.factor.apply(residual[:,bad],solve=True,trans=trans)
             self.event['refinement_steps']+=1
         self.event['gmres_columns']+=int(np.sum(bad))
@@ -113,6 +137,7 @@ class CompressedFactor:
         rejects the preconditioner. Callers still check the physical backward error.
         """
         n,count=b.shape
+        iteration_cap=min(8,GMRES_ITERATION_CAP) if self.recycled else GMRES_ITERATION_CAP
         x=np.array(x,complex,copy=True);iterations=0;previous=np.inf
         basis_storage=work_storage=None
         while True:
@@ -122,22 +147,23 @@ class CompressedFactor:
             active=np.flatnonzero(~np.isfinite(errors)|(errors>REFINEMENT_BACKWARD_ERROR))
             if not len(active):return x
             worst=float(np.max(errors))
-            if iterations>=GMRES_ITERATION_CAP or not np.isfinite(worst) or worst>previous/2:
+            if iterations>=iteration_cap or not np.isfinite(worst) or worst>previous/2:
                 raise HierarchicalRejected('Compressed GMRES did not converge within its cap.')
             previous=worst
             beta=np.linalg.norm(residual[:,active],axis=0)
-            c,m=len(active),min(GMRES_RESTART,GMRES_ITERATION_CAP-iterations)
+            c,m=len(active),min(GMRES_RESTART,iteration_cap-iterations)
             if basis_storage is None:
                 # Each iteration's n-by-c RHS is contiguous. Reuse this
                 # allocation across restarts, including shrinking active sets.
-                basis_storage=np.empty((n,count,GMRES_RESTART+1),complex,order='F')
+                basis_storage=np.empty((n,count,min(GMRES_RESTART,iteration_cap)+1),complex,order='F')
                 work_storage=np.empty((n,count),complex,order='F')
             basis=basis_storage[:,:c,:m+1];work=work_storage[:,:c]
             basis[:,:,0]=residual[:,active]/beta
             hessenberg=np.zeros((c,m+1,m),complex)
             cosines=np.zeros((c,m),complex);sines=np.zeros((c,m),complex)
             rhs=np.zeros((c,m+1),complex);rhs[:,0]=beta
-            steps=0
+            steps=np.zeros(c,dtype=int)
+            finished=np.zeros(c,dtype=bool)
             for j in range(m):
                 self.checkpoint()
                 w=self.a.matmul(self.factor.apply(basis[:,:,j],solve=True,trans=trans),trans)
@@ -163,12 +189,22 @@ class CompressedFactor:
                 hessenberg[:,j,j],hessenberg[:,j+1,j]=length,0
                 rhs[:,j+1]=-sines[:,j].conj()*rhs[:,j]
                 rhs[:,j]=cosines[:,j]*rhs[:,j]
-                steps=j+1;iterations+=1
-                # The 2-norm residual estimate bounds the max-norm backward error. Stop
-                # there, or at a breakdown: every column's triangle is nonsingular now.
-                if np.all(abs(rhs[:,j+1])<=REFINEMENT_BACKWARD_ERROR*denominator[active]/4) or np.any(breakdown):break
-            y=np.linalg.solve(hessenberg[:,:steps,:steps],rhs[:,:steps,None])[...,0]
-            np.einsum('ncj,cj->nc',basis[:,:,:steps],y,out=work)
+                iterations+=1
+                # Each column owns its Krylov dimension. A happy breakdown
+                # in an easy column must not truncate a harder column's cycle.
+                stopped=breakdown|(abs(rhs[:,j+1])<=REFINEMENT_BACKWARD_ERROR*denominator[active]/4)
+                newly_finished=stopped&~finished
+                steps[newly_finished]=j+1
+                finished|=stopped
+                basis[:,finished,j+1]=0.
+                if np.all(finished):break
+            steps[~finished]=j+1
+            y=np.zeros((c,j+1),complex)
+            for count_steps in np.unique(steps):
+                columns=np.flatnonzero(steps==count_steps)
+                y[columns,:count_steps]=np.linalg.solve(hessenberg[columns,:count_steps,:count_steps],
+                                                       rhs[columns,:count_steps,None])[...,0]
+            np.einsum('ncj,cj->nc',basis[:,:,:j+1],y,out=work)
             x[:,active]+=self.factor.apply(work,solve=True,trans=trans)
 
     def inverse(self,rhs,trans=0,return_residual=False,limit=SOLVE_BACKWARD_ERROR_LIMIT):
@@ -178,12 +214,17 @@ class CompressedFactor:
         if b.ndim!=2 or b.shape[0]!=len(self.a) or not b.shape[1] or not np.all(np.isfinite(b)):
             raise ValueError('Invalid compressed RHS.')
         failed=False
+        reused=self.recycled
         try:x,residual=self._refine(b,trans)
         except (HierarchicalRejected,np.linalg.LinAlgError,RuntimeWarning) as exc:
-            if self.tolerance<=2e-10:raise
-            self.event['coarse_rejection']=str(exc);failed=True
+            if self.tolerance<=2e-10 and not reused:raise
+            if reused:self.event['frequency_preconditioner']['rejected']=str(exc)
+            else:self.event['coarse_rejection']=str(exc)
+            failed=True
         if failed:
-            self._build(2e-10);x,residual=self._refine(b,trans)
+            if reused:self._fresh_build()
+            else:self._build(2e-10)
+            x,residual=self._refine(b,trans)
         errors=self.physical_errors(x,b,residual,trans)
         if not np.all(np.isfinite(errors)) or np.max(errors)>limit:
             raise HierarchicalRejected('Compressed inverse failed the original-coefficient error bound.')
@@ -194,6 +235,18 @@ class CompressedFactor:
         solution=x[:,0] if vector else x
         if return_residual:return solution,residual[:,0] if vector else residual
         return solution
+
+    def retain_preconditioner(self):
+        """Transfer the inverse only after the complete field solve succeeded."""
+        if self.recycling_key is None or self.factor is None:return
+        from ghost_backend.compressed.recycling import save,capacity_bytes
+        capacity=capacity_bytes()
+        if not capacity:return
+        event=self.event.setdefault('frequency_preconditioner',{})
+        event.update(cached=False,cache_capacity_bytes=capacity)
+        if save(self.recycling_key,self.original_frequency,self.factor):
+            event['cached']=True
+            self.factor=None
 
     def _condition(self):
         rows,columns,norm=self.a.equilibrate()

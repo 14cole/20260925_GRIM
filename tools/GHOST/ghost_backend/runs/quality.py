@@ -84,6 +84,13 @@ def solver_report_text(metadata):
         lines.append(f"Modal convergence: {sum(bool(value) for value in modal)}/{len(modal)} frequencies passed")
     if any(row.get("near_quadrature") for row in frequencies):
         lines.append("Near-quadrature evidence is included in the per-frequency details.")
+    quadrature = metadata.get('quadrature_comparison')
+    if quadrature:
+        worst = max((row.get('complex_max_normalized', 0.) for row in quadrature.get('samples', [])), default=0.)
+        lines.append('Same-mesh integration comparison: {} (largest normalized complex-field change {:.4g}%).'.format(
+            'passed' if quadrature.get('passed') else 'failed', 100.*worst))
+    if modal:
+        lines.append('Modal convergence covers the requested angles and polarizations; angular interpolation is not certified.')
     layers = metadata.get("thin_layer", [])
     if (any(layers.values()) if isinstance(layers, dict) else bool(layers)):
         lines.append("Thin layer: first-order thickness approximation. Mesh certification does not certify its difference from bulk material.")
@@ -107,8 +114,10 @@ def solver_report_text(metadata):
         lines.append('Frequencies that failed the local mesh comparison passed after retrying global sizing.')
     checkpoints = metadata.get('frequency_checkpoints')
     if checkpoints:
-        lines.append('Completed frequency checkpoints: {}; reused: {}.'.format(checkpoints['completed'], checkpoints['reused']))
+        lines.append('Completed frequencies: {}; saved checkpoints: {}; reused: {}.'.format(
+            checkpoints['completed'], checkpoints.get('persisted', checkpoints['completed']), checkpoints['reused']))
         lines.append('Checkpoint directory: ' + str(checkpoints['directory']))
+        lines.extend(checkpoints.get('write_warnings', []))
     if metadata.get("survey_mode"):
         lines.append("Survey: the mesh-refinement comparison was not run.")
     profile = metadata.get("runtime_profile", {})

@@ -6,12 +6,20 @@ condition and mesh-convergence gates. Geometry and material values are unchanged
 """
 import copy
 import time
+from functools import lru_cache
 import numpy as np
 from ghost_backend.execution.runtime import ScopedValue
 from ghost_backend.execution.options import current_options, execution_scope, automatic_backend_requested
 from ghost_backend.twod.basis import abscissae
 
 _INDICATORS = ScopedValue('ghost_hp_indicators', None)
+
+
+@lru_cache(maxsize=2)
+def _legendre_transform(degree):
+    result = np.linalg.inv(np.polynomial.legendre.legvander(2*abscissae(degree)-1, degree))
+    result.flags.writeable = False
+    return result
 
 
 class Indicators:
@@ -25,14 +33,16 @@ class Indicators:
         # Coefficients in a shifted Legendre basis give a mesh-local smoothness
         # indicator. Angle batches are discarded; only one scalar per primitive
         # survives, including contributions from both sides of material interfaces.
-        transform = np.linalg.inv(np.polynomial.legendre.legvander(2*abscissae(degree)-1, degree))
+        transform = _legendre_transform(degree)
         magnitude = np.max(abs(density), axis=0)
         scale = np.maximum(magnitude, np.finfo(float).tiny)
         for first in range(0, len(ids), 256):
             last = min(first+256, len(ids))
             local = density[ids[first:last]] / scale[None, None, :]
             tail = np.einsum('a,ear->er', transform[-1], local)
-            scores = np.max(abs(tail)**2, axis=1)
+            # Sum individual angle energies, not maxima of arbitrary batches.
+            # This makes refinement independent of RAM-driven RHS batch sizes.
+            scores = np.sum(abs(tail)**2, axis=1)
             for element, score in zip(mesh.elements[first:last], scores):
                 key = getattr(element, 'primitive_key', '')
                 if key:
@@ -78,13 +88,15 @@ def run_certified(low_level_solver, geometry_snapshot, solver_kwargs,
 def _run_certified(low_level_solver, geometry_snapshot, solver_kwargs,
                    mesh_convergence_policy, progress_callback, shared_discretization_caches=None):
     from ghost_backend.twod import solver as s
-    from ghost_backend.twod.preparation import prepare_geometry
+    from ghost_backend.twod.preparation import prepare_geometry, mesh_frequencies
     from ghost_backend.twod.adaptive_geometry import eligible_snapshot
     from ghost_backend.runs.quality import validate_mesh_convergence_policy
     options = current_options()
     _, _, materials, scale = prepare_geometry(geometry_snapshot, solver_kwargs.get('material_base_dir'),
                                          solver_kwargs.get('geometry_units', 'inches'))
-    eligible, reason = eligible_snapshot(geometry_snapshot, materials, solver_kwargs['frequencies_ghz'],
+    frequencies = (mesh_frequencies(solver_kwargs['frequencies_ghz']) if solver_kwargs.get('mesh_reference_ghz') is not None
+                   else solver_kwargs['frequencies_ghz'])
+    eligible, reason = eligible_snapshot(geometry_snapshot, materials, frequencies,
                                          scale, solver_kwargs.get('mesh_reference_ghz'))
     policy = validate_mesh_convergence_policy(mesh_convergence_policy)
     if not eligible:

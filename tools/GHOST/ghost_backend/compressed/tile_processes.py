@@ -98,18 +98,17 @@ def _initialize(payload):
 def _tile(task):
     from ghost_backend.execution.cpu import _STATE
     from ghost_backend.execution.options import execution_scope
-    i, j = task
+    i, j, missing = task
     oracle, compressors, options, state, _ = _WORKER
     groups = compressors[0].groups
     sources = _sources(oracle)
     before = [[getattr(o, name) for name in COUNTERS] for o in sources]
     with execution_scope(options, assembly_threads=1), _STATE.override(state):
-        values = oracle.get_with_error(groups[i], groups[j])
-    if len(compressors) == 1:
-        values = [values]
+        from ghost_backend.compressed.operator import tile_values
+        values = tile_values(oracle, groups[i], groups[j], missing)
     counters = [([getattr(o, name)-old for name, old in zip(COUNTERS, previous)], o.max_entries)
                 for o, previous in zip(sources, before)]
-    return [shell.compress_tile(i, j, raw, tail) for shell, (raw, tail) in zip(compressors, values)], counters
+    return {index: compressors[index].compress_tile(i,j,*value) for index,value in values.items()}, counters
 
 
 def compressed_tiles(oracle, operators, workers, payload, checkpoint):
@@ -123,14 +122,19 @@ def compressed_tiles(oracle, operators, workers, payload, checkpoint):
     from ghost_backend.execution.runtime import single_thread_worker_environment
     groups = operators[0].groups
     def tiles():
-        return ((i, j) for j in range(len(groups)) for i in range(len(groups)))
+        return ((i, j, [index for index,op in enumerate(operators) if (i,j) not in op.pilot_tiles])
+                for j in range(len(groups)) for i in range(len(groups)))
     remaining = iter(tiles())
     sources = _sources(oracle)
     done = 0
     pending = deque()
     window = max(1, 2*int(workers))
-    executor = ProcessPoolExecutor(workers, mp_context=mp.get_context('spawn'),
-                                   initializer=_initialize, initargs=(payload,))
+    from ghost_backend.compressed.worker_pool import acquire, run_tile
+    owner = acquire(workers)
+    path = owner.prepare(payload) if owner is not None else None
+    executor = owner.executor if owner is not None else ProcessPoolExecutor(
+        workers, mp_context=mp.get_context('spawn'), initializer=_initialize, initargs=(payload,))
+    successful = False
     def fill():
         # Starting a process imports numerical runtimes before its initializer.
         # Keep both bootstrap protections around every bounded submission.
@@ -140,12 +144,17 @@ def compressed_tiles(oracle, operators, workers, payload, checkpoint):
                 if task is None:
                     break
                 checkpoint()
-                pending.append(executor.submit(_tile, task))
+                from concurrent.futures import Future
+                if task[2]:
+                    future = executor.submit(run_tile,path,task) if owner is not None else executor.submit(_tile,task)
+                else:
+                    future = Future();future.set_result(({}, [([0]*len(COUNTERS),o.max_entries) for o in sources]))
+                pending.append((future,task))
     try:
         fill()
         while pending:
             checkpoint()
-            future = pending[0]
+            future,task = pending[0]
             while True:
                 try:
                     compressed, counters = future.result(timeout=.1)
@@ -158,26 +167,33 @@ def compressed_tiles(oracle, operators, workers, payload, checkpoint):
                     setattr(source, name, getattr(source, name)+delta)
                 source.max_entries = max(source.max_entries, largest)
             done += 1
-            yield compressed
+            from ghost_backend.compressed.operator import take_pilot
+            yield [compressed[index] if index in compressed else take_pilot(op,*task[:2])
+                   for index,op in enumerate(operators)]
             # The consumer has stored/released the preceding result before
             # another job enters the window. Futures cannot retain the full
             # operator behind a slow early tile.
             del compressed, counters, future
             fill()
+        successful = True
     except BrokenProcessPool:
         pass
     finally:
-        for future in pending:
+        for future,task in pending:
             future.cancel()
         pending.clear()
-        for process in list((getattr(executor, '_processes', None) or {}).values()):
-            if process.is_alive():
-                process.terminate()
-        executor.shutdown(wait=True, cancel_futures=True)
+        if owner is not None:
+            if not successful:
+                owner.close()
+        else:
+            for process in list((getattr(executor, '_processes', None) or {}).values()):
+                if process.is_alive():
+                    process.terminate()
+            executor.shutdown(wait=True, cancel_futures=True)
     from itertools import islice
-    for i, j in islice(tiles(), done, None):
+    for i, j, missing in islice(tiles(), done, None):
         checkpoint()
-        values = oracle.get_with_error(groups[i], groups[j])
-        if len(operators) == 1:
-            values = [values]
-        yield [operator.compress_tile(i, j, raw, tail) for operator, (raw, tail) in zip(operators, values)]
+        from ghost_backend.compressed.operator import tile_values, take_pilot
+        values = tile_values(oracle,groups[i],groups[j],missing) if missing else {}
+        yield [op.compress_tile(i,j,*values[index]) if index in values else take_pilot(op,i,j)
+               for index,op in enumerate(operators)]

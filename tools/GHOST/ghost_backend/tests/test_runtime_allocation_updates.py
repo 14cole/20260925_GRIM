@@ -139,7 +139,9 @@ class FakeOracle:
 
 class FakeOperator:
     groups = [np.asarray([i]) for i in range(5)]
-    def compress_tile(self, i, j, raw, tail):
+    def __init__(self):
+        self.pilot_tiles = {}
+    def compress_tile(self, i, j, raw, tail, proposed=None):
         return i, j
 
 
@@ -147,7 +149,7 @@ class FakeFuture:
     def __init__(self, owner, task):
         self.owner, self.task, self.cancelled = owner, task, False
     def result(self, timeout=None):
-        if self.owner.fail == self.task:
+        if self.owner.fail == self.task[:2]:
             from concurrent.futures.process import BrokenProcessPool
             raise BrokenProcessPool('test native worker death')
         if self.owner.waiting:
@@ -155,7 +157,8 @@ class FakeFuture:
             self.owner.wait_attempts += 1
             raise TimeoutError()
         self.owner.waiting_count -= 1
-        return [self.task], [([1, 1, 0], 1)]
+        i, j, missing = self.task
+        return {index: (i, j) for index in missing}, [([1, 1, 0], 1)]
     def cancel(self):
         self.cancelled = True
 

@@ -25,9 +25,8 @@ def residual_storage_settings():
 def _residual_spool_selected(matrix, owned, policy):
     """Spool the original coefficients (``linalg.residual_spool``) instead of
     keeping them next to the LU: the same ``dense_residual_storage`` policy as
-    the 2-D dense factor ('auto' spools a system of 512 MiB or more only when
-    its copy does not fit the memory available as it is factored; the worker
-    plan prices the copy)."""
+    the 2-D dense factor ('auto' checks host headroom and the remaining solve
+    reservation; explicit reservations also protect systems below 512 MiB)."""
     from ghost_backend.linalg.residual_spool import auto_spooled
     eligible = (owned and isinstance(matrix, np.ndarray) and matrix.dtype == np.complex128
                 and matrix.ndim == 2 and matrix.flags.owndata and matrix.flags.writeable
@@ -155,6 +154,7 @@ class ModalFactor:
                           max_backward_error=0., max_relative_residual=0., refinement_steps=0,
                           residual_storage='memory')
         self.monitor_cond = monitor_cond
+        self._owned_matrix = owned
         self._residual_storage = residual_storage
         self.norm_1 = None
         if monitor_cond:
@@ -206,8 +206,8 @@ class ModalFactor:
         self.hierarchical = self.mirror = None
         self.event.update(backend='lu', **{key: str(reason)})
         self.event['factorizations'] += 1
-        # The matrix is kept for the residuals: LU works on its own copy.
-        self._factor_lu(False, self._residual_storage)
+        # An owned matrix may be spooled if LU's copy exceeds the reservation.
+        self._factor_lu(self._owned_matrix, self._residual_storage)
         self._condition()
 
     def _condition(self):
@@ -237,6 +237,7 @@ class ModalFactor:
                 self.mode, self.condition, BOR_CONDITION_EST_MAX))
 
     def _factor_lu(self, owned, residual_storage):
+        from ghost_backend.linalg.residual_spool import require_copy_capacity, copy_for_lu
         matrix, mode = self.a, self.mode
         getrf, self.getrs, self.gecon = get_lapack_funcs(('getrf', 'getrs', 'gecon'), (matrix,))
         # 0: LU of A (solve A x = b); 1: LU of A^T in a C-ordered buffer
@@ -251,6 +252,7 @@ class ModalFactor:
             except OSError:
                 if policy == 'disk':
                     raise
+                require_copy_capacity(matrix.nbytes)
         if spool is not None:
             buffer = matrix if matrix.flags.f_contiguous else matrix.T
             self.trans = 0 if matrix.flags.f_contiguous else 1
@@ -263,8 +265,9 @@ class ModalFactor:
             self.event.update(residual_storage='disk', original_matrix_disk_bytes=int(matrix.nbytes))
         else:
             # Keep A for original-coefficient residuals; LAPACK owns one F-order copy.
+            lu_buffer = copy_for_lu(matrix)
             self.lu, self.piv, info = timed_stage('factorization')(getrf)(
-                np.array(matrix, dtype=complex, order='F', copy=True), overwrite_a=True)
+                lu_buffer, overwrite_a=True)
         if info:
             raise RuntimeError('BoR mode m={} LU factorization failed (LAPACK info={}).'.format(mode, info))
 
@@ -281,7 +284,9 @@ class ModalFactor:
             try:
                 return timed_stage('rhs_solve')(self.hierarchical.solve)(rhs)
             except (HierarchicalRejected, np.linalg.LinAlgError, RuntimeWarning) as exc:
-                self._fall_back_to_lu(exc)
+                reason = str(exc)
+            # The traceback must release the failed factor before LU allocates.
+            self._fall_back_to_lu(reason)
         if self.mirror is not None:
             return timed_stage('rhs_solve')(self.mirror.solve)(rhs)
         value, info = timed_stage('rhs_solve')(self.getrs)(self.lu, self.piv, rhs, trans=self.trans)
@@ -335,7 +340,11 @@ class ModalFactor:
                 x, residual = timed_stage('rhs_solve')(self.hierarchical.solve)(b, return_residual=True)
                 np.negative(residual, out=residual)
             except (HierarchicalRejected, np.linalg.LinAlgError, RuntimeWarning) as exc:
-                self._fall_back_to_lu(exc)
+                reason = str(exc)
+            else:
+                reason = None
+            if reason is not None:
+                self._fall_back_to_lu(reason)
                 x = residual = None
         x, relative, backward = self._refined(b, x, residual)
         if self.mirror is not None and not (np.max(relative) <= BOR_LINEAR_RESIDUAL_MAX

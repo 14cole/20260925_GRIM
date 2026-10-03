@@ -488,17 +488,17 @@ class _SolveWorker(QObject):
             cfie_alpha=self.cfie_alpha,
             abort_event=self.abort_event,
             bor_options=self.bor_options,
+            progress_callback=self._on_progress,
         )
         if self.mesh_certification:
-            return solve_monostatic_rcs_bor_certified(
-                progress_callback=self._on_progress,
-                mesh_convergence_policy=self.mesh_policy,
-                **kwargs
-            )
-        return solve_monostatic_rcs_bor_survey(
-            progress_callback=self._on_progress,
-            **kwargs
-        )
+            kwargs['mesh_convergence_policy'] = self.mesh_policy
+        solve = (solve_monostatic_rcs_bor_certified if self.mesh_certification
+                 else solve_monostatic_rcs_bor_survey)
+        if self.checkpoint_directory:
+            from ghost_backend.bor.checkpoints import run_checkpointed
+            return run_checkpointed(solve, kwargs, self.checkpoint_directory,
+                                    self.bor_options, self.mesh_certification)
+        return solve(**kwargs)
 
     def _run_2d(self, snapshot, progress_callback):
         from ghost_backend.linalg.refined_lu import linear_precision
@@ -563,7 +563,8 @@ class _SolveWorker(QObject):
         if self.checkpoint_directory:
             from ghost_backend.twod.checkpoints import run_checkpointed
             return run_checkpointed(solve_monostatic, monostatic_kwargs, self.checkpoint_directory,
-                self.execution_options, self.lu_precision, self.mesh_certification)
+                self.execution_options, self.lu_precision, self.mesh_certification,
+                frequency_workers='auto')
         return solve_monostatic(**monostatic_kwargs)
 
     @Slot()
@@ -580,8 +581,8 @@ class _SolveWorker(QObject):
 
     def _execute_run(self):
         from ghost_backend.execution.metrics import progress_listener
-        from ghost_backend.twod.preparation import preparation_scope
-        with preparation_scope(), progress_listener(self.telemetry.emit):
+        from ghost_backend.twod.preparation import preparation_scope, sweep_mesh_scope
+        with preparation_scope(), sweep_mesh_scope(self.frequencies), progress_listener(self.telemetry.emit):
             return self._execute_profiled_run()
 
     def _execute_profiled_run(self):
@@ -1782,6 +1783,7 @@ class SolverTab(RunSetupMixin, QWidget):
         self._select_result_view("rcs")
 
         metadata = result.get("metadata", {}) or {}
+        partial = bool(metadata.get('partial_result'))
         units = str(metadata.get("geometry_units_in", self.cmb_units.currentText()))
         write_summary = _result_summary(result)
         quality_suffix = _quality_gate_suffix(metadata)
@@ -1802,8 +1804,17 @@ class SolverTab(RunSetupMixin, QWidget):
                 mesh_suffix = f" Mesh convergence: FAIL ({reason})."
         elif bool(metadata.get("survey_mode", False)):
             mesh_suffix = " Survey mode: base mesh only (not mesh-certified)."
+        if metadata.get('frequency_checkpoints', {}).get('write_warnings') and not partial:
+            mesh_suffix += ' Checkpoint storage warning: computed samples are available, but some frequencies cannot be resumed.'
 
-        self.progress.setValue(100)
+        if partial:
+            completed = metadata.get('frequency_checkpoints', {}).get('completed', 0)
+            requested = max(metadata.get('requested_frequency_count', 1), 1)
+            write_summary = 'PARTIAL RESULT ({}/{} frequencies). '.format(completed, requested) + write_summary
+            mesh_suffix += ' Checkpoint storage failed; remaining frequencies were not solved. Manual export is available.'
+            self.progress.setValue(int(100 * completed / requested))
+        else:
+            self.progress.setValue(100)
         self.lbl_status.setText(write_summary + quality_suffix + mesh_suffix)
         if self._last_result_stale:
             self.lbl_status.setText(
@@ -1813,7 +1824,7 @@ class SolverTab(RunSetupMixin, QWidget):
                 + " Geometry changed during the solve; result is stale and was not exported."
             )
 
-        if self.chk_export_after_solve.isChecked() and not self._last_result_stale:
+        if self.chk_export_after_solve.isChecked() and not self._last_result_stale and not partial:
             try:
                 requested_output = self.edit_output.text()
                 out_text = self._resolve_output_path(
@@ -1982,9 +1993,9 @@ class SolverTab(RunSetupMixin, QWidget):
             execution_options=preflight_setup.get("execution_options"),
             preflight_setup=preflight_setup,
             bor_options=self.bor_options_widget.value(),
-            # Completed 2D monostatic frequencies are always kept for resume.
+            # Completed monostatic frequencies are kept for 2D and BoR resume.
             checkpoint_directory=(str(Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / 'ghost-frequency-checkpoints')
-                if solver_kind == '2d' and scatter_mode == 'monostatic' else None),
+                if scatter_mode == 'monostatic' else None),
         )
         worker.moveToThread(thread)
 

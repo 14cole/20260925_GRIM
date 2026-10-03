@@ -11,6 +11,25 @@ BLOCK_ROWS = 64
 COMBINED_REUSE_CONDUCTOR_FRACTION_MAX_INVERSE = 8
 
 
+def geometric_near_pair_count(centers, lengths):
+    """Count ordered near pairs without letting one long panel widen every query."""
+    if not len(lengths):
+        return 0
+    tree = cKDTree(centers)
+    if np.all(lengths == lengths[0]):
+        return int(tree.count_neighbors(tree, 3.0*lengths[0]))
+    pairs = len(lengths)  # self pairs
+    for i, (center, length) in enumerate(zip(centers, lengths)):
+        # Every qualifying unordered pair appears in the larger panel's ball.
+        # Equal-length pairs belong to the larger index, so none are duplicated.
+        candidates = np.asarray(tree.query_ball_point(center, 3.0*length), dtype=int)
+        owned = (lengths[candidates] < length) | ((lengths[candidates] == length) & (candidates < i))
+        candidates = candidates[owned]
+        distance = np.linalg.norm(centers[candidates]-center, axis=1)
+        pairs += 2*int(np.count_nonzero(distance <= 3.0*length))
+    return pairs
+
+
 def build_layout(mesh, infos, pol):
     elements = mesh.elements
     regions, interface_elements = {}, {}
@@ -150,14 +169,7 @@ def storage_resources(mesh, layout):
 
     centers = np.asarray([e.center for e in mesh.elements])
     lengths = np.asarray([e.length for e in mesh.elements])
-    near_pairs = 0
-    if len(lengths):
-        tree = cKDTree(centers)
-        radius = 3.0 * float(lengths.max())
-        for i, center in enumerate(centers):
-            candidates = np.asarray(tree.query_ball_point(center, radius), dtype=int)
-            distance = np.linalg.norm(centers[candidates]-center, axis=1)
-            near_pairs += int(np.count_nonzero(distance <= 3.0*np.maximum(lengths[i], lengths[candidates])))
+    near_pairs = geometric_near_pair_count(centers, lengths)
     import ghost_backend.twod.operators as ops
     tile = ops._assembly_tile_size(len(mesh.elements), 312)
     largest_group = max((len(requests) for _, requests in operator_plan(layout)), default=0)

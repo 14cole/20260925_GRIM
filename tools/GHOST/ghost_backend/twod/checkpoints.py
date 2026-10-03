@@ -26,7 +26,7 @@ def _sha(path):
     return digest.hexdigest()
 
 
-def input_identity(arguments, options, precision, certified):
+def input_identity(arguments, options, precision, certified, solver_kind='2d'):
     from ghost_backend.twod.geometry import _material_base_dir_for_snapshot
     from ghost_backend.twod.preparation import material_fingerprints
     snapshot = arguments['geometry_snapshot']
@@ -34,7 +34,10 @@ def input_identity(arguments, options, precision, certified):
     files = material_fingerprints(snapshot, base)
     source = hashlib.sha256()
     backend = Path(__file__).resolve().parents[1]
-    for folder in ('twod', 'compressed', 'linalg', 'execution', 'runs', 'geometry'):
+    folders = ('twod', 'compressed', 'linalg', 'execution', 'runs', 'geometry')
+    if solver_kind == 'bor':
+        folders += ('bor',)
+    for folder in folders:
         for path in sorted(p for p in (backend / folder).rglob('*')
                            if p.is_file() and p.suffix in ('.py','.f','.f90','.c','.dll','.so','.dylib')):
             source.update(str(path.relative_to(backend)).replace('\\', '/').encode('utf-8'))
@@ -45,7 +48,8 @@ def input_identity(arguments, options, precision, certified):
     if arguments.get('mesh_reference_ghz') is not None:
         inputs['mesh_frequencies_ghz'] = arguments['frequencies_ghz']
     return hashlib.sha256(_json(dict(inputs=inputs, options=options, precision=precision,
-        certified=certified, materials=files, source=source.hexdigest(), schema=1)).encode('utf-8')).hexdigest()
+        certified=certified, solver_kind=solver_kind, materials=files,
+        source=source.hexdigest(), schema=2)).encode('utf-8')).hexdigest()
 
 
 class FrequencyCheckpoints:
@@ -172,49 +176,189 @@ class FrequencyCheckpoints:
         except (OSError, ValueError, KeyError, TypeError, EOFError, zipfile.BadZipFile):
             return None
 
+    def available(self, frequency):
+        """Verify bytes and the result header without decoding sample columns.
 
-def run_checkpointed(solve, arguments, directory, options, precision, certified):
+        The full reader still validates the columns immediately before export.
+        This keeps solve-time memory bounded to one frequency and eliminates
+        the former second decompression of every reused result.
+        """
+        path = self._path(frequency)
+        try:
+            marker = json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
+            if marker != dict(identity=self.identity, frequency=float(frequency), sha256=_sha(path)):
+                return False
+            with np.load(str(path), allow_pickle=False) as data:
+                record = json.loads(data['header'].tobytes().decode('utf-8'))
+                required = {'header'} | {'{}{}'.format(prefix, index)
+                    for index in range(len(record['columns'])) for prefix in ('c', 'p')}
+                return (record['identity'] == self.identity
+                    and record['frequency'] == float(frequency)
+                    and record['certified'] == self.certified
+                    and len(record['encodings']) == len(record['columns'])
+                    and required.issubset(data.files)
+                    and (not self.certified or record['result'].get('metadata', {}).get(
+                        'mesh_convergence_certified') is True))
+        except (OSError, ValueError, KeyError, TypeError, EOFError, zipfile.BadZipFile):
+            return False
+
+
+def _retained_bytes(value, seen=None):
+    """Conservative owned object/array size for exceptional unsaved results."""
+    import sys
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    total = sys.getsizeof(value)
+    if isinstance(value, np.ndarray):
+        return total + (_retained_bytes(value.base, seen) if value.base is not None else 0)
+    if isinstance(value, dict):
+        return total + sum(_retained_bytes(k, seen) + _retained_bytes(v, seen) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return total + sum(_retained_bytes(v, seen) for v in value)
+    if type(value).__module__ == 'ghost_backend.twod.samples':
+        return total + _retained_bytes(vars(value), seen)
+    return total
+
+
+def run_checkpointed(solve, arguments, directory, options, precision, certified,
+                     *, solver_kind='2d', merge=None, frequency_workers=1):
+    from contextlib import ExitStack
+    from ghost_backend.twod.preparation import preparation_scope, sweep_mesh_scope
+    # Direct API callers need the same run-owned workers, material snapshot,
+    # and bounded inverse cache as the desktop's outer preparation scope.
+    # Nested scopes share ownership; the outermost scope alone closes resources.
+    scope = preparation_scope() if solver_kind == '2d' else ExitStack()
+    with scope, sweep_mesh_scope(arguments['frequencies_ghz']):
+        return _run_checkpointed(solve, arguments, directory, options, precision,
+                                 certified, solver_kind=solver_kind, merge=merge,
+                                 frequency_workers=frequency_workers)
+
+
+def _run_checkpointed(solve, arguments, directory, options, precision, certified,
+                      *, solver_kind, merge, frequency_workers=1):
     from ghost_backend.twod.solver import _merge_frequency_results
+    from ghost_backend.twod.solver import _solve_memory_limit_gb
+    from ghost_backend.execution.options import _MEMORY_ALLOCATION
+    from contextlib import ExitStack
     started = time.perf_counter()
     profiles = []
     frequencies = list(arguments['frequencies_ghz'])
-    if len(set(frequencies)) != len(frequencies):
+    if solver_kind != 'bor' and len(set(frequencies)) != len(frequencies):
         raise ValueError('Duplicate frequencies are not supported in a co-polarized result grid.')
-    identity = input_identity(arguments, options, precision, certified)
-    store = FrequencyCheckpoints(directory, identity, certified)
+    identity = input_identity(arguments, options, precision, certified, solver_kind=solver_kind)
+    try:
+        store = FrequencyCheckpoints(directory, identity, certified)
+    except OSError as exc:
+        result = solve(**arguments)
+        warning = 'Frequency checkpoints unavailable; completed result remains available: ' + str(exc)
+        metadata = result.setdefault('metadata', {})
+        metadata.setdefault('warnings', []).append(warning)
+        metadata['warning_count'] = len(metadata['warnings'])
+        metadata['frequency_checkpoints'] = dict(directory=str(directory), completed=len(frequencies),
+            persisted=0, reused=0, input_sha256=identity, write_warnings=[warning])
+        return result
     progress = arguments.get('progress_callback')
     abort = arguments.get('abort_event')
     reused = 0
+    unsaved, checkpoint_warnings, completed_frequencies = {}, [], []
+    retained = 0
+    # Exceptional fallback storage is explicitly subtracted from subsequent
+    # solve admission. Large failures return a clearly identified partial
+    # result instead of silently exceeding the solve's RAM reservation.
+    initial_limit = _solve_memory_limit_gb()
+    fallback_limit = min(64 * 1024**2, max(0., initial_limit) * 1024**3 * .02)
+    parallel = None
+    if solver_kind == '2d' and frequency_workers != 1:
+        from ghost_backend.execution.frequency_sweep import compute_parallel
+        parallel = compute_parallel(solve, arguments, directory, store, options, precision,
+                                    certified, frequency_workers, initial_limit)
+        if parallel is not None:
+            completed_frequencies = parallel['completed']
+            unsaved, checkpoint_warnings = parallel['unsaved'], parallel['warnings']
+            profiles, reused = parallel['profiles'], parallel['reused']
+            retained = _retained_bytes(unsaved)
     for index,frequency in enumerate(frequencies):
         if abort is not None and abort.is_set():
             raise InterruptedError('Solve canceled; completed frequency checkpoints were retained.')
-        cached = store.load(frequency)
-        if cached is not None:
+        if parallel is not None and frequency in completed_frequencies:
+            continue
+        if retained > fallback_limit:
+            break
+        if frequency in unsaved:
+            pass  # Preserve BoR's duplicate-frequency request semantics.
+        elif store.available(frequency):
             reused += 1
         else:
+            progress_index = len(completed_frequencies) if parallel is not None else index
             def report(done, total, message):
                 if progress:
-                    progress(index*1000 + int(1000*done/max(total,1)), len(frequencies)*1000, message)
-            result = solve(**dict(arguments, frequencies_ghz=[frequency], progress_callback=report))
+                    progress(progress_index*1000 + int(1000*done/max(total,1)), len(frequencies)*1000, message)
+            scope = (_MEMORY_ALLOCATION.override(max(0., _solve_memory_limit_gb() - retained / 1024**3))
+                     if retained else ExitStack())
+            memory_failure = None
+            try:
+                with scope:
+                    result = solve(**dict(arguments, frequencies_ghz=[frequency], progress_callback=report))
+            except MemoryError as exc:
+                if not unsaved:
+                    raise
+                memory_failure = str(exc)
+            if memory_failure is not None:
+                checkpoint_warnings.append('Further solving stopped while preserving unsaved completed '
+                    'frequencies: ' + memory_failure)
+                break
             if result.get('metadata', {}).get('runtime_profile'):
                 profiles.append(result['metadata']['runtime_profile'])
-            store.save(frequency, result)
+            try:
+                store.save(frequency, result)
+            except OSError as exc:
+                warning = 'Frequency {:g} GHz computed but checkpoint could not be saved: {}'.format(frequency, exc)
+                checkpoint_warnings.append(warning)
+                unsaved[frequency] = result
+                retained = _retained_bytes(unsaved)
             del result
-        del cached
+        completed_frequencies.append(frequency)
         if progress:
-            progress((index+1)*1000, len(frequencies)*1000,
-                     'Frequency {:g} GHz saved; {} of {} complete ({} reused).'.format(frequency,index+1,len(frequencies),reused))
+            completed_count = len(completed_frequencies)
+            progress(completed_count*1000, len(frequencies)*1000,
+                      'Frequency {:g} GHz {}; {} of {} complete ({} reused).'.format(
+                          frequency, 'computed; checkpoint unavailable' if frequency in unsaved else 'saved',
+                          completed_count,len(frequencies),reused))
+        if retained > fallback_limit:
+            break
     if abort is not None and abort.is_set():
         raise InterruptedError('Solve canceled; completed frequency checkpoints were retained.')
+    unsaved_count = sum(frequency in unsaved for frequency in completed_frequencies)
     def completed():
-        for frequency in frequencies:
-            value = store.load(frequency)
+        for frequency in completed_frequencies:
+            value = unsaved.get(frequency)
+            if value is None:
+                value = store.load(frequency)
             if value is None:
                 raise IOError('A completed frequency checkpoint changed before result export. Rerun to recompute it.')
             yield value
-    result = _merge_frequency_results(completed(), frequencies)
+    # Parallel completion order is independent of the requested output order.
+    if parallel is not None:
+        completed_frequencies = [f for f in frequencies if f in completed_frequencies]
+    result = (merge or _merge_frequency_results)(completed(), completed_frequencies)
+    remaining = [f for f in frequencies if f not in completed_frequencies]
+    if remaining:
+        checkpoint_warnings.append('PARTIAL RESULT: stopped after {} of {} frequencies because continuing '
+            'with unsaved results could exceed the available RAM allowance. Remaining frequencies: {} GHz. '
+            'Completed samples remain available for manual export.'.format(
+                len(completed_frequencies), len(frequencies), ', '.join(map(str, remaining))))
+        result['metadata']['partial_result'] = True
+        result['metadata']['remaining_frequencies_ghz'] = remaining
+        result['metadata']['requested_frequency_count'] = len(frequencies)
+    result['metadata'].setdefault('warnings', []).extend(checkpoint_warnings)
+    result['metadata']['warning_count'] = len(result['metadata']['warnings'])
     result['metadata']['frequency_checkpoints'] = dict(directory=str(store.directory),
-        completed=len(frequencies), reused=reused, input_sha256=identity)
+        completed=len(completed_frequencies), persisted=len(completed_frequencies) - unsaved_count,
+            reused=reused, input_sha256=identity, write_warnings=checkpoint_warnings)
+    if parallel is not None:
+        result['metadata']['frequency_execution'] = parallel['details']
     peaks = [p['sampled_peak_process_rss_bytes'] for p in profiles if p.get('sampled_peak_process_rss_bytes') is not None]
     result['metadata']['runtime_profile'] = dict(
         wall_seconds=time.perf_counter()-started,
@@ -233,4 +377,18 @@ def run_checkpointed(solve, arguments, directory, options, precision, certified)
     result['metadata']['runtime_profile']['process_tree_memory_semantics'] = (
         'Parent plus descendant RSS sums from this execution only; cached samples excluded; '
         'shared pages may be counted more than once. Private bytes are Windows private commit.')
+    if parallel is not None:
+        profile = result['metadata']['runtime_profile']
+        for key, value in parallel['worker_peaks'].items():
+            profile[key.replace('sampled_peak_', 'sampled_peak_frequency_worker_')] = value
+            # Independent worker maxima are not a simultaneous process-tree
+            # measurement. Do not present a worker's footprint as total RAM.
+            profile[key] = None
+        profile['memory_semantics'] = (
+            'Total concurrent RSS was not sampled. frequency_worker fields are maxima '
+            'of individual worker solve samples, not aggregate sweep memory.')
+        profile['process_tree_memory_semantics'] = profile['memory_semantics']
+        profile['stage_semantics'] = (
+            'Current execution only; cached stages excluded. Worker stage times are summed; '
+            'concurrent and nested work may overlap and their sum may exceed wall time.')
     return result

@@ -1,5 +1,5 @@
 """Finalize two polarized operators from each shared geometry tile query."""
-from ghost_backend.compressed.operator import StreamedOperator, TileWriter
+from ghost_backend.compressed.operator import StreamedOperator, TileWriter, tile_values, take_pilot
 from pathlib import Path
 import numpy as np
 import os,tempfile,hashlib
@@ -91,6 +91,8 @@ def build_pair(oracle,coordinates,tile=512,budget=512*1024**2,checkpoint=None,sp
             cls=SpooledOperator if index==1 and spool_directory is not None else StreamedOperator
             extra={'directory':spool_directory} if cls is SpooledOperator else {}
             operators.append(cls(o,coordinates,tile=tile,budget=budget,checkpoint=checkpoint,assemble=False,**extra))
+            from ghost_backend.compressed.pilots import take
+            operators[-1].pilot_tiles = take(getattr(o,'pilot_identity',None), operators[-1])
         from ghost_backend.compressed.tile_processes import prepare, compressed_tiles
         workers,payload=prepare(oracle,operators)
         if workers:
@@ -101,9 +103,14 @@ def build_pair(oracle,coordinates,tile=512,budget=512*1024**2,checkpoint=None,sp
                 for j,cols in enumerate(operators[0].groups):
                     if hasattr(oracle,'prepare_columns'):oracle.prepare_columns(cols)
                     for i,rows in enumerate(operators[0].groups):
-                        values=oracle.get_with_error(rows,cols)
+                        known = [take_pilot(op,i,j) for op in operators]
+                        missing = [index for index,value in enumerate(known) if value is None]
+                        values=tile_values(oracle,rows,cols,missing) if missing else {}
                         for index in range(2):
-                            writer.submit(operators[index].compress_tile,_store(operators,budget,index),i,j,*values[index])
+                            if known[index] is not None:
+                                writer.submit_prepared(known[index],_store(operators,budget,index))
+                            else:
+                                writer.submit(operators[index].compress_tile,_store(operators,budget,index),i,j,*values[index])
                         values=None
         for op,source in zip(operators,oracle.oracles):op.finalize(source)
     except BaseException:

@@ -90,6 +90,7 @@ class CPUState:
         self.systems = []
         self.formulations = []
         self.memory_estimates = []
+        self.stage_cost_meshes = []
         self.cache_stats = dict(hits=0, stores=0, evictions=0, bytes=0,
                                 peak_bytes=0, budget_bytes=CACHE_BYTES)
 
@@ -123,14 +124,20 @@ class CPUState:
                     batch_size=self.batch_size, cache=dict(self.cache_stats),
                     kernel_tables=list(self.table_events),
                     table_budget_bytes=TABLE_BYTES, systems=list(self.systems),
-                    formulations=list(self.formulations), memory_estimates=list(self.memory_estimates))
+                    formulations=list(self.formulations), memory_estimates=list(self.memory_estimates),
+                    stage_cost_meshes=list(self.stage_cost_meshes))
 
 
-def select_formulation(resources, progress_callback=None):
+def select_formulation(resources, progress_callback=None, frequency_ghz=None, polarization=None):
     state = _STATE.get()
     if state is not None:
         state.progress_callback = progress_callback
         state.select(resources)
+        if frequency_ghz is not None:
+            state.stage_cost_meshes.append(dict(frequency_ghz=float(frequency_ghz), phase='actual',
+                polarization=polarization, polynomial_degree=resources.get('basis_width',2)-1,
+                panels=resources.get('panels'), unknowns=resources['system_dofs'],
+                formulation=resources['formulation'], resources=dict(resources)))
 
 
 def _kernel_tables_unavailable():

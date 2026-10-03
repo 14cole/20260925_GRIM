@@ -14,6 +14,36 @@ MATMUL_WORKERS=4
 MATMUL_THREADED_COLUMNS=8
 
 
+def tile_values(oracle, rows, cols, missing=None):
+    """Query only missing polarizations, optionally proposing a verified basis."""
+    from ghost_backend.execution.options import option
+    sources = list(getattr(oracle, 'oracles', [oracle]))
+    missing = list(range(len(sources))) if missing is None else list(missing)
+    proposals = {}
+    experimental = option('compressed_far_method', 'full') == 'verified_cur'
+    if len(missing) == len(sources):
+        if experimental and hasattr(oracle, 'propose_fast_far'):
+            proposed = oracle.propose_fast_far(rows, cols)
+            if proposed is not None:
+                proposals = dict(enumerate(proposed if isinstance(proposed, list) else [proposed]))
+        values = oracle.get_with_error(rows, cols)
+        values = [values] if len(sources) == 1 else values
+        return {i: (*values[i], proposals.get(i)) for i in missing}
+    result = {}
+    for i in missing:
+        source = sources[i]
+        proposed = source.propose_fast_far(rows, cols) if experimental and hasattr(source, 'propose_fast_far') else None
+        result[i] = (*source.get_with_error(rows, cols), proposed)
+    return result
+
+
+def take_pilot(operator, i, j):
+    value = operator.pilot_tiles.pop((i, j), None)
+    if value is not None:
+        operator.pilot_reuses += 1
+    return value
+
+
 def _thread_budget():
     from ghost_backend.execution.options import allocated_cpu_budget, effective_assembly_threads
     return effective_assembly_threads(allocated_cpu_budget())
@@ -48,9 +78,23 @@ def tile_payload(raw, tail, tolerance, method, probe=True):
         if probe and min(raw.shape) >= 128:
             # Distant smooth blocks usually fit a small sampled column space.
             # This only proposes a basis: the full original tile is verified.
-            ids = np.linspace(0, raw.shape[1]-1, 16).astype(int)
-            candidate, _ = _qr_basis(raw[:, ids], tolerance * norm)
+            # Larger spatial tiles often need more than sixteen directions.
+            # A still-small proposal avoids factoring every column when that
+            # first basis is too narrow. Its stricter sampled threshold keeps
+            # weak directions until the authoritative complete-tile check.
+            width = 64 if min(raw.shape) >= 384 else (48 if min(raw.shape) >= 256 else 16)
+            ids = np.linspace(0, raw.shape[1]-1, width).astype(int)
+            threshold = tolerance * norm
+            if width > 16:
+                threshold *= .1 * np.sqrt(width / raw.shape[1])
+            candidate, _ = _qr_basis(raw[:, ids], threshold)
             recovery = candidate.conj().T @ raw
+            if width > 16:
+                # Trim weak directions in the small projected matrix so a
+                # broader proposal does not unnecessarily grow retained tiles
+                # and downstream factors. The complete tile is still checked.
+                reduced, recovery = _qr_basis(recovery, .75 * tolerance * norm)
+                candidate = candidate @ reduced
             proposed = candidate @ recovery
             proposal_error = abs(raw - proposed)
             if np.linalg.norm(proposal_error) <= tolerance * norm:
@@ -119,6 +163,18 @@ class TileWriter:
             previous_store(future.result())
         self.pending.append((self.pool.submit(contextvars.copy_context().run, compress, *args), store))
 
+    def submit_prepared(self, value, store):
+        """Keep reused tiles in the same summation order as newly built tiles."""
+        if self.pool is None:
+            store(value)
+            return
+        while self.pending and (len(self.pending) >= self.depth or self.pending[0][0].done()):
+            future, previous_store = self.pending.popleft()
+            previous_store(future.result())
+        from concurrent.futures import Future
+        future = Future();future.set_result(value)
+        self.pending.append((future,store))
+
     def __exit__(self, kind, value, traceback):
         try:
             while kind is None and self.pending:
@@ -144,6 +200,7 @@ class StreamedOperator:
         if oracle.n<=0 or coordinates.ndim!=2 or coordinates.shape[0]!=oracle.n or not coordinates.shape[1] or not np.all(np.isfinite(coordinates)):
             raise ValueError('Coordinates must be finite and match the nonempty system.')
         self.n=oracle.n;self.bytes=0;self.tiles={};self.checkpoint=checkpoint or (lambda:None)
+        self.recycling_identity = getattr(oracle,'recycling_identity',None)
         self.coordinates=coordinates.copy();self.shape=(self.n,self.n)
         self.entries=self.calls=self.max_entries=0
         self.row_error=np.zeros(self.n);self.row_norm=np.zeros(self.n)
@@ -167,6 +224,9 @@ class StreamedOperator:
                                         self.column_error,self.column_norm,self.row_max,self.coordinates,self.group_bounds))
         if self.bytes>budget:raise MemoryError('Compressed operator exceeded its retained-storage cap.')
         self.compressed=0;self.peak_tile=0;self.tolerance=tolerance;self.compression=compression;self.budget=budget
+        self.pilot_reuses = 0
+        from ghost_backend.compressed.pilots import take
+        self.pilot_tiles = take(getattr(oracle, 'pilot_identity', None), self) if assemble else {}
         if not assemble:return
         self.assemble_tiles(oracle)
 
@@ -183,8 +243,12 @@ class StreamedOperator:
                 if hasattr(oracle,'prepare_columns'):oracle.prepare_columns(cols)
                 for i,rows in enumerate(self.groups):
                     self.checkpoint()
-                    raw,tail=oracle.get_with_error(rows,cols)
-                    writer.submit(self.compress_tile,self.store_tile,i,j,raw,tail)
+                    previous = take_pilot(self, i, j)
+                    if previous is not None:
+                        writer.submit_prepared(previous,self.store_tile)
+                        continue
+                    raw,tail,proposal=tile_values(oracle,rows,cols)[0]
+                    writer.submit(self.compress_tile,self.store_tile,i,j,raw,tail,proposal)
                     raw=tail=None
         self.finalize(oracle)
 
@@ -198,7 +262,7 @@ class StreamedOperator:
     def add_tile(self,i,j,raw,tail):
         self.store_tile(self.compress_tile(i,j,raw,tail))
 
-    def compress_tile(self,i,j,raw,tail):
+    def compress_tile(self,i,j,raw,tail,proposal=None):
         """Validate and compress one tile without touching shared operator state."""
         self.checkpoint()
         rows,cols=self.groups[i],self.groups[j]
@@ -208,7 +272,9 @@ class StreamedOperator:
         if not np.all(np.isfinite(raw)) or not np.all(np.isfinite(tail)) or np.any(tail<0):
             raise ValueError('Oracle returned invalid coefficients or error bounds.')
         payload,accepted=(raw,None),False
-        if i!=j:
+        if i!=j and proposal is not None:
+            payload,raw,tail,accepted=proposal.validate(raw,tail,self.tolerance)
+        if i!=j and not accepted:
             payload,raw,tail,accepted=tile_payload(raw,tail,self.tolerance,self.compression,probe=self.separated(i,j))
         magnitude=abs(raw)
         sums=(np.sum(magnitude,axis=1),np.max(magnitude,axis=1),np.sum(tail,axis=1),
@@ -239,6 +305,7 @@ class StreamedOperator:
             retained_bytes=self.bytes,max_query_bytes=self.peak_tile,geometry_queries=oracle.calls,
             geometry_coefficients=oracle.entries,dropped_routes=oracle.dropped_routes,
             row_error_bound=float(self.row_error.max()),storage_budget=self.budget,compression=self.compression)
+        self.evidence['reused_admission_tiles'] = self.pilot_reuses
 
     def __len__(self):return self.n
     def __matmul__(self,value):return self.matmul(value)

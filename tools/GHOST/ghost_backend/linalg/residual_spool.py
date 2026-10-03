@@ -2,6 +2,7 @@
 import shutil
 import tempfile
 import weakref
+import threading
 import numpy as np
 
 
@@ -77,33 +78,63 @@ class ResidualSpool:
 
 
 # 'auto' keeps the original coefficients next to their LU whenever that copy
-# fits.  Both admission plans already price it (the 2-D dense estimate two
-# matrices, BoR three per mode worker), and each residual product of a spooled
-# matrix re-reads the whole file: the certified 10 GHz airfoil (7.8 GB system)
+# fits within host headroom and the solve reservation. A hierarchical plan
+# may not price a full LU copy, so fallback must check again. Each residual
+# product of a spooled matrix re-reads the whole file: the certified 10 GHz
+# airfoil (7.8 GB system)
 # spent 64 s of 207 s re-reading it about 20 times, and ran in 145 s kept in
-# memory within its 16.7 GB estimate.  A large matrix is spooled only when the
-# memory available as it is factored cannot hold the copy -- a guard against
-# pressure the plan did not foresee, not a size rule.
+# memory within its 16.7 GB estimate. A copy that fits stays in memory; an
+# explicit reservation also applies to matrices below the disk-I/O threshold.
 AUTO_SPOOL_MIN_BYTES = 512 * 1024**2
 COPY_MARGIN_BYTES = 256 * 1024**2
+_COPY_LOCK = threading.Lock()
 
 
 def copy_fits(nbytes):
-    """Whether a copy of ``nbytes`` (plus a margin) fits the memory available now.
+    """Check host headroom and the remaining solve/scheduler reservation.
 
-    Unknown availability counts as not fitting, which keeps a large matrix spooled.
+    The original matrix is already resident. Include current process residency
+    (conservatively including concurrent work) before admitting an additional
+    LU copy; a host with free RAM does not enlarge a solve's reservation.
+    Unknown availability counts as not fitting.
     """
-    from ghost_backend.twod.solver import _detect_available_gb
+    from ghost_backend.twod.solver import _process_rss_bytes, _solve_memory_limit_gb
     try:
-        available = float(_detect_available_gb()) * 1024**3
+        resident = max(int(nbytes), _process_rss_bytes())
+        from ghost_backend.compressed.worker_pool import retained_bytes
+        resident += retained_bytes()
+        available = float(_solve_memory_limit_gb(resident / 1024**3)) * 1024**3 - resident
     except Exception:
         return False
     return available > 0 and available >= nbytes + max(COPY_MARGIN_BYTES, nbytes // 8)
 
 
+def require_copy_capacity(nbytes):
+    """Fail before allocating an unadmitted fallback matrix copy."""
+    if not copy_fits(nbytes):
+        raise MemoryError('Dense LU and its original-matrix residual copy do not fit the '
+                          'remaining solve RAM budget. Use an owned matrix with automatic '
+                          'or disk residual storage, or increase the RAM reservation.')
+
+
+def copy_for_lu(matrix):
+    """Admit and materialize one LU copy before another worker can admit its own.
+
+    A check alone races across BoR mode workers: several can all observe the
+    same free RAM before any copy is resident. Only the bandwidth-bound copy
+    holds this lock; the much longer LAPACK factorization remains parallel.
+    """
+    with _COPY_LOCK:
+        require_copy_capacity(matrix.nbytes)
+        return np.array(matrix, dtype=np.complex128, order='F', copy=True)
+
+
 def auto_spooled(nbytes):
     """The 'auto' residual-storage decision for an eligible owned matrix."""
-    return nbytes >= AUTO_SPOOL_MIN_BYTES and not copy_fits(nbytes)
+    from ghost_backend.execution.options import allocated_memory_budget, environment_value
+    # Explicit reservations apply even below the usual disk-I/O threshold.
+    reserved = allocated_memory_budget() is not None or bool(environment_value('GHOST_MAX_SOLVE_GB', '').strip())
+    return (reserved or nbytes >= AUTO_SPOOL_MIN_BYTES) and not copy_fits(nbytes)
 
 
 def selected(matrix, owned, factor_mode):

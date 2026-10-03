@@ -13,6 +13,8 @@ class AssemblySession:
         self.abort_event = None
         self.compressed_partner = None
         self.memory_storage = {}
+        self.pilot_tiles = {}
+        self.pilot_bytes = 0
         # A co-polarized driver solves TM right after TE on the same system; its
         # TE step may then assemble both matrices in one kernel traversal.
         self.copolarized = False
@@ -100,6 +102,8 @@ def shared_assembly(function):
                 session.pending = None
                 session.compressed_partner = None
                 session.memory_storage.clear()
+                session.pilot_tiles.clear()
+                session.pilot_bytes = 0
                 session.plane_wave_loads.clear()
     return call
 

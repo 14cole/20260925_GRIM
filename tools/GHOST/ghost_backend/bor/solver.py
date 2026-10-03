@@ -740,9 +740,12 @@ JUNCTION_CELL_ORDER = 10
 JUNCTION_CELL_DEPTH = 7
 
 
-def _junction_cell_points(kind: 'str') -> 'Tuple[np.ndarray, np.ndarray, np.ndarray]':
+def _junction_cell_points(kind: 'str', refinement=None) -> 'Tuple[np.ndarray, np.ndarray, np.ndarray]':
     """Graded cells for a cross-surface pair touching at corner ``kind``."""
-    return _cell_points(kind, gorder=JUNCTION_CELL_ORDER, depth=JUNCTION_CELL_DEPTH)
+    if refinement is None:
+        from ghost_backend.bor.options import current_options
+        refinement = current_options()['near_refinement']
+    return _cell_points(kind, gorder=JUNCTION_CELL_ORDER, depth=JUNCTION_CELL_DEPTH + refinement)
 
 
 def _cell_points(kind: 'str', gorder: 'int' = 4,
@@ -1324,9 +1327,10 @@ class BorPecSolver:
         self.freq_hz = freq_hz
         self.g = gauss_on_generatrix(self.gen, gauss_order)
         self.gauss_order = gauss_order
-        self.near_depth = int(near_depth)
-        if self.near_depth < 0:
+        from ghost_backend.bor.options import current_options
+        if int(near_depth) < 0:
             raise ValueError("near_depth must be a non-negative integer.")
+        self.near_depth = int(near_depth) + current_options()['near_refinement']
 
 
         self.near_span = 2

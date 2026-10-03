@@ -94,7 +94,10 @@ static inline void first_or_add(double *acc, int first, double re, double im, do
     }
 }
 
-EXPORT int ghost_far_block(
+/* The public wrapper supplies constant widths for the linear, quadratic and
+   cubic bases. Inlining lets the compiler unroll those short contractions;
+   distances, interpolation and the order of every sum remain unchanged. */
+static inline __attribute__((always_inline)) int ghost_far_block_impl(
     int64_t mb, int64_t nb, int q, int width,
     const double *obs_pts, const double *src_pts,
     const double *qw, const double *phi,
@@ -185,6 +188,22 @@ EXPORT int ghost_far_block(
         }
     }
     return 0;
+}
+
+EXPORT int ghost_far_block(
+    int64_t mb, int64_t nb, int q, int width,
+    const double *obs_pts, const double *src_pts,
+    const double *qw, const double *phi,
+    const double *obs_norm, const double *src_norm,
+    const uint8_t *far,
+    int obs_normal_deriv, int want_s, int want_k, int mirrored,
+    double k_re, double k_im,
+    int intervals, const double *bounds, int degree, const double *coeff,
+    double *acc_s, double *acc_k, double *acc_kt) {
+    if (width == 2) return ghost_far_block_impl(mb, nb, q, 2, obs_pts, src_pts, qw, phi, obs_norm, src_norm, far, obs_normal_deriv, want_s, want_k, mirrored, k_re, k_im, intervals, bounds, degree, coeff, acc_s, acc_k, acc_kt);
+    if (width == 3) return ghost_far_block_impl(mb, nb, q, 3, obs_pts, src_pts, qw, phi, obs_norm, src_norm, far, obs_normal_deriv, want_s, want_k, mirrored, k_re, k_im, intervals, bounds, degree, coeff, acc_s, acc_k, acc_kt);
+    if (width == 4) return ghost_far_block_impl(mb, nb, q, 4, obs_pts, src_pts, qw, phi, obs_norm, src_norm, far, obs_normal_deriv, want_s, want_k, mirrored, k_re, k_im, intervals, bounds, degree, coeff, acc_s, acc_k, acc_kt);
+    return ghost_far_block_impl(mb, nb, q, width, obs_pts, src_pts, qw, phi, obs_norm, src_norm, far, obs_normal_deriv, want_s, want_k, mirrored, k_re, k_im, intervals, bounds, degree, coeff, acc_s, acc_k, acc_kt);
 }
 
 /* Tile scatter with the weighting fused in: SystemScatter's

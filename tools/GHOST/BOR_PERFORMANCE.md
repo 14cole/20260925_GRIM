@@ -533,9 +533,13 @@ the conversion implemented by the feature-assembly tools. See the
 
 Analytic sphere tests, table/streamed equivalence, complex-field comparisons,
 and mesh convergence cover different error sources. The fixed graded rule for
-self and adjacent meridian integrals still lacks an independent production
-convergence gate; its measured error and the reason it was kept are in
-[numerical methods](NUMERICAL_METHODS.md), and its metadata identifies the gap.
+self and adjacent meridian integrals is unchanged by default; its measured
+error and the reason it was kept are in [numerical methods](NUMERICAL_METHODS.md).
+The optional `quadrature_check='refine'` setting performs a second same-mesh
+solve with deeper self/adjacent/junction integration and checks complex-field
+agreement. The desktop calls this "Compare refined integration". It returns
+the refined result only after agreement, with separate comparison evidence;
+the additional solve costs time and does not certify geometric faceting error.
 Junction pairs of two surfaces use a refined rule checked against a deeper one.
 Results report `near_quadrature.efie_near_block_asymmetry_max`, the
 reciprocity defect of the retained EFIE near blocks (a free lower bound on

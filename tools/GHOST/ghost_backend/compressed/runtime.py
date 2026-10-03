@@ -69,6 +69,8 @@ def native(mesh,infos,pol,k0,kind,obs_order=8,src_order=8,layer=None):
     from ghost_backend.compressed.polarization_cache import build_pair
     from ghost_backend.twod.assembly.session import current_session, system_key
     oracle=NativeOracle(mesh,infos,pol,k0,kind,obs_order,src_order,layer)
+    from ghost_backend.compressed.pilots import attach
+    attach(oracle,mesh,infos,pol,kind,k0,layer,obs_order,src_order)
     session=current_session()
     key=(system_key(mesh,infos or [],'compressed_'+kind,obs_order,src_order),layer)
     previous=session.take(key,pol) if session is not None else None
@@ -78,6 +80,7 @@ def native(mesh,infos,pol,k0,kind,obs_order=8,src_order=8,layer=None):
     partner=getattr(session,'compressed_partner',None)
     if pol=='TE' and partner is not None and (partner[0] is mesh or kind=='thin'):
         other=NativeOracle(mesh,None if kind=='thin' else partner[1],'TM',k0,kind,obs_order,src_order,layer)
+        attach(other,mesh,None if kind=='thin' else partner[1],'TM',kind,k0,layer,obs_order,src_order)
         if other.n==oracle.n:
             pair=build_pair(PairedNativeOracle(oracle,other),coordinates(mesh,oracle.n),
                 tile=min(512,getattr(oracle,'maximum_tile',512)),budget=storage_budget(),
@@ -98,6 +101,7 @@ def regional(mesh,infos,pol,obs_order=8,src_order=8):
     from ghost_backend.compressed.operator import StreamedOperator
     from ghost_backend.compressed.polarization_cache import build_pair, SpooledOperator
     from ghost_backend.twod.assembly.session import current_session, system_key
+    from ghost_backend.compressed.pilots import attach
     session=current_session();key=system_key(mesh,infos,'compressed_region',obs_order,src_order)
     previous=session.take(key,pol) if session is not None else None
     if previous is not None:
@@ -107,6 +111,8 @@ def regional(mesh,infos,pol,obs_order=8,src_order=8):
     partner=getattr(session,'compressed_partner',None)
     if pol=='TE' and partner is not None and partner[0] is mesh:
         oracle=PairedOracle(mesh,infos,partner[1],cut=32,obs_order=obs_order,src_order=src_order)
+        for source,values,label in zip(oracle.oracles,(infos,partner[1]),('TE','TM')):
+            attach(source,mesh,values,label,'multi_region',obs_order=obs_order,src_order=src_order)
         xy=mr.dof_coordinates(mesh,oracle.oracles[0].layout)
         pair=build_pair(oracle,xy,tile=512,budget=storage_budget(),checkpoint=checkpoint,spool_directory=temporary_directory())
         pair[0].reserved_partner_bytes=pair[1].bytes
@@ -115,6 +121,7 @@ def regional(mesh,infos,pol,obs_order=8,src_order=8):
         session.compressed_partner=None
         return pair[0],oracle.oracles[0].layout
     oracle=PreparedOracle(mesh,infos,pol,cut=32,obs_order=obs_order,src_order=src_order)
+    attach(oracle,mesh,infos,pol,'multi_region',obs_order=obs_order,src_order=src_order)
     xy=mr.dof_coordinates(mesh,oracle.layout)
     operator=StreamedOperator(oracle,xy,tile=512,budget=storage_budget(),checkpoint=checkpoint)
     return operator,oracle.layout

@@ -19,7 +19,8 @@ from ghost_backend.execution.runtime import ScopedValue
 DEFAULTS = dict(version=1, angle_batch_size=64, rhs_compression='auto',
                 factorization='auto', compressed_storage_mib=0,
                 compression_tile=32, tile_cache_mib=16, near_backend='auto',
-                stream_spill='auto', far_compression='auto')
+                stream_spill='auto', far_compression='auto',
+                quadrature_check='off', near_refinement=0)
 _ACTIVE = ScopedValue('ghost_bor_options', default=None)
 _ABORT = ScopedValue('ghost_bor_abort', default=None)
 _OUTPUT_GB = ScopedValue('ghost_bor_output_gb', default=0.)
@@ -178,6 +179,12 @@ def validate_options(value):
         raise ValueError('BOR stream_spill must be auto or off.')
     if result['far_compression'] not in ('auto', 'on', 'off'):
         raise ValueError('BOR far_compression must be auto, on, or off.')
+    if result['quadrature_check'] not in ('off', 'refine'):
+        raise ValueError('BOR quadrature_check must be off or refine.')
+    if type(result['near_refinement']) is not int or not 0 <= result['near_refinement'] <= 2:
+        raise ValueError('BOR near_refinement must be an integer in 0..2.')
+    if result['quadrature_check'] == 'refine' and result['near_refinement'] == 2:
+        raise ValueError('BOR quadrature comparison needs near_refinement below 2.')
     return result
 
 
@@ -287,6 +294,24 @@ def configured(function):
         options = current_options() if supplied is None else validate_options(supplied)
         bound = signature.bind_partial(*args, **kwargs)
         bound.apply_defaults()
+        # This decorator also serves resource previews, which have no fields
+        # to compare and must never launch numerical solves during setup.
+        field_solve = 'thetas_deg' in signature.parameters or 'elevations_deg' in signature.parameters
+        if options['quadrature_check'] == 'refine' and field_solve:
+            from ghost_backend.bor.quadrature import checked_solve
+            import numpy as np
+            values = dict(bound.arguments)
+            catchall = _keyword_catchall(signature)
+            if catchall is not None:
+                values.update(values.get(catchall) or {})
+            reserved = estimate_output_gb(len(values.get('frequencies_ghz', (1,))),
+                np.size(values.get('thetas_deg', values.get('elevations_deg', ()))),
+                'certified' in function.__name__, bool(values.get('expand_to_360', False)))
+            # Direct and survey entries have no outer reserve_output wrapper.
+            # Establish their normal allowance before checked_solve adds the
+            # compact base fields retained during the refined execution.
+            with _OUTPUT_GB.override(max(output_reserved_gb(), reserved)):
+                return checked_solve(wrapped, args, kwargs, options)
         checkpoint = bound.arguments.get('check_abort', current_checkpoint())
         # Preserve the public contract: reject CFIE endpoint values before
         # trying to inspect geometry (including intentionally invalid inputs).
@@ -354,6 +379,8 @@ def configured(function):
         if isinstance(result, dict):
             if 'modes_used' in result:
                 result.setdefault('near_quadrature', {})['self_and_junction_convergence_checked'] = False
+                result['near_quadrature']['refinement_depth_increment'] = options['near_refinement']
+                result['modal_convergence_scope'] = 'requested_angles_and_polarizations'
             result['bor_execution_options'] = dict(options)
             if cache is not None:
                 result['bor_tile_cache'] = cache.evidence()

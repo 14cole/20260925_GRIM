@@ -29,6 +29,8 @@ DEFAULTS = {
     'far_quadrature_order': 0,
     'far_grading': True,
     'dense_residual_storage': 'auto',
+    'compressed_far_method': 'full',
+    'frequency_preconditioner': 'off',
 }
 # compressed_storage_mib 0 sizes compressed storage from the solve's RAM limit at run time.
 AUTOMATIC_STORAGE_MIB = 0
@@ -84,6 +86,10 @@ def validate_options(value):
         raise ValueError('RHS compression must be off, auto, or on.')
     if result['dense_residual_storage'] not in ('auto', 'memory', 'disk'):
         raise ValueError('Dense residual storage must be auto, memory, or disk.')
+    if result['compressed_far_method'] not in ('full', 'verified_cur'):
+        raise ValueError('Compressed far method must be full or verified_cur (experimental).')
+    if result['frequency_preconditioner'] not in ('off', 'reuse'):
+        raise ValueError('Frequency preconditioner must be off or reuse (experimental).')
     storage = result['compressed_storage_mib']
     if type(storage) is not int or not (storage == AUTOMATIC_STORAGE_MIB or 16 <= storage <= 1048576):
         raise ValueError('compressed_storage_mib must be 0 for automatic or an integer from 16 to 1048576.')

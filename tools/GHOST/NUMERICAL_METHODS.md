@@ -509,7 +509,169 @@ Codex's review added magnetic and lossy media (`mu_r` up to 3, `3-3j | 1-1j`:
 0.006 to 0.056 dB at 48 elements) and three-layer coatings (0.005 and 0.008 dB
 at 40 elements per surface) to the evidence for the weighted form.
 
-## Tests
+## October 2 solver review changes
+
+Fixed-reference 2-D sweeps now retain the complete request's sizing-frequency
+set across frequency-local execution and checkpoint resume. Both polarizations
+and base/fine certification phases retain their own mesh topology; matrices
+and factors still live for one frequency. Low references and dispersive
+materials can therefore produce a finer mesh than earlier canonical sweeps.
+
+Run forecasts use digest keys and a 16 MiB byte budget. Reused checkpoints
+verify their digest/header before solving and decode their sample arrays once
+at final merge. Failed checkpoint writes preserve computed results within a
+bounded allowance; if further work cannot fit, the GUI marks the result
+partial and does not automatically export it. BoR desktop sweeps now use
+frequency checkpoints with BoR source, material and option identities.
+
+LU fallback checks remaining host and solve-reservation memory before copying
+the original matrix. Failed factor construction tracebacks are released before
+replacement. Batched compressed GMRES retires completed columns independently.
+Original-matrix residual gates remain unchanged.
+
+BoR `quadrature_check='refine'` is an optional same-mesh comparison, exposed as
+"Compare refined integration" in the desktop BoR options. It increases the
+self/adjacent and cross-surface junction grading depth by one, compares each
+frequency/channel's complex fields at requested angles, and returns the
+refined result only when maximum and RMS normalized changes are at most
+0.002 and 0.001. It adds a second solve and is off by default. This checks
+integration sensitivity, not continuous angular interpolation or the accuracy
+of the drawn piecewise-linear shape. Refined integration need not reduce total
+error when integration and faceting errors previously offset each other.
+
+Far-block ACA now checks spread rows and up to three random unused rows before
+accepting its stopping estimate. A failed probe becomes a new pivot. This is
+stronger sampled evidence, not a deterministic full-block error certificate.
+
+Backend timing reuse retains the conservative initial cost prior. Repeated
+paired measurements may also inform a nearby request on the same geometry,
+materials, source, host and execution settings, subject to tight frequency,
+DOF and angular-grid bounds, stable timing samples and an uncertainty margin.
+Normal solves do not perform speculative extra backend solves for calibration.
+
+Earlier component benchmarks were measured separately from complete solves;
+their speedups are not claims of the same improvement in complete solve time.
+The published [measurement summary](../../experiments/solver_review_20261002/results.json)
+records the later airfoil and subtraction comparisons, their scope and the
+status of research prototypes. Local baseline copies and raw benchmark logs
+are not part of the published repository.
+
+The subsequent 2-D sweep improvements retain admission-sampled compressed
+tiles within a 32 MiB run cache. Reuse requires identical geometry, evaluated
+materials, polarization, quadrature settings and row/column DOF lists. Cached
+tiles enter the normal assembly queue so error-bound sums keep their original
+order. A completed polarization partner supplies an exact payload size instead
+of being sampled again. Run-owned spawned assembly workers refresh their
+coefficient data between operators and close on completion or cancellation;
+idle worker allowances remain in the memory forecast during factorization.
+
+Desktop checkpointed sweeps use up to two frequency workers when CPU, RAM and
+predicted work permit, with nested assembly pools disabled. Expensive units
+run first and final samples retain request order. CPU reservations and worker
+interpreter memory are included in admission. This changes scheduling, not
+mesh certification or the equations solved.
+
+The stage cost model separates near/far assembly, compression, factorization
+and RHS work. Nearby calibration requires the same geometry, materials,
+source, host, options and factorization regime, compatible observed meshes,
+at least three stable samples for each backend and an uncertainty margin.
+Bounds are 15% in frequency, 20% in DOFs and angle count, and 50% in stage work.
+Fallback or repeated-factorization runs do not train the stage model.
+
+`compressed_far_method='verified_cur'` is experimental and off by default.
+It proposes factors from selected exact rows and columns only for separated
+support boxes. Every coefficient is still evaluated to validate the proposal;
+its complete error enters the existing row/column error bounds. Rejected
+proposals fall back to ordinary QR compression. This is not a sampled-only
+error certificate or an asymptotically faster production assembly path.
+
+`frequency_preconditioner='reuse'` is also experimental and off by default.
+The run-local cache is limited to the smaller of 128 MiB and 5% of the solve
+RAM budget and stores inverse data only. A compatible mesh, DOF ordering,
+polarization and formulation are required, with frequency ratio at most 1.10.
+The operator is always assembled at the requested frequency. A reused inverse
+gets two correction steps and up to eight GMRES iterations before rebuilding;
+the original-coefficient backward-error gate is unchanged. Mesh-changing
+adaptive sweeps generally cannot use this cache.
+
+Native fixed-width far-kernel loops preserve the arithmetic order. The earlier
+frequency-scheduling comparison is included in the published measurement
+summary. Native-only component measurements and rejected local experiments
+do not establish complete-solve improvements.
+
+On the measured Windows host, certified `airfoil.geo` sweeps at 1, 1.5, 2,
+2.5 and 3 GHz with 181 angles and the same four-CPU/12-GiB budget averaged
+40.765 seconds sequentially and 32.845 seconds with two frequency workers
+(two runs each, 19.4% less elapsed time). Meshes matched and the largest
+complex-field change, normalized by each channel's peak, was 4.92e-13.
+One certified 10 GHz before/after pair measured 94.279 and 91.296 seconds
+(3.2% less time); memory sampling fell from 3.668 to 2.017 seconds and the
+largest normalized field change was 3.96e-14. That pair used the same optimized
+native binary on both sides to isolate the Python/backend changes. The 3 GHz
+dense solve's internal time was essentially unchanged. Parent-process peak
+working set was essentially unchanged; simultaneous worker-inclusive peak RAM
+was unavailable, so these measurements establish no RAM saving. The complete
+1-18 GHz sweep has not been timed, and component or small-sweep gains should
+not be extrapolated to it.
+
+The optional inverse-reuse experiment did not improve the measured cases.
+A fixed-mesh coated case at 1 and 1.01 GHz (384 panels, 181 angles) avoided two
+factorizations but required extra GMRES work: 4.244 seconds without reuse and
+4.692 seconds with reuse, with 16.1 MiB more peak working set. Its largest
+peak-normalized field change was 3.14e-12 and physical backward error remained
+below 2.86e-15. The fixed-mesh airfoil case at 3-3.1 GHz produced inverses
+larger than the 128 MiB cache; the redundant reuse run was stopped and is not a
+timing comparison. This evidence supports keeping the option off by default.
+
+The latest production changes widen the sampled column-space proposals used
+by ordinary QR tile compression and trim their projected rank before storage.
+Every accepted proposal is checked against the complete original tile at the
+existing tolerance; its full coefficient error still enters the operator's
+error bounds. Rejected proposals fall back to the existing compression path.
+This enabled optimization is separate from the optional `verified_cur` path.
+Regional coefficient assembly also prepares shared index maps once per
+operator and reuses selections within each tile query, avoiding redundant
+whole-mesh mapping work. It does not reuse meshes or coefficients across
+frequencies or change material routing, geometry or certification thresholds.
+
+Fresh-process certified airfoil comparisons used 181 angles, both
+polarizations, four CPU threads and a 12 GiB budget. Relative to the already
+optimized backend, the 3 GHz median changed from 15.31 to 15.21 seconds
+(essentially unchanged), the 10 GHz median from 92.12 to 79.37 seconds
+(13.8% lower), and the 18 GHz measurement from 236.75 to 196.12 seconds
+(17.2% lower). The 3 and 10 GHz figures use two runs per version; 18 GHz uses
+one paired measurement. Assembly time fell about 23-29% at 10 and 18 GHz,
+while sampled aggregate process-tree peak working set fell about 1.5%.
+Summed working sets may double-count shared pages; this is a sampled process
+metric, not a measurement of unique physical RAM consumption.
+All certification checks passed, and the largest whole-airfoil complex-field
+change was below 1.3e-13 of the corresponding pattern peak. These are separate
+single-frequency comparisons; their gains must not be added to earlier
+measurements or extrapolated to a complete frequency sweep.
+
+A one-time coherent-subtraction comparison found quadratic/cubic changes
+below 0.066% of the feature-response peak for standard PEC grooves at 3, 10
+and 15 GHz, and 0.683% for a synthetic 0.01-inch groove at 10 GHz. A finer
+cubic mesh changed the latter response by 0.236%. After the production
+optimizations, that narrow-gap subtraction was unchanged in VV and changed
+by at most 8.04e-11 of its feature peak in HH. These are observed comparisons,
+not error bounds for other geometries or individual deep nulls. The standard
+coupons have frequency-designed remote backing, so their three frequencies
+do not constitute a sweep of one fixed coupon. The published
+[results](../../experiments/solver_review_20261002/results.json) and
+[subtraction plot](../../experiments/solver_review_20261002/subtraction_comparison.png)
+record this evidence; the production subtraction workflow is unchanged.
+
+Same-frequency quadratic/cubic assembly reuse remains a small dense research
+prototype: its setup-inclusive comparison measured a 27.1% reduction, but
+does not establish a gain for the full compressed, certified airfoil solver.
+Directional far-kernel interpolation is also a prototype, compared with
+direct SciPy kernels rather than GHOST's native assembled operator.
+Higher-order BoR remains a design proposal without an implementation or
+measured saving. None of these three research directions is enabled in the
+production solver.
+
+## Running tests
 
 Install the `test` and (for desktop coverage) `gui` extras, then run
 `python ghost_backend/tests/run_suite.py`. This runs the headless suite together

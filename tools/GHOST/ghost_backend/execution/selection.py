@@ -2,9 +2,10 @@
 import math
 import copy
 import json
+import hashlib
 from ghost_backend.execution.options import execution_scope, validate_options
 from ghost_backend.execution.runtime import ScopedValue
-from ghost_backend.execution.policy import MODEL, BACKENDS, relative_cost, rank_candidates
+from ghost_backend.execution.policy import MODEL, BACKENDS, relative_cost, rank_candidates, work_threads
 
 _BATCH_SELECTION = ScopedValue('ghost_batch_backend_selection', default=None)
 
@@ -22,8 +23,14 @@ def current_batch_selection():
 
 
 def select_backend(arguments, options, certified=False, checkpoint=None):
+    from ghost_backend.twod.preparation import sweep_mesh_scope
+    with sweep_mesh_scope(arguments['frequencies_ghz']):
+        return _select_backend(arguments, options, certified, checkpoint)
+
+
+def _select_backend(arguments, options, certified=False, checkpoint=None):
     """Reuse immutable run forecasts, but make every admission against live RAM."""
-    from ghost_backend.twod.preparation import forecast_cache
+    from ghost_backend.twod.preparation import forecast_cache, mesh_frequencies
     from ghost_backend.twod import solver as s
     from ghost_backend.runs.quality import validate_mesh_convergence_policy
     cache = forecast_cache()
@@ -39,6 +46,8 @@ def select_backend(arguments, options, certified=False, checkpoint=None):
                   max_panels=arguments.get('max_panels', s.MAX_PANELS_DEFAULT),
                   mesh_reference_ghz=arguments.get('mesh_reference_ghz'),
                   fine_factor=validate_mesh_convergence_policy(arguments.get('mesh_convergence_policy'))['fine_factor'] if certified else 1.)
+    if arguments.get('mesh_reference_ghz') is not None:
+        inputs['mesh_frequencies_ghz'] = mesh_frequencies(arguments['frequencies_ghz'])
     normalized = validate_options(options)
     from ghost_backend.execution.options import (
         effective_assembly_threads, blas_thread_reservation, allocated_memory_budget,
@@ -47,7 +56,9 @@ def select_backend(arguments, options, certified=False, checkpoint=None):
     with execution_scope(dict(normalized, factorization='dense')):
         allocation = (effective_assembly_threads(), blas_thread_reservation(),
                       allocated_memory_budget(), requested_precision())
-    key = json.dumps([inputs, normalized, allocation], sort_keys=True) if cache is not None else None
+    # Retain only a digest: large geometry snapshots and angle grids must not be
+    # repeated in every frequency's cache key.
+    key = hashlib.sha256(json.dumps([inputs, normalized, allocation], sort_keys=True).encode('utf-8')).digest() if cache is not None else None
     if cache is not None and key in cache:
         cached, resource_records = cache[key]
         result = copy.deepcopy(cached)
@@ -79,9 +90,6 @@ def select_backend(arguments, options, certified=False, checkpoint=None):
     resource_records = []
     result = _forecast_backend(arguments, normalized, certified, checkpoint, resource_records)
     if cache is not None:
-        # A frequency sweep must not leave an unbounded planning cache behind.
-        if len(cache) >= 128:
-            cache.pop(next(iter(cache)))
         cache[key] = (copy.deepcopy(result), resource_records)
     return result
 
@@ -127,7 +135,7 @@ def _forecast_backend(arguments, options, certified=False, checkpoint=None, reso
     Explicit backend choices never call this function.
     """
     from ghost_backend.twod import solver as s
-    from ghost_backend.twod.preparation import prepare_geometry
+    from ghost_backend.twod.preparation import prepare_geometry, mesh_frequencies as sizing_frequencies
     from ghost_backend.runs.quality import validate_mesh_convergence_policy, scale_snapshot_panel_density
     snapshot = arguments['geometry_snapshot']
     frequencies = list(arguments['frequencies_ghz'])
@@ -154,9 +162,10 @@ def _forecast_backend(arguments, options, certified=False, checkpoint=None, reso
             if event is not None and event.is_set():
                 raise InterruptedError('Backend planning canceled.')
             ref = arguments.get('mesh_reference_ghz') or freq
-            # The co-polarized API finishes each frequency independently. The
-            # explicit single-channel API can still solve one joint mesh pair.
-            mesh_frequencies = frequencies if 'polarization' in arguments else [freq]
+            # Fixed-reference requests use the whole sweep for conservative
+            # material sizing, even though operators remain frequency-local.
+            mesh_frequencies = (sizing_frequencies(frequencies) if arguments.get('mesh_reference_ghz') is not None
+                                else frequencies if 'polarization' in arguments else [freq])
             geometries = candidate_meshes(snapshot, materials, factor, options['mesh_strategy']=='adaptive',
                                          mesh_frequencies, scale, arguments.get('mesh_reference_ghz'))
             if options['mesh_strategy']!='adaptive':
@@ -189,11 +198,12 @@ def _forecast_backend(arguments, options, certified=False, checkpoint=None, reso
                                     n_regions=resources['n_regions'], system_dofs=resources['system_dofs'],
                                     operator_matrices=resources['operator_matrices'], dense_resources=measured,
                                     n_rhs=len(arguments['elevations_deg']), solver_method='experimental_cpu')
-                            candidates[mode]['cost']+=relative_cost(resources,len(arguments['elevations_deg']),mode)
+                            threads=work_threads(resources['system_dofs'],mesh_options)
+                            candidates[mode]['cost']+=relative_cost(resources,len(arguments['elevations_deg']),mode,*threads)
                             candidates[mode]['peak_gb']=max(candidates[mode]['peak_gb'],peaks[mode])
                         records.append(dict(frequency_ghz=float(freq), phase=phase, polarization=pol,
                             polynomial_degree=degree, panels=len(panels), unknowns=resources['system_dofs'], dense_peak_gib=peaks['dense'],
-                            formulation=resources['formulation'],backend_peak_gib=peaks))
+                            formulation=resources['formulation'],backend_peak_gib=peaks, resources=dict(resources)))
     peak = max(r['dense_peak_gib'] for r in records)
     candidates={m:c for m,c in candidates.items() if m not in exclusions}
     try:

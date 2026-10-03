@@ -1,8 +1,6 @@
 """compressed RAM forecasts, separate from retained-payload limits."""
 import math
 import time
-import hashlib
-import pickle
 import numpy as np
 from ghost_backend.execution.metrics import timed_stage
 
@@ -42,9 +40,9 @@ def inverse_storage(n):
     return final + 40*n, peak + 40*n
 
 
-def sample_operator(oracle, coordinates, tile=512, checkpoint=None):
+def sample_operator(oracle, coordinates, tile=512, checkpoint=None, pilot_identity=None):
     """Sample spatial-separation bands without enumerating a quadratic grid."""
-    from ghost_backend.compressed.operator import StreamedOperator, tile_payload
+    from ghost_backend.compressed.operator import StreamedOperator
     checkpoint = checkpoint or (lambda: None)
     shell = StreamedOperator(oracle, coordinates, tile=tile, assemble=False,
         budget=max(16*MIB, 128*oracle.n), checkpoint=checkpoint)
@@ -85,9 +83,12 @@ def sample_operator(oracle, coordinates, tile=512, checkpoint=None):
                     not np.all(np.isfinite(raw)) or not np.all(np.isfinite(tail)) or np.any(tail<0)):
                 raise ValueError('Invalid coefficient tile in compressed memory forecast.')
             raw_bytes = raw.nbytes
-            payload, reconstructed, errors, _ = tile_payload(raw, tail, 1e-14, 'qr', probe=shell.separated(i,j))
+            compressed = shell.compress_tile(i, j, raw, tail)
+            payload = compressed[3]
             ratios.append(sum(a.nbytes for a in payload if a is not None)/float(raw_bytes))
-            raw = tail = payload = reconstructed = errors = None
+            from ghost_backend.compressed.pilots import save
+            save(pilot_identity, rows, cols, compressed)
+            raw = tail = payload = compressed = None
 
 
         prefix = np.r_[0, np.cumsum(lengths)]
@@ -117,17 +118,20 @@ def geometry_storage(mesh, infos, pol, kind, k0, layer=None, dofs=None):
     from ghost_backend.compressed.coefficients import NativeOracle
     from ghost_backend.compressed.regional_coefficients import PreparedOracle
     from ghost_backend.compressed.runtime import coordinates, checkpoint
-    from ghost_backend.twod.assembly.session import current_session, system_key
+    from ghost_backend.twod.assembly.session import current_session
     from ghost_backend.twod.formulations.regions import dof_coordinates
     started = time.perf_counter()
+    from ghost_backend.compressed.pilots import assembled_partner, key as pilot_key
+    previous = assembled_partner(mesh, infos, pol, kind, dofs)
+    if previous is not None:
+        return previous
     if dofs is not None and dofs <= SMALL_DENSE_DOFS:
         size = 16*dofs**2 + 96*dofs
         return dict(method='small_dense_ceiling', operator_bytes=size,
             operator_allowance_bytes=size, samples=0, sampled=False, seconds=0.)
     session = current_session()
-    key = hashlib.sha256(pickle.dumps((system_key(mesh,
-        [] if kind=='thin_dielectric_layer' else infos or [], 'memory_'+kind, 8, 8),
-        pol, complex(k0), layer), protocol=4)).digest()
+    key = pilot_key(mesh, [] if kind=='thin_dielectric_layer' else infos or [],
+                    pol, kind, k0, layer)
     cached = getattr(session, 'memory_storage', {}) if session is not None else {}
     if key in cached:
         return dict(cached[key])
@@ -146,7 +150,8 @@ def geometry_storage(mesh, infos, pol, kind, k0, layer=None, dofs=None):
         result = dict(method='small_dense_ceiling', operator_bytes=size,
             operator_allowance_bytes=size, samples=0, sampled=False)
     else:
-        result = sample_operator(oracle, xy, min(512,getattr(oracle,'maximum_tile',512)), checkpoint)
+        result = sample_operator(oracle, xy, min(512,getattr(oracle,'maximum_tile',512)), checkpoint,
+                                 pilot_key(mesh, infos, pol, kind, k0, layer))
     result['seconds'] = time.perf_counter()-started
     if session is not None:
         if len(cached) >= 8:
@@ -184,7 +189,12 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
     tile_metadata = 1280*groups**2
     from ghost_backend.twod.polynomial_quadrature import MOMENT_CACHE_BYTES
     moment_cache = resources.get('moment_cache_bytes', MOMENT_CACHE_BYTES if resources.get('basis_width', 2) > 2 else 0)
-    overhead = 128*MIB + 6144*n + count*4096 + tile_metadata + moment_cache
+    from ghost_backend.compressed.pilots import CACHE_BYTES as PILOT_BYTES
+    from ghost_backend.compressed.worker_pool import forecast_bytes
+    from ghost_backend.compressed.recycling import capacity_bytes
+    worker_bytes = forecast_bytes(d, threads, groups=groups)
+    recycle_bytes = capacity_bytes()
+    overhead = 128*MIB + 6144*n + count*4096 + tile_metadata + moment_cache + PILOT_BYTES + worker_bytes + recycle_bytes
 
     from ghost_backend.twod.operators import _ASSEMBLY_TILE
     from ghost_backend.execution.options import option
@@ -208,6 +218,8 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
         operator_allowance_bytes=int(operator), inverse_ceiling_bytes=int(inverse),
         process_geometry_bytes=int(overhead), rhs_workspace_bytes=int(solve_work),
         projection_cache_bytes=PROJECTION_CACHE_BYTES,
+        retained_worker_allowance_bytes=worker_bytes,
+        frequency_preconditioner_cache_bytes=recycle_bytes,
         moment_cache_bytes=moment_cache,
         assembly_workspace_bytes=int(assembly_work),
         tile_metadata_bytes=int(tile_metadata),

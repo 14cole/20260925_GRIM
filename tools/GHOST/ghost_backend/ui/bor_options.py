@@ -20,6 +20,11 @@ class BorOptionsWidget(QGroupBox):
         for label,value in [('Automatic','auto'),('Off','off'),('On','on')]:
             self.reuse.addItem(label,value)
         form.addRow('Incident basis reuse',self.reuse)
+        self.quadrature=QComboBox()
+        self.quadrature.addItem('Standard', 'off')
+        self.quadrature.addItem('Compare refined integration', 'refine')
+        self.quadrature.setToolTip('Runs twice on the same mesh with finer self/adjacent/junction integration. Checks complex fields at the requested angles and returns the refined result only if they agree. Adds solve time; does not certify the drawn shape.')
+        form.addRow('Integration accuracy check',self.quadrature)
         self.storage=QSpinBox()
         self.storage.setRange(0,1048576)
         self.storage.setValue(0)
@@ -57,10 +62,12 @@ class BorOptionsWidget(QGroupBox):
         self.storage.setValue(value['compressed_storage_mib'])
         self.tile.setValue(value['compression_tile'])
         self.cache.setValue(value['tile_cache_mib'])
+        self.quadrature.setCurrentIndex(self.quadrature.findData(value['quadrature_check']))
+        self._extra_options = {key:value[key] for key in ('near_backend','stream_spill','far_compression','near_refinement')}
         self._sync()
 
     def value(self):
-        return validate_options(dict(factorization=self.factorization.currentData(),
+        return validate_options(dict(getattr(self, '_extra_options', {}), factorization=self.factorization.currentData(),
             angle_batch_size=self.batch.value(),rhs_compression=self.reuse.currentData(),
             compressed_storage_mib=self.storage.value(),compression_tile=self.tile.value(),
-            tile_cache_mib=self.cache.value()))
+            tile_cache_mib=self.cache.value(),quadrature_check=self.quadrature.currentData()))

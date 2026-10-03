@@ -106,6 +106,7 @@ def test_gmres_basis_is_contiguous_and_never_conjugated_as_a_tensor(trans):
             assert x.flags.f_contiguous or x.flags.c_contiguous
             return x.copy()
     instance = cf.CompressedFactor.__new__(cf.CompressedFactor)
+    instance.recycled = False
     instance.a, instance.factor, instance.checkpoint = Operator(), Identity(), lambda: None
     original = np.conjugate
     def bounded_conjugate(value, **kwargs):

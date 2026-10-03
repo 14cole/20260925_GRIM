@@ -40,6 +40,50 @@ def _span(ids):
     return (int(ids.min()), int(ids.max())) if len(ids) else (0, -1)
 
 
+def _route_plan(row_map, column_map, weight, maps=None):
+    """Frequency-owned routing only; no coefficients or queried tiles retained."""
+    def prepare(mapping):
+        key = mapping.tobytes() if maps is not None else None
+        if maps is not None and key in maps:
+            return maps[key]
+        nodes = np.flatnonzero(mapping >= 0)
+        dofs = mapping[nodes]
+        result = nodes, dofs, _span(dofs)
+        if maps is not None:
+            maps[key] = result
+        return result
+    rn, rd, rs = prepare(row_map)
+    cn, cd, cs = prepare(column_map)
+    return weight, rn, cn, rd, cd, rs, cs
+
+
+def _selected_route(plan, rd, cd, row_span, column_span, node_count, selected_maps=None):
+    weight, rn, cn, row_dofs, column_dofs, rs, cs = plan
+    if rs[1] < row_span[0] or rs[0] > row_span[1] or cs[1] < column_span[0] or cs[0] > column_span[1]:
+        return None
+    def select(nodes, dofs, local, cache):
+        key = id(dofs)
+        if key in cache:
+            return cache[key]
+        destination = local[dofs]
+        keep = destination >= 0
+        active = nodes[keep]
+        mapping = None
+        if len(active):
+            mapping = np.full(node_count, -1, int)
+            mapping[active] = destination[keep]
+        cache[key] = mapping, active
+        return mapping, active
+    row_cache, column_cache = selected_maps if selected_maps is not None else ({}, {})
+    r, ri = select(rn, row_dofs, rd, row_cache)
+    if r is None:
+        return None
+    c, ci = select(cn, column_dofs, cd, column_cache)
+    if c is None:
+        return None
+    return (r, c, weight), ri, ci
+
+
 class PreparedOracle:
     # Plain arrays and templates: tile queries may run in worker processes.
     process_tiles=True
@@ -66,6 +110,7 @@ class PreparedOracle:
                 self.mass[node]+=bound
                 self.normal_mass[node]+=bound*np.linalg.norm(e.normal)
         self.groups=[]
+        route_maps = {}
         for k,requests in mr.operator_plan(self.layout):
             templates=ss.multi_outputs(None,mesh,self.layout,k,requests)
             prepared=[]
@@ -83,10 +128,7 @@ class PreparedOracle:
                 for output in template:
                     routes=[]
                     for old_r,old_c,weight in output.routes:
-                        row_nodes,column_nodes=np.flatnonzero(old_r>=0),np.flatnonzero(old_c>=0)
-                        row_dofs,column_dofs=old_r[row_nodes],old_c[column_nodes]
-                        routes.append((old_r,old_c,weight,row_nodes,column_nodes,row_dofs,column_dofs,
-                                       _span(row_dofs),_span(column_dofs)))
+                        routes.append(_route_plan(old_r, old_c, weight, route_maps))
                     reach.append(routes)
                 prepared.append((request,reach,source,coefficient,source_mass,weighted_mass))
             self.groups.append((k,prepared))
@@ -110,6 +152,11 @@ class PreparedOracle:
     def get(self,rows,cols):
         return self.get_with_error(rows,cols)[0]
 
+    def propose_fast_far(self, rows, cols, tolerance=1e-14):
+        """Experimental interpolation; full coefficient validation is required."""
+        from ghost_backend.compressed.fast_far import propose
+        return propose(self, rows, cols, tolerance)
+
     def get_with_error(self,rows,cols,assemble=True):
         rows,cols=CompactOperator._ids(rows,self.n),CompactOperator._ids(cols,self.n)
         if len(rows)*len(cols)*24>16*1024**2:raise MemoryError('Regional coefficient query exceeds 16 MiB.')
@@ -123,6 +170,7 @@ class PreparedOracle:
         row_span,column_span=_span(rows),_span(cols)
         nn=len(self.mesh.nodes)
         pending=[]
+        selected_maps = ({}, {})
         from ghost_backend.twod.formulations.combined_regions import fused_outputs
         combined = fused_outputs(matrix, self.mesh, self.layout, rows, cols)
         empty = ss.SystemScatter(matrix, nn, [], [], [])
@@ -132,16 +180,10 @@ class PreparedOracle:
                 pair=[]
                 for kind,output in enumerate(reach):
                     routes=[];reached_rows=[];reached_columns=[]
-                    for old_r,old_c,weight,row_nodes,column_nodes,row_dofs,column_dofs,dof_rows,dof_columns in output:
-                        # Disjoint DOF ranges prove a route misses this tile without a gather.
-                        if dof_rows[1]<row_span[0] or dof_rows[0]>row_span[1]:continue
-                        local_r=rd[row_dofs];ri=row_nodes[local_r>=0]
-                        if not len(ri):continue
-                        if dof_columns[1]<column_span[0] or dof_columns[0]>column_span[1]:continue
-                        local_c=cd[column_dofs];ci=column_nodes[local_c>=0]
-                        if not len(ci):continue
-                        r,c=np.full(nn,-1,int),np.full(nn,-1,int)
-                        r[ri]=local_r[local_r>=0];c[ci]=local_c[local_c>=0]
+                    for plan in output:
+                        selected = _selected_route(plan, rd, cd, row_span, column_span, nn, selected_maps)
+                        if selected is None:continue
+                        (r,c,weight),ri,ci=selected
                         dropped=False
                         if self.cut is not None and complex(k).imag<0:
                             dx=self.xy[ri,0][:,None]-self.xy[ci,0][None,:]
@@ -200,6 +242,12 @@ class PairedOracle:
             raise ValueError('Paired assembly requires matching TE/TM DOF layouts.')
         b.geometry=a.geometry
         self.n=a.n;self.mesh=mesh;self.calls=0;self.kernel_groups=0
+
+    def propose_fast_far(self, rows, cols, tolerance=1e-14):
+        """Sample both polarizations through their shared coefficient traversal."""
+        from ghost_backend.compressed.fast_far import propose
+        return propose(self, rows, cols, tolerance)
+
     def get_with_error(self,rows,cols):
         data=[o.get_with_error(rows,cols,assemble=False) for o in self.oracles]
         grouped={}
