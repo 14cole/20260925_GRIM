@@ -11,6 +11,7 @@ from ghost_backend.geometry.materials import (
     choose_thin_layer,
 )
 from ghost_backend.ui.table_editors import ScrollSafeComboBox
+from ghost_backend.ui.geometry_inspection import GeometryInspectionMixin
 
 try:
     from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QThread
@@ -85,11 +86,34 @@ class MplCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi)
         self.ax = self.fig.add_subplot(111)
+        self.fig.subplots_adjust(left=.16, right=.97, bottom=.16, top=.90)
         super().__init__(self.fig)
         self.setParent(parent)
 
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.updateGeometry()
+
+
+    def inaxes(self, xy):
+        # Matplotlib's default canvas hit test omits child axes. Route events
+        # before picking/navigation callbacks so the inset owns its clicks.
+        main = super().inaxes(xy)
+        for child in sorted(self.ax.child_axes, key=lambda ax: ax.get_zorder(), reverse=True):
+            if child.get_visible() and child.patch.contains_point(xy):
+                return child
+        return main
+
+
+class GeometryNavigationToolbar(NavigationToolbar):
+    def press_pan(self, event):
+        if event.inaxes in self.canvas.ax.child_axes:
+            return
+        super().press_pan(event)
+
+    def press_zoom(self, event):
+        if event.inaxes in self.canvas.ax.child_axes:
+            return
+        super().press_zoom(event)
 
 
 class _GeometryValidationWorker(QThread):
@@ -116,7 +140,7 @@ class _GeometryValidationWorker(QThread):
             self.failed.emit(str(exc))
 
 
-class GeometryTab(QWidget):
+class GeometryTab(GeometryInspectionMixin, QWidget):
     dirty_changed = Signal(bool)
 
 
@@ -133,7 +157,7 @@ class GeometryTab(QWidget):
         plot_layout = QVBoxLayout(plot_container)
         self.canvas = MplCanvas(plot_container)
 
-        self.toolbar = NavigationToolbar(self.canvas, plot_container)
+        self.toolbar = GeometryNavigationToolbar(self.canvas, plot_container)
         plot_layout.addWidget(self.toolbar)
         plot_layout.addWidget(self.canvas)
         self.lbl_status = QLabel("")
@@ -154,9 +178,9 @@ class GeometryTab(QWidget):
         self.btn_validate = QPushButton("Validate")
         self.chk_show_normals = QCheckBox("Show Normals")
         self.chk_show_normals.setToolTip(
-            "Draw the normal of every primitive, coloured by the material it "
-            "points into (blue = air, grey = PEC, green = dielectric), with a "
-            "label at each segment midpoint showing 'facing | behind'."
+            "Show normals at a readable screen size, spaced to avoid crowding. "
+            "Zoom in to reveal more arrows. Arrow = facing material; short "
+            "rear tick = material behind. Select a segment for its side labels."
         )
         self.chk_show_impedance = QCheckBox("Show Impedance")
         self.chk_show_impedance.setToolTip(
@@ -166,18 +190,45 @@ class GeometryTab(QWidget):
         self.chk_fill_materials = QCheckBox("Fill Materials")
         self.chk_fill_materials.setToolTip(
             "Fill enclosed regions with their material colour (grey = PEC, "
-            "green tints = dielectrics, white = air) as implied by each "
+            "coloured tints = dielectrics, background = air) as implied by each "
             "segment's winding. A region whose boundary segments disagree "
             "about the enclosed material is hatched red."
         )
         btn_row.addWidget(self.btn_load)
         btn_row.addWidget(self.btn_save)
         btn_row.addWidget(self.btn_validate)
-        btn_row.addWidget(self.chk_show_normals)
-        btn_row.addWidget(self.chk_show_impedance)
-        btn_row.addWidget(self.chk_fill_materials)
         btn_row.addStretch(1)
         right_layout.addLayout(btn_row)
+
+        self.cmb_geometry_mode = ScrollSafeComboBox()
+        self.cmb_geometry_mode.addItem("2D geometry", "2d")
+        self.cmb_geometry_mode.addItem("BoR profile (X = radius)", "bor")
+        self.cmb_geometry_mode.setToolTip(
+            "Choose how to preview and validate this geometry. BoR revolves the "
+            "X >= 0 half-profile around X = 0; this also selects the solver mode."
+        )
+        btn_row.insertWidget(2, self.cmb_geometry_mode)
+        display_row = QHBoxLayout()
+        self.cmb_normal_scope = ScrollSafeComboBox()
+        self.cmb_normal_scope.addItem("Auto spaced", "auto")
+        self.cmb_normal_scope.addItem("Selected only", "selected")
+        self.cmb_normal_scope.addItem("All primitives", "all")
+        self.cmb_normal_scope.setToolTip("Selected only isolates normals on the selected rows. All primitives can overlap.")
+        for widget in (self.chk_show_normals, self.cmb_normal_scope,
+                       self.chk_show_impedance, self.chk_fill_materials):
+            display_row.addWidget(widget)
+        display_row.addStretch(1)
+        plot_layout.insertLayout(1, display_row)
+        focus_row = QHBoxLayout()
+        self.btn_fit_selected = QPushButton("Fit selected")
+        self.btn_fit_all = QPushButton("Fit all")
+        self.btn_fit_selected.setToolTip("Fit the selected segments; then scroll at a narrow gap to inspect it.")
+        focus_row.addWidget(self.btn_fit_selected)
+        focus_row.addWidget(self.btn_fit_all)
+        self.lbl_preview_hint = QLabel("Scroll to zoom at cursor. Select a boundary to inspect its materials.")
+        self.lbl_preview_hint.setWordWrap(True)
+        focus_row.addWidget(self.lbl_preview_hint, 1)
+        plot_layout.insertLayout(2, focus_row)
 
         self.btn_material_models = QPushButton("Material models and boundary sides...")
         self.btn_material_models.clicked.connect(lambda: show_material_guide(self))
@@ -194,6 +245,19 @@ class GeometryTab(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         right_layout.addWidget(self.table)
+
+        self.validation_results = QTableWidget(0, 3)
+        self.validation_results.setHorizontalHeaderLabels(["Level", "Row", "Finding (click to locate)"])
+        self.validation_results.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.validation_results.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.validation_results.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.validation_results.setColumnWidth(0, 58)
+        self.validation_results.setColumnWidth(1, 42)
+        self.validation_results.setMaximumHeight(200)
+        self.validation_results.setWordWrap(True)
+        self.validation_results.hide()
+        self.validation_results.cellClicked.connect(self._select_validation_finding)
+        right_layout.addWidget(self.validation_results)
 
         mesh_actions = QHBoxLayout()
         self.btn_find_refinement = QPushButton("Find corners / junctions")
@@ -309,10 +373,91 @@ class GeometryTab(QWidget):
 
         self.canvas.mpl_connect("button_press_event", self._on_plot_button_press)
         self.canvas.mpl_connect("scroll_event", self._on_plot_scroll)
+        self._normal_view = None
+        self._axis_artist = None
+        self.canvas.mpl_connect("draw_event", self._on_preview_draw)
+        self.cmb_geometry_mode.currentIndexChanged.connect(self._on_geometry_mode_changed)
+        self.cmb_normal_scope.currentIndexChanged.connect(self._on_show_normals_toggled)
+        self.btn_fit_selected.clicked.connect(lambda: self._fit_geometry(selected=True))
+        self.btn_fit_all.clicked.connect(lambda: self._fit_geometry(selected=False))
+
+        self._init_inspection(plot_layout)
 
         self._set_equal_column_widths(self.table, enabled=True)
         self._set_equal_column_widths(self.table_ibc, enabled=False)
         self._set_equal_column_widths(self.table_diel, enabled=False)
+
+    def geometry_mode(self):
+        return str(self.cmb_geometry_mode.currentData() or "2d")
+
+    def set_geometry_mode(self, mode):
+        index = self.cmb_geometry_mode.findData(str(mode).lower())
+        if index < 0:
+            raise ValueError("Geometry mode must be '2d' or 'bor'.")
+        self.cmb_geometry_mode.setCurrentIndex(index)
+
+    def _on_geometry_mode_changed(self, *_):
+        self._cancel_validation()
+        self._update_geometry_axes()
+        self._render_fills()
+        self._render_normals()
+        self.lbl_status.setText("BoR profile: X is radius, Y is axial Z; validate against the axisymmetric solver rules."
+                                if self.geometry_mode() == "bor" else "2D geometry: validate planar boundaries and materials.")
+        self.canvas.draw_idle()
+
+    def _update_geometry_axes(self):
+        if self._axis_artist is not None:
+            try:
+                self._axis_artist.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        self._axis_artist = None
+        ax = self.canvas.ax
+        if self.geometry_mode() == "bor":
+            ax.set_xlabel(f"Radius X ({self._geometry_unit_label()})")
+            ax.set_ylabel(f"Axial Z = Y ({self._geometry_unit_label()})")
+            self._axis_artist = ax.axvline(0, color="#888888", linestyle="--", linewidth=1, zorder=2)
+        else:
+            ax.set_xlabel(f"X ({self._geometry_unit_label()})")
+            ax.set_ylabel(f"Y ({self._geometry_unit_label()})")
+
+    def _fit_geometry(self, *, selected=False):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}) if selected else range(len(self.segments))
+        points = [(x, y) for row in rows for x, y in zip(self.segments[row].x, self.segments[row].y)
+                  if math.isfinite(x) and math.isfinite(y)]
+        if not points:
+            self.lbl_status.setText("Select one or more segments to fit." if selected else "Load geometry to preview.")
+            return
+        xs, ys = zip(*points)
+        span = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
+        pad = 0.08 * span
+        self.canvas.ax.set_xlim(min(xs) - pad, max(xs) + pad)
+        self.canvas.ax.set_ylim(min(ys) - pad, max(ys) + pad)
+        self.canvas.draw_idle()
+
+    def _preview_view_key(self):
+        ax = self.canvas.ax
+        return (*ax.get_xlim(), *ax.get_ylim(), *ax.bbox.bounds)
+
+    def _on_preview_draw(self, _event):
+        changed = False
+        if self.chk_show_normals.isChecked() and self._normal_view != self._preview_view_key():
+            self._render_normals()
+            changed = True
+        if hasattr(self, "chk_detail_inset") and self._refresh_detail_if_needed():
+            changed = True
+        if changed:
+            self.canvas.draw_idle()
+
+    def _select_validation_finding(self, row, _column):
+        item = self.validation_results.item(row, 0)
+        target = item.data(Qt.UserRole) if item else None
+        if target is not None and 0 <= target < len(self.segments):
+            if not self._inspection_row_matches(target):
+                self.cmb_material_isolation.setCurrentIndex(0)
+            self.table.selectRow(target)
+            self._apply_selection(target)
+            self._fit_geometry(selected=True)
 
     def is_dirty(self) -> 'bool':
         return bool(self._dirty)
@@ -348,6 +493,10 @@ class GeometryTab(QWidget):
         return True
 
     def request_close(self, parent: 'Optional[QWidget]' = None) -> 'bool':
+        if self._gap_worker is not None and self._gap_worker.isRunning():
+            self._clear_gap()
+            self.lbl_status.setText('Canceling minimum gap search. Close again after it finishes.')
+            return False
         if self._validation_worker is not None and self._validation_worker.isRunning():
             self._cancel_validation()
             self.lbl_status.setText('Canceling validation. Close again after it finishes.')
@@ -365,6 +514,8 @@ class GeometryTab(QWidget):
             "grid": str(grid),
         }
         self._apply_plot_theme_to_axes()
+        self._render_fills()
+        self._detail_dirty = True
         self.canvas.draw_idle()
 
     def _apply_plot_theme_to_axes(self) -> 'None':
@@ -433,6 +584,7 @@ class GeometryTab(QWidget):
         finally:
             self._populating = False
 
+        self._inspection_before_load()
         ax = self.canvas.ax
         ax.clear()
         self.segment_lines = []
@@ -458,8 +610,7 @@ class GeometryTab(QWidget):
             self.segment_lines.append(line2d)
             self.segment_base_colors.append(base_color)
         ax.set_title(self.title)
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
+        self._update_geometry_axes()
         ax.set_aspect("equal", adjustable="datalim")
         ax.grid(True, alpha=0.3)
         self._apply_plot_theme_to_axes()
@@ -1251,22 +1402,30 @@ class GeometryTab(QWidget):
     def _on_table_selection_changed(self):
         if self._syncing_selection:
             return
+        selected = {index.row() for index in self.table.selectedIndexes()}
         row = self.table.currentRow()
+        if row not in selected:
+            row = min(selected) if selected else -1
         self._apply_selection(row)
 
     def _apply_selection(self, row: 'int'):
         self._selected_row = row if (row is not None and row >= 0) else None
         self._refresh_segment_styles()
         self._update_status_label(row if row is not None else -1)
+        self._render_normals()
+        self._inspection_selection_changed()
         self.canvas.draw_idle()
 
     def _on_plot_pick(self, event):
+        if self.btn_measure_gap.isChecked() or (self._detail_ax is not None and self._inspection_axes(event.mouseevent) is self._detail_ax):
+            return
         line = getattr(event, "artist", None)
         if not line:
             return
-        try:
-            row = self.segment_lines.index(line)
-        except ValueError:
+        if self.toolbar.mode:
+            return
+        row = self._hit_test(event.mouseevent)
+        if row is None:
             return
         self._syncing_selection = True
         try:
@@ -1276,7 +1435,9 @@ class GeometryTab(QWidget):
             self._syncing_selection = False
 
     def _on_plot_button_press(self, event):
-        if event.inaxes != self.canvas.ax:
+        if self._inspection_button_press(event):
+            return
+        if event.inaxes != self.canvas.ax or self.toolbar.mode:
             return
         modifier_select = event.button == 1 and (event.key in ("control", "shift"))
         if event.button == 3 or modifier_select:
@@ -1290,14 +1451,15 @@ class GeometryTab(QWidget):
                     self._syncing_selection = False
 
     def _hit_test(self, event) -> 'Optional[int]':
-        for i in reversed(range(len(self.segment_lines))):
-            line = self.segment_lines[i]
-            contains, _ = line.contains(event)
-            if contains:
-                return i
-        return None
+        hit = self._nearest_primitive(event)
+        return hit["row"] if hit is not None else None
 
     def _on_plot_scroll(self, event):
+        if self._detail_ax is not None and self._inspection_axes(event) is self._detail_ax:
+            step = 1 if event.button == "up" else -1
+            index = max(0, min(self.cmb_detail_zoom.count() - 1, self.cmb_detail_zoom.currentIndex() + step))
+            self.cmb_detail_zoom.setCurrentIndex(index)
+            return
         if event.inaxes != self.canvas.ax or event.xdata is None or event.ydata is None:
             return
         base_scale = 1.2 if event.button == "up" else (1 / 1.2)
@@ -1309,13 +1471,16 @@ class GeometryTab(QWidget):
         ylim = ax.get_ylim()
         w = (xlim[1] - xlim[0]) / scale
         h = (ylim[1] - ylim[0]) / scale
-        ax.set_xlim(x - w / 2, x + w / 2)
-        ax.set_ylim(y - h / 2, y + h / 2)
+        fx = (x - xlim[0]) / (xlim[1] - xlim[0])
+        fy = (y - ylim[0]) / (ylim[1] - ylim[0])
+        ax.set_xlim(x - fx * w, x + (1 - fx) * w)
+        ax.set_ylim(y - fy * h, y + (1 - fy) * h)
         self.canvas.draw_idle()
 
     def _refresh_segment_styles(self):
+        selected = {index.row() for index in self.table.selectedIndexes()}
         for i, line in enumerate(self.segment_lines):
-            if self._selected_row is not None and i == self._selected_row:
+            if i in selected or (self._selected_row is not None and i == self._selected_row):
                 line.set_color("pink")
                 line.set_linewidth(2.5)
                 line.set_zorder(10)
@@ -1328,7 +1493,8 @@ class GeometryTab(QWidget):
             base = self.segment_base_colors[i] if i < len(self.segment_base_colors) else "gray"
             line.set_color(base)
             line.set_linewidth(1.5)
-            line.set_zorder(1)
+            line.set_zorder(3)
+        self._apply_material_isolation()
 
     def _clear_normals(self):
         for art in self.normal_artists:
@@ -1355,7 +1521,10 @@ class GeometryTab(QWidget):
         xs: 'List[float]' = []
         ys: 'List[float]' = []
         for i, (x1, y1, x2, y2) in enumerate(primitives):
-            if i == 0:
+            if i == 0 or (xs[-1], ys[-1]) != (x1, y1):
+                if i:
+                    xs.append(float("nan"))
+                    ys.append(float("nan"))
                 xs.append(x1)
                 ys.append(y1)
             xs.append(x2)
@@ -1384,6 +1553,13 @@ class GeometryTab(QWidget):
         if seg_type == 1:
             return "air", self._SHEET_COLOR, "air", self._SHEET_COLOR
         if seg_type == 2:
+            if self.geometry_mode() == "bor":
+                kinds = {self._parse_int_token(item.properties[0], -1)
+                         if item.properties else -1 for item in self.segments}
+                if kinds == {1, 2}:
+                    # The BoR solver treats pure PEC portions of a mixed
+                    # transmitting sheet as zero-Z sheet, with air on both sides.
+                    return "air", self._AIR_COLOR, "air", self._AIR_COLOR
             return "air", self._AIR_COLOR, "PEC", self._PEC_COLOR
         if seg_type == 3:
             return "air", self._AIR_COLOR, f"d{pos_mat}", self._diel_color(pos_mat)
@@ -1393,71 +1569,81 @@ class GeometryTab(QWidget):
             return f"d{pos_mat}", self._diel_color(pos_mat), f"d{neg_mat}", self._diel_color(neg_mat)
         return "?", "magenta", "?", "magenta"
 
-    def _render_normals(self):
-        self._clear_normals()
-        if not self.chk_show_normals.isChecked():
-            return
-        if not self.segments:
-            return
-
-        all_x = [x for seg in self.segments for x in seg.x]
-        all_y = [y for seg in self.segments for y in seg.y]
-        if not all_x or not all_y:
-            return
-        diag = max(((max(all_x) - min(all_x)) ** 2 + (max(all_y) - min(all_y)) ** 2) ** 0.5, 1.0)
-        arrow_len = 0.04 * diag
-        tick_len = 0.018 * diag
-        ax = self.canvas.ax
-
-        arrows, arrow_colors, ticks, tick_colors = [], [], [], []
-        label_rows = set(range(len(self.segments))) if len(self.segments) <= 100 else set(sorted(self.issue_rows)[:99])
+    def _render_normals(self, ax=None):
+        main = ax is None
+        if main:
+            self._clear_normals()
+            self._normal_view = self._preview_view_key()
+            self._detail_dirty = True
+        artists = self.normal_artists if main else []
+        if not self.chk_show_normals.isChecked() or not self.segments:
+            return artists
+        from ghost_backend.geometry.preview import select_normal_samples, visible_segment_midpoint
+        ax = self.canvas.ax if main else ax
+        ax.apply_aspect()
+        if main:
+            self._normal_view = self._preview_view_key()
+        transform, inverse = ax.transData, ax.transData.inverted()
+        selected = {i.row() for i in self.table.selectedIndexes()}
         if self._selected_row is not None:
-            label_rows.add(self._selected_row)
+            selected.add(self._selected_row)
+        scope = self.cmb_normal_scope.currentData()
+        candidates = []
+        bounds = (ax.bbox.x0, ax.bbox.y0, ax.bbox.x1, ax.bbox.y1)
         for row, seg in enumerate(self.segments):
+            if not self._inspection_row_matches(row):
+                continue
+            if scope == "selected" and row not in selected:
+                continue
             front_label, front_color, back_label, back_color = self._segment_side_materials(seg)
-            issue = row in self.issue_rows
-            arrow_color = "crimson" if issue else front_color
-            primitives = self._segment_primitives(seg)
-            for x1, y1, x2, y2 in primitives:
-                dx = x2 - x1
-                dy = y2 - y1
-                length = (dx * dx + dy * dy) ** 0.5
-                if length <= 1e-12:
-                    continue
-                nx = -dy / length
-                ny = dx / length
-                mx = 0.5 * (x1 + x2)
-                my = 0.5 * (y1 + y2)
-
-                arrows.append((mx, my, nx * arrow_len, ny * arrow_len))
-                arrow_colors.append(arrow_color)
-                ticks.append(((mx, my), (mx - nx * tick_len, my - ny * tick_len)))
-                tick_colors.append(back_color)
-
-            if primitives and row in label_rows:
-                x1, y1, x2, y2 = primitives[len(primitives) // 2]
+            for x1, y1, x2, y2 in self._segment_primitives(seg):
                 dx, dy = x2 - x1, y2 - y1
-                length = max((dx * dx + dy * dy) ** 0.5, 1e-12)
+                length = math.hypot(dx, dy)
+                if not math.isfinite(length) or length <= 1e-12:
+                    continue
+                start_px, end_px = transform.transform([(x1, y1), (x2, y2)])
+                clipped = visible_segment_midpoint(start_px, end_px, bounds)
+                if clipped is None:
+                    continue
+                if all(bounds[0] <= p[0] <= bounds[2] and bounds[1] <= p[1] <= bounds[3]
+                       for p in (start_px, end_px)):
+                    mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+                else:
+                    mx, my = inverse.transform(clipped)
+                center = transform.transform((mx, my))
                 nx, ny = -dy / length, dx / length
-                mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
-                txt = ax.annotate(
-                    f"{front_label} | {back_label}",
-                    xy=(mx + nx * (arrow_len * 1.35), my + ny * (arrow_len * 1.35)),
-                    ha="center", va="center", fontsize=7,
-                    color="crimson" if issue else "#222222",
-                    bbox={"boxstyle": "round,pad=0.18", "fc": "white",
-                          "ec": arrow_color, "lw": 0.6, "alpha": 0.85},
-                    zorder=13,
-                )
-                self.normal_artists.append(txt)
-
-        if arrows:
-            x, y, u, v = zip(*arrows)
-            self.normal_artists.append(ax.quiver(x, y, u, v, angles='xy', scale_units='xy',
-                scale=1, color=arrow_colors, width=.002, alpha=.85, zorder=12))
-            collection = LineCollection(ticks, colors=tick_colors, linewidths=2.2, alpha=.85, zorder=12)
-            ax.add_collection(collection)
-            self.normal_artists.append(collection)
+                # Transform a direction without translation: subtracting two
+                # transformed positions introduces noise in zero components.
+                matrix = transform.get_affine().get_matrix()
+                screen_length = math.hypot(matrix[0, 0] * nx + matrix[0, 1] * ny,
+                                           matrix[1, 0] * nx + matrix[1, 1] * ny)
+                if screen_length <= 0:
+                    continue
+                arrow_dx, arrow_dy = nx * 18 / screen_length, ny * 18 / screen_length
+                back = (mx - nx * 7 / screen_length, my - ny * 7 / screen_length)
+                candidates.append(dict(row=row, midpoint=tuple(center),
+                    priority=0 if row in selected else (1 if row in self.issue_rows else 2),
+                    arrow=(mx, my, arrow_dx, arrow_dy), tick=((mx, my), tuple(back)),
+                    front="crimson" if row in self.issue_rows else front_color, back=back_color))
+        samples = candidates if scope == "all" else select_normal_samples(candidates, min_spacing=38, bounds=bounds)
+        if samples:
+            x, y, u, v = zip(*(sample["arrow"] for sample in samples))
+            artists.append(ax.quiver(x, y, u, v, angles="xy", scale_units="xy",
+                scale=1, color=[s["front"] for s in samples], units="dots", width=1.3,
+                headwidth=4, headlength=5, alpha=.95, zorder=12))
+            collection = LineCollection([s["tick"] for s in samples],
+                colors=[s["back"] for s in samples], linewidths=1.6, alpha=.9, zorder=12)
+            ax.add_collection(collection, autolim=False)
+            artists.append(collection)
+        if main and self._selected_row is not None and 0 <= self._selected_row < len(self.segments):
+            seg = self.segments[self._selected_row]
+            front, front_color, back, _ = self._segment_side_materials(seg)
+            artists.append(ax.text(.01, .99,
+                f"{seg.name}: arrow into {front} | behind {back}", transform=ax.transAxes,
+                va="top", fontsize=8, color="#222222",
+                bbox={"boxstyle": "round,pad=.3", "fc": "white", "ec": front_color, "alpha": .95},
+                zorder=15))
+        return artists
 
     def _on_show_normals_toggled(self, checked: 'bool'):
         _ = checked
@@ -1474,168 +1660,18 @@ class GeometryTab(QWidget):
         self.fill_artists = []
 
     def _fill_loops(self) -> 'List[Dict[str, Any]]':
-        """
-        Stitch segment chains into closed loops and infer the enclosed material.
-
-        Returns dicts: {points, label, color, consistent, depth, rows}.
-        Interior side rule: for a CCW loop the interior is on the LEFT of
-        travel (= the normal side); a chain traversed backwards contributes
-        its opposite side.  All member chains of a loop must imply the same
-        interior material, otherwise the loop is flagged inconsistent.
-        """
-
-        from ghost_backend.geometry.io import _chain_area2, _chain_is_closed, _point_in_polygon
-
-        chains: 'List[Dict[str, Any]]' = []
-        for row, seg in enumerate(self.segments):
-            xs, ys = self._segment_plot_xy(seg)
-            pts = list(zip(xs, ys))
-            if len(pts) < 2:
-                continue
-            chains.append({"row": row, "pts": pts})
-
-        all_x = [p[0] for c in chains for p in c["pts"]]
-        all_y = [p[1] for c in chains for p in c["pts"]]
-        if not all_x:
-            return []
-        diag = max(((max(all_x) - min(all_x)) ** 2 + (max(all_y) - min(all_y)) ** 2) ** 0.5, 1.0)
-        tol = max(1e-12, 1e-9 * diag)
-
-        def key(p):
-            return (round(p[0] / tol), round(p[1] / tol))
-
-
-        loops: 'List[List[Tuple[Dict[str, Any], bool]]]' = []
-        open_chains = []
-        for ch in chains:
-            if _chain_is_closed(ch["pts"], tol):
-                loops.append([(ch, True)])
-            else:
-                open_chains.append(ch)
-
-
-        ends: 'Dict[Tuple[int, int], List[Tuple[int, str]]]' = {}
-        for i, ch in enumerate(open_chains):
-            ends.setdefault(key(ch["pts"][0]), []).append((i, "start"))
-            ends.setdefault(key(ch["pts"][-1]), []).append((i, "end"))
-        links: 'Dict[Tuple[int, str], Tuple[int, str]]' = {}
-        for members in ends.values():
-            if len(members) == 2 and members[0][0] != members[1][0]:
-                links[members[0]] = members[1]
-                links[members[1]] = members[0]
-
-        used: 'Set[int]' = set()
-        for i, ch in enumerate(open_chains):
-            if i in used:
-                continue
-            member_list = [(ch, True)]
-            used.add(i)
-            cur, exit_end = i, "end"
-            closed_ok = False
-            while True:
-                nxt = links.get((cur, exit_end))
-                if nxt is None:
-                    break
-                j, joined_at = nxt
-                if j == i:
-                    closed_ok = True
-                    break
-                if j in used:
-                    break
-                forward = joined_at == "start"
-                member_list.append((open_chains[j], forward))
-                used.add(j)
-                cur, exit_end = j, "end" if forward else "start"
-            if closed_ok and len(member_list) >= 2:
-                loops.append(member_list)
-
-
-        out: 'List[Dict[str, Any]]' = []
-        for members in loops:
-            pts: 'List[Tuple[float, float]]' = []
-            for ch, forward in members:
-                p = ch["pts"] if forward else list(reversed(ch["pts"]))
-                pts.extend(p if not pts else p[1:])
-            if not _chain_is_closed(pts, tol):
-                continue
-            area2 = _chain_area2(pts)
-            if abs(area2) <= 0.0:
-                continue
-            ccw = area2 > 0.0
-            labels = set()
-            label_color: 'Dict[str, str]' = {}
-            rows = []
-            for ch, forward in members:
-                seg = self.segments[ch["row"]]
-                rows.append(ch["row"])
-                fl, fc, bl, bc = self._segment_side_materials(seg)
-
-
-                front_is_interior = (ccw == forward)
-                lab, col = (fl, fc) if front_is_interior else (bl, bc)
-                labels.add(lab)
-                label_color[lab] = col
-            consistent = len(labels) == 1
-            lab = labels.pop() if consistent else "?"
-            out.append({
-                "points": pts,
-                "label": lab,
-                "color": label_color.get(lab, "red"),
-                "consistent": consistent,
-                "rows": rows,
-            })
-
-
-        for i, loop in enumerate(out):
-            rep = (0.5 * (loop["points"][0][0] + loop["points"][1][0]),
-                   0.5 * (loop["points"][0][1] + loop["points"][1][1]))
-            loop["depth"] = sum(
-                1 for j, other in enumerate(out)
-                if j != i and _point_in_polygon(rep[0], rep[1], other["points"])
-            )
-        return out
+        from ghost_backend.geometry.preview import build_material_faces
+        return build_material_faces(self.segments, self._segment_side_materials,
+                                    close_axis=self.geometry_mode() == "bor")
 
     def _render_fills(self):
         self._clear_fills()
+        self._detail_dirty = True
+        self._fill_loops_cache = []
         if not self.chk_fill_materials.isChecked() or not self.segments:
             return
-        from matplotlib.patches import Polygon as MplPolygon
-
-        ax = self.canvas.ax
-        for loop in sorted(self._fill_loops(), key=lambda d: d["depth"]):
-            if not loop["consistent"]:
-                patch = MplPolygon(
-                    loop["points"], closed=True, facecolor="none",
-                    edgecolor="red", hatch="//", lw=0.0, alpha=0.5,
-                    zorder=1 + 0.01 * loop["depth"],
-                )
-            else:
-                lab = loop["label"]
-                if lab == "air":
-                    face = "white"
-                else:
-
-
-                    from matplotlib.colors import to_rgb
-                    r, g, b = to_rgb(loop["color"])
-                    mix = 0.72
-                    face = (r + (1 - r) * mix, g + (1 - g) * mix, b + (1 - b) * mix)
-                patch = MplPolygon(
-                    loop["points"], closed=True, facecolor=face,
-                    edgecolor="none", alpha=1.0,
-                    zorder=1 + 0.01 * loop["depth"],
-                )
-            ax.add_patch(patch)
-            self.fill_artists.append(patch)
-            if loop["consistent"] and loop["label"] != "air":
-                xs = [p[0] for p in loop["points"]]
-                ys = [p[1] for p in loop["points"]]
-                txt = ax.annotate(
-                    loop["label"], xy=(sum(xs) / len(xs), sum(ys) / len(ys)),
-                    ha="center", va="center", fontsize=8, color=loop["color"],
-                    alpha=0.9, zorder=1.5,
-                )
-                self.fill_artists.append(txt)
+        self._fill_loops_cache = self._fill_loops()
+        self.fill_artists = self._draw_fill_faces(self.canvas.ax, legend=True)
 
     def _on_fill_materials_toggled(self, checked: 'bool'):
         _ = checked
@@ -1777,6 +1813,7 @@ class GeometryTab(QWidget):
 
     def _render_impedance_overlay(self):
         self._clear_impedance_overlay()
+        self._detail_dirty = True
         if not self.chk_show_impedance.isChecked() or not self.segments:
             return
         ax = self.canvas.ax
@@ -1789,7 +1826,9 @@ class GeometryTab(QWidget):
 
         lookup = self._ibcs_lookup()
 
-        for seg in self.segments:
+        for row, seg in enumerate(self.segments):
+            if not self._inspection_row_matches(row):
+                continue
             primitives = self._segment_primitives(seg)
             if not primitives:
                 continue
@@ -1940,6 +1979,10 @@ class GeometryTab(QWidget):
 
     def _cancel_validation(self, *_):
         self._validation_version += 1
+        self.issue_rows.clear()
+        self.validation_results.hide()
+        self.validation_results.setRowCount(0)
+        self._refresh_segment_styles()
         if self._validation_worker is not None:
             self._validation_worker.abort.set()
 
@@ -1953,7 +1996,7 @@ class GeometryTab(QWidget):
         worker = _GeometryValidationWorker()
         worker.audit = GeometryAudit(copy.deepcopy(self.segments),
             self._read_small_table(self.table_ibc), self._read_small_table(self.table_diel),
-            material_dir, worker.checkpoint)
+            material_dir, worker.checkpoint, mode=self.geometry_mode())
         worker.version = self._validation_version
         self._validation_worker = worker
         worker.ready.connect(self._validation_ready)
@@ -1962,7 +2005,7 @@ class GeometryTab(QWidget):
         worker.finished.connect(worker.deleteLater)
         self.destroyed.connect(worker.abort.set)
         self.btn_validate.setText('Cancel validation')
-        self.lbl_status.setText('Validating captured geometry...')
+        self.lbl_status.setText(f'Validating captured {self.geometry_mode().upper()} geometry...')
         worker.start()
 
     def _validation_finished(self):
@@ -1977,6 +2020,16 @@ class GeometryTab(QWidget):
             self.lbl_status.setText('Geometry changed during validation. Validate again for current results.')
             return
         findings, issue_rows = result
+        ordered = sorted(findings, key=lambda f: {"ERROR": 0, "WARN": 1, "INFO": 2}.get(f[0], 3))
+        self.validation_results.setRowCount(len(ordered))
+        for index, (level, source_row, message) in enumerate(ordered):
+            for column, value in enumerate((level, str(source_row + 1) if source_row >= 0 else "-", message)):
+                item = QTableWidgetItem(value)
+                item.setToolTip(message)
+                item.setData(Qt.UserRole, source_row)
+                self.validation_results.setItem(index, column, item)
+        self.validation_results.resizeRowsToContents()
+        self.validation_results.setVisible(bool(ordered))
         self.issue_rows = issue_rows
         self._refresh_segment_styles()
         self._render_normals()
@@ -1990,6 +2043,7 @@ class GeometryTab(QWidget):
         summary = (
             f"Validation complete: {len(errors)} error(s), {len(warns)} warning(s), {len(infos)} info message(s)."
         )
+        self.lbl_status.setText(summary + " Click a finding to locate it.")
         detail_lines = errors + warns + infos
         if detail_lines:
             max_lines = 30

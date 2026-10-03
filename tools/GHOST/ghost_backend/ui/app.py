@@ -45,7 +45,7 @@ class GhostWorkspace(QTabWidget):
         self.addTab(self.solver_tab, "Solver")
         self.addTab(self.line_expansion_tab, "Line Expansion")
         self.setTabToolTip(
-            0, "Load, edit, visualize, validate, and save 2-D geometry."
+            0, "Load, edit, visualize, validate, and save 2-D or BoR geometry."
         )
         self.setTabToolTip(
             1, "Solve the current Geometry tab or an explicitly selected .geo file."
@@ -56,6 +56,51 @@ class GhostWorkspace(QTabWidget):
         self.geometry_tab.dirty_changed.connect(self._sync_geometry_tab_title)
         self.solver_tab.files_exported.connect(self.files_exported.emit)
         self.line_expansion_tab.files_exported.connect(self.files_exported.emit)
+        self.solver_tab.cmb_solver_kind.currentIndexChanged.connect(
+            self._sync_geometry_mode_from_solver
+        )
+        self.geometry_tab.cmb_geometry_mode.currentIndexChanged.connect(
+            self._sync_solver_kind_from_geometry
+        )
+        self._sync_geometry_mode_from_solver()
+        self.solver_tab.cmb_units.currentTextChanged.connect(self._sync_geometry_units_from_solver)
+        self.geometry_tab.cmb_geometry_units.currentTextChanged.connect(self._sync_solver_units_from_geometry)
+        self._sync_geometry_units_from_solver()
+
+    def _sync_geometry_mode_from_solver(self, _index: int = 0) -> None:
+        self.geometry_tab.set_geometry_mode(
+            str(self.solver_tab.cmb_solver_kind.currentData() or "2d")
+        )
+
+    def _sync_solver_kind_from_geometry(self, _index: int = 0) -> None:
+        mode = self.geometry_tab.geometry_mode()
+        solver_combo = self.solver_tab.cmb_solver_kind
+        if mode == solver_combo.currentData():
+            return
+        # The solver locks its mode while working. Keep the second selector
+        # from bypassing that guard through a programmatic combo-box change.
+        if self.solver_tab.job_is_running():
+            self._sync_geometry_mode_from_solver()
+            self.geometry_tab.lbl_status.setText(
+                "Wait for the solver task to finish before changing geometry mode."
+            )
+            return
+        index = solver_combo.findData(mode)
+        if index >= 0:
+            solver_combo.setCurrentIndex(index)
+
+    def _sync_geometry_units_from_solver(self, *_):
+        self.geometry_tab.set_geometry_units(self.solver_tab.cmb_units.currentText())
+
+    def _sync_solver_units_from_geometry(self, *_):
+        units = self.geometry_tab.geometry_units()
+        if units == self.solver_tab.cmb_units.currentText():
+            return
+        if self.solver_tab.job_is_running():
+            self._sync_geometry_units_from_solver()
+            self.geometry_tab.lbl_status.setText("Wait for the solver task to finish before changing geometry units.")
+            return
+        self.solver_tab.cmb_units.setCurrentText(units)
 
     def _sync_geometry_tab_title(self, dirty: bool) -> None:
         index = self.indexOf(self.geometry_tab)
