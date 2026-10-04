@@ -61,8 +61,16 @@ if _sys.version_info < (3, 10):
 if not __package__:
     import sys
     from pathlib import Path
-    if Path(__file__).resolve().parent.name == "ghost_backend":
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    _driver_directory = Path(__file__).resolve().parent
+    _runtime_directory = _driver_directory / "runtime"
+    if "--worker" in sys.argv:
+        _worker_index = sys.argv.index("--worker")
+        if len(sys.argv) > _worker_index + 1:
+            _runtime_directory = Path(sys.argv[_worker_index + 1]).resolve() / "runtime"
+    if (_runtime_directory / "ghost_backend" / "execution" / "paths.py").is_file():
+        sys.path.insert(0, str(_runtime_directory))
+    elif _driver_directory.name == "ghost_backend":
+        sys.path.insert(0, str(_driver_directory.parent))
 from ghost_backend.execution.paths import backend_root as _backend_root
 from ghost_backend.execution.options import (
     blas_thread_reservation,
@@ -94,6 +102,7 @@ from ghost_backend.execution.provenance import (
     describe_source_mismatch,
     manifest_solve_spec_fingerprint,
     runtime_environment_fingerprint,
+    runtime_environment_payload,
     stable_json_fingerprint,
     embed_output_attestation,
     unit_solve_spec_fingerprint,
@@ -682,7 +691,14 @@ def submit():
             })
 
     mesh_policy = accuracy_target_policy(ACCURACY_TARGET)
+    # Workers import their own immutable backend, including native kernels.
+    from ghost_backend.hpc.runtime_snapshot import snapshot_backend_runtime
     source_driver = Path(__file__).resolve()
+    runtime_parent = snapshot_backend_runtime(_backend_root(), run_dir)
+    script_path = run_dir / "driver_configured.py"
+    shutil.copy2(str(source_driver), str(script_path))
+    source_records = {'driver_configured.py': str(script_path)}
+    frozen_backend = str(runtime_parent / "ghost_backend")
     manifest = {
         "schema":          MANIFEST_SCHEMA,
         "run_id":          run_id,
@@ -697,11 +713,13 @@ def submit():
         "n_jobs":          int(N_JOBS),
         "n_slots":         int(N_NODES) * int(N_JOBS),
         "n_units":         len(units),
-        "solver_source_sha256": _solver_source_fingerprint(),
+        "solver_source_sha256": backend_source_fingerprint(frozen_backend, source_records),
         # Per-file hashes behind that fingerprint, so a later mismatch can say
         # which file moved instead of only that one did.
-        "solver_source_inventory": _solver_source_inventory(),
+        "solver_source_inventory": backend_source_inventory(frozen_backend, source_records),
+        "runtime_pythonpath": "runtime",
         "runtime_environment_sha256": runtime_environment_fingerprint(),
+        "submission_runtime_environment": runtime_environment_payload(),
         "solver_config": {
             "geometry_units":          GEOMETRY_UNITS,
             "linear_solver":           "dense_lu",
@@ -732,8 +750,6 @@ def submit():
     )
     (run_dir / "schedule.json").write_text(json.dumps(schedule, indent=2))
 
-    script_path = run_dir / "driver_configured.py"
-    shutil.copy2(str(source_driver), str(script_path))
     slurm_paths = []  # type: List[Path]
     for j in range(int(N_JOBS)):
         sp = run_dir / f"submit_job{j}.slurm"
@@ -752,13 +768,11 @@ def submit():
             mail_type=SLURM_MAIL_TYPE,
             mail_user=SLURM_MAIL_USER,
             extra_sbatch=SLURM_EXTRA_SBATCH,
-            # The driver is copied into the run directory.  Pin the Backend
-            # that produced its manifest after module/environment setup, just
-            # as the BoR driver does, including for manually copied drivers.
+            # Module setup cannot replace the run's frozen backend.
             prologue=[
                 *JOB_PROLOGUE,
                 ("export PYTHONPATH="
-                 f"{shlex.quote(str(_backend_root().parent))}"
+                 f"{shlex.quote(str(runtime_parent))}"
                  ":${PYTHONPATH:-}"),
             ],
             python_exe=PYTHON_EXE,

@@ -77,6 +77,8 @@ def resource_summary(snapshot, base_dir, value, checkpoint=None):
     from ghost_backend.runs.quality import accuracy_target_policy
     from ghost_backend.runs.setup import geometry_dimensions
     value = validate_bor_setup(value)
+    from ghost_backend.assembly.fields import bor_output_profile
+    bor_output_profile(snapshot, value["units"])
     policy = accuracy_target_policy(value['accuracy'])
     options = dict(value['bor_options'])
     workers = max(1, (os.cpu_count() or 2)-1)

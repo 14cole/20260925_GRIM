@@ -1272,23 +1272,59 @@ def _stitch_chains(chains):
     return [tuple(p) for p in pts]
 
 
+def _bor_geometry_scale(geometry_units):
+    units = str(geometry_units).strip().lower()
+    scales = {"m": 1.0, "meter": 1.0, "meters": 1.0,
+              "mm": 1e-3, "millimeter": 1e-3, "millimeters": 1e-3,
+              "in": .0254, "inch": .0254, "inches": .0254,
+              "ft": .3048, "foot": .3048, "feet": .3048}
+    if units not in scales:
+        raise ValueError(f"Unsupported geometry units {geometry_units!r}; use meters, "
+                         "millimeters, inches, or feet.")
+    return scales[units]
+
+
+def bor_output_profile_metadata(snapshot):
+    """Preserve transmitting-sheet semantics alongside exported geometry."""
+    from ghost_backend.geometry.io import chains_from_snapshot_segments
+    sheet = any(chain.seg_type == 1 for chain in
+                chains_from_snapshot_segments(snapshot.get("segments", [])))
+    return {"body_profile_kind": "transmitting_sheet" if sheet else "outer_boundary"}
+
+
+def bor_output_profile(snapshot, geometry_units="meters"):
+    """Complete solved profile for standalone BoR output, including TYPE 1 sheets.
+
+    Sheet topology follows the solver. Pair this with bor_output_profile_metadata
+    when exporting so the sheet cannot imply an opaque feature-placement surface.
+    """
+    if bor_output_profile_metadata(snapshot)["body_profile_kind"] == "transmitting_sheet":
+        from ghost_backend.bor.dispatch import _chains_from_snapshot, _classify, _prepare_bor_groups
+        chains = _chains_from_snapshot(snapshot, _bor_geometry_scale(geometry_units))
+        groups, _, axis_tol = _prepare_bor_groups(chains, _classify(chains))
+        ordered = groups[0]
+        profile = np.vstack([ordered[0].pts] + [chain.pts[1:] for chain in ordered[1:]]).copy()
+        profile[np.abs(profile[:, 0]) <= axis_tol, 0] = 0.0
+    else:
+        profile = outer_generatrix(snapshot, geometry_units)
+    if (profile.ndim != 2 or profile.shape[1] != 2 or len(profile) < 2
+            or not np.all(np.isfinite(profile)) or np.any(profile[:, 0] < 0)
+            or np.any(np.linalg.norm(np.diff(profile, axis=0), axis=1) == 0)):
+        raise ValueError("BoR output profile must have finite nonnegative radii and nonzero spans.")
+    return profile
+
+
 def outer_generatrix(snapshot, geometry_units: 'str' = "meters") -> 'np.ndarray':
     """The air-facing surface (rho, z) polyline features sit on, in METERS.
     It is the ordered UNION of TYPE 2 (air|PEC/IBC) and TYPE 3
     (air|dielectric) segments.  A partially coated/banded body contains both;
     preferring TYPE 3 globally would drop every bare exterior span."""
     from ghost_backend.geometry.io import chains_from_snapshot_segments
-    units = str(geometry_units).strip().lower()
-    scales = {"m": 1.0, "meter": 1.0, "meters": 1.0,
-              "mm": 1e-3, "millimeter": 1e-3, "millimeters": 1e-3,
-              "in": 0.0254, "inch": 0.0254, "inches": 0.0254,
-              "ft": 0.3048, "foot": 0.3048, "feet": 0.3048}
-    if units not in scales:
-        raise ValueError(
-            f"Unsupported geometry units {geometry_units!r}; use meters, "
-            "millimeters, inches, or feet.")
-    scale = scales[units]
+    scale = _bor_geometry_scale(geometry_units)
     chains = chains_from_snapshot_segments(snapshot["segments"])
+    if any(chain.seg_type == 1 for chain in chains):
+        raise ValueError("A transmitting TYPE 1 sheet is not an opaque feature-placement "
+                         "surface. Use bor_output_profile to export its standalone RCS.")
     outer = [c for c in chains if c.seg_type in (2, 3)]
     if not outer:
         raise ValueError("no air-facing (TYPE 2 or 3) surface found in the body .geo.")
@@ -1989,9 +2025,14 @@ def save_body_grim(bodies: 'Dict[float, Dict[str, Any]]', out_path: 'str', *,
     return _save_grim_npz(payload, out)
 
 
-def load_body_profile_grim(path: 'str') -> 'np.ndarray':
+def load_body_profile_grim(path: 'str', *, require_feature_surface: 'bool' = False) -> 'np.ndarray':
     """Load the embedded meter-valued ``rho,z`` generatrix from a body GRIM."""
     with np.load(path, allow_pickle=False) as payload:
+        if require_feature_surface and "body_profile_kind" in payload.files:
+            kind = str(np.asarray(payload["body_profile_kind"]).item())
+            if kind != "outer_boundary":
+                raise ValueError(f"{path}: {kind} profile supports standalone BoR RCS, "
+                                 "but not automatic feature placement or opaque body shadowing.")
         if (
             "body_profile_rho_m" not in payload.files
             or "body_profile_z_m" not in payload.files
@@ -4354,9 +4395,9 @@ def save_monostatic_grim(
     """Publish one complete BoR monostatic deliverable.
 
     Its primary arrays are the requested radar-frame azimuth/elevation VV, HH,
-    and VH response. The exact body-frame aspect amplitudes and profile needed
-    for later coherent feature placement travel inside the same GRIM, so users
-    never have to manage separate radar-grid and body-model products.
+    and VH response. Exact body-frame amplitudes and the profile travel inside
+    the same GRIM for inspection and, for outer boundaries, feature placement.
+    Transmitting-sheet profiles retain their separate surface semantics.
     """
 
     frequencies = sorted(float(value) for value in bodies)
@@ -5533,7 +5574,8 @@ def add_features_to_monostatic_grim(
 
 
         load_body_grim(base)
-        profile = load_body_profile_grim(base)
+        profile = load_body_profile_grim(
+            base, require_feature_surface=bool(placements or points or corners))
 
     new_provenance_record = {
         "schema": "ghost.workflow.coherent-feature-addition.v1",

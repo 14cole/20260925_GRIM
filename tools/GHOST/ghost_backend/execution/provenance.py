@@ -25,6 +25,8 @@ _BACKEND_SOURCE_SUFFIXES = (
     ".f90",
     ".so",
     ".dll",
+    ".dylib",
+    ".pyd",
 )
 
 
@@ -797,9 +799,20 @@ def runtime_environment_payload() -> 'Dict[str, Any]':
     }
 
 
+def runtime_compatibility_payload(payload: 'Dict[str, Any]' = None) -> 'Dict[str, Any]':
+    """Keep numerical dependencies strict without binding a run to one host.
+
+    Kernel releases and CPU descriptions remain informational provenance.
+    OS family, architecture, interpreter and numerical builds stay strict.
+    """
+    environment = runtime_environment_payload() if payload is None else payload
+    return {key: value for key, value in environment.items()
+            if key not in {"platform_release", "platform_processor"}}
+
+
 def runtime_environment_fingerprint() -> 'str':
     raw = json.dumps(
-        runtime_environment_payload(),
+        runtime_compatibility_payload(),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

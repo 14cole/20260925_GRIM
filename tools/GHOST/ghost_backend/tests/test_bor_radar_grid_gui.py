@@ -119,13 +119,23 @@ class BorRadarGridGuiTests(unittest.TestCase):
                     ("HH", frequency * (1 + np.cos(np.deg2rad(angle)) - .25j)),
                 ):
                     channels[pol].append(dict(frequency_ghz=frequency, theta_inc_deg=angle,
-                        rcs_amp_real=amplitude.real, rcs_amp_imag=amplitude.imag))
+                        polarization=pol, rcs_amp_real=amplitude.real, rcs_amp_imag=amplitude.imag))
         result = dict(solver="bor_mom_rcs", scattering_mode="monostatic",
                       polarizations=["VV", "HH"], polarization_mapping={"VV": "VV", "HH": "HH"},
                       co_solved_samples=channels, metadata={})
-        with mock.patch("ghost_backend.ui.solver.solve_monostatic_rcs_bor_survey", return_value=result) as solve:
-            self.assertIs(worker._run_bor(), result)
-            np.testing.assert_allclose(solve.call_args.kwargs["elevations_deg"], expected_aspects)
+        def solve_frequency(**kwargs):
+            requested = set(kwargs["frequencies_ghz"])
+            subset = {pol: [row for row in rows if row["frequency_ghz"] in requested]
+                      for pol, rows in channels.items()}
+            return dict(result, samples=subset["VV"] + subset["HH"], co_solved_samples=subset)
+        with tempfile.TemporaryDirectory() as checkpoints:
+            worker.checkpoint_directory = checkpoints
+            with mock.patch("ghost_backend.ui.solver.solve_monostatic_rcs_bor_survey",
+                            side_effect=solve_frequency) as solve:
+                result = worker._run_bor()
+                self.assertEqual(solve.call_count, 2)
+                np.testing.assert_allclose(solve.call_args.kwargs["elevations_deg"], expected_aspects)
+                self.assertEqual(len(result["co_solved_samples"]["VV"]), len(channels["VV"]))
         tab.last_solve_context = context
         tab._set_solving_state(False)
         tab.edit_elev_list.setText("0")
@@ -166,7 +176,9 @@ class BorRadarGridGuiTests(unittest.TestCase):
         self.tab.edit_elev_list.setText("0, 90, 180")
         self.tab.edit_bor_elev_list.setText("-30, 30")
         request = self.tab._capture_run_setup()
-        snapshot = {"segments": [{"point_pairs": [{"x1": 0, "y1": 1, "x2": 1, "y2": 0}]}]}
+        from ghost_backend.geometry.io import parse_geometry, build_geometry_snapshot
+        geometry = Path(__file__).resolve().parents[1] / "geometry/geometries/body.geo"
+        snapshot = build_geometry_snapshot(*parse_geometry(geometry.read_text()))
         with mock.patch("ghost_backend.bor.dispatch.estimate_bor_resources",
                         return_value={"estimated_peak_gb": 1., "mesh_elements": 20,
                                       "active_mode_workers": 2}):

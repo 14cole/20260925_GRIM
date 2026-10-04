@@ -3866,7 +3866,8 @@ def prepare_feature_assembly(
     }
     profile: 'Optional[np.ndarray]' = None
     if embedded_grid is not None:
-        profile = load_body_profile_grim(str(sources.base))
+        profile = load_body_profile_grim(
+            str(sources.base), require_feature_surface=bool(sources.active_features))
         grid = dict(embedded_grid)
         base_grid_contract = {
             "schema": "ghost.assembly-base-grid-contract.v1",

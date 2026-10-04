@@ -497,6 +497,8 @@ def _plan(
     extents: 'Dict[str, Tuple[float, float]]' = {}
     costs: 'Dict[str, float]' = {}
     from ghost_backend.bor.dispatch import estimate_bor_resources
+    from ghost_backend.assembly.fields import bor_output_profile
+    checked_profiles = set()
     for unit in units:
         path = str(unit["geometry"])
         if path not in extents:
@@ -508,6 +510,9 @@ def _plan(
             arc, radius, float(unit["frequency_ghz"]), len(aspects_deg)
         )
         snapshot, material_base = _load_snapshot(path)
+        if path not in checked_profiles:
+            bor_output_profile(snapshot, GEOMETRY_UNITS)
+            checked_profiles.add(path)
         unit["resource_estimate"] = estimate_bor_resources(
             snapshot,
             float(unit["frequency_ghz"]),
@@ -873,7 +878,9 @@ def main() -> 'None':
         bor_solver_diagnostics_from_units,
         read_unit_grims,
     )
-    from ghost_backend.assembly.fields import outer_generatrix, save_monostatic_grim
+    from ghost_backend.assembly.fields import (
+        bor_output_profile, bor_output_profile_metadata, save_monostatic_grim,
+    )
 
     records = read_unit_grims(unit_dir)
     for stem in sorted({str(unit["geometry_stem"]) for unit in units}):
@@ -882,7 +889,7 @@ def main() -> 'None':
             records, stem=stem
         )
         snapshot, _material_base = _load_snapshot(str(matching[0]["geometry"]))
-        profile = outer_generatrix(snapshot, GEOMETRY_UNITS)
+        profile = bor_output_profile(snapshot, GEOMETRY_UNITS)
         save_monostatic_grim(
             bodies_from_units(records, stem=stem),
             profile,
@@ -896,6 +903,7 @@ def main() -> 'None':
             source_path=str(matching[0]["geometry"]),
             solver_diagnostics=solver_diagnostics,
             artifact_metadata={
+                **bor_output_profile_metadata(snapshot),
                 "geometry_input_sha256": str(
                     matching[0].get("geometry_input_sha256", "")
                 ),

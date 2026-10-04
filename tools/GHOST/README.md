@@ -207,7 +207,27 @@ py ghost_backend/run_hpc_bor_monostatic.py
 
 The 2-D production path co-solves VV/TE and HH/TM and writes them into one
 GRIM artifact per geometry/frequency. The BoR path produces a combined
-feature-ready body artifact after its per-frequency restart units complete.
+body artifact after its per-frequency restart units complete.
+
+Each newly prepared HPC run contains its own `runtime/ghost_backend` source
+and native-kernel snapshot. The saved worker and generated Slurm scripts use
+that snapshot, so editing the original CONFIG block or updating the checkout
+cannot alter an already prepared run. Keep the `runtime` folder with the run.
+The snapshot is still integrity checked; changing it invalidates that run.
+Python, NumPy, SciPy and their numerical build configuration must remain
+compatible between submission and workers. Kernel-release and processor
+labels are recorded as host information rather than compatibility requirements.
+
+BoR workers refresh resource estimates inside their compute allocation and
+bind each solve to its selected backend, CPU count and memory reservation.
+Submit-host estimates are planning hints, not worker memory reservations.
+
+BoR TYPE 1 sheets and connected sheet/PEC profiles export their complete
+solved profile and radar response. Sheet-containing artifacts identify their
+profile as a sheet and cannot be used automatically as an opaque body surface
+for feature placement or shadowing. Geometry/export compatibility is checked
+before solving; ordinary conductor and dielectric body exports retain their
+feature-surface workflow.
 
 See:
 

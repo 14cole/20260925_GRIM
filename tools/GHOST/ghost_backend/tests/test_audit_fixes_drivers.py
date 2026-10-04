@@ -612,7 +612,7 @@ class StaleSpillSweepTests(unittest.TestCase):
                         local.index("_plan(solve_units"))
         worker = inspect.getsource(run_hpc_bor_monostatic.worker)
         self.assertLess(worker.index("sweep_stale_bor_spill()"),
-                        worker.index("estimate_bor_resources"))
+                        worker.index("_compute_resource_plan("))
 
 
 class CpuAllocationTests(unittest.TestCase):

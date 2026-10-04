@@ -2280,9 +2280,9 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
             Path("/tmp/run"),
             0,
         )
-        backend = str(Path(run_hpc_bor_monostatic.__file__).resolve().parent.parent)
+        runtime = str(Path("/tmp/run") / "runtime")
         self.assertIn(
-            f"export PYTHONPATH={shlex.quote(backend)}:${{PYTHONPATH:-}}",
+            f"export PYTHONPATH={shlex.quote(runtime)}:${{PYTHONPATH:-}}",
             text,
         )
 

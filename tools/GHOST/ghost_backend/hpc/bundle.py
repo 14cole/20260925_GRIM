@@ -1549,7 +1549,8 @@ def _stage_portable_bundle_with_lease(
         _fsync_directory(result_path.parent)
     before_runs = {path.resolve() for path in output_root.glob("run_*") if path.is_dir()}
     inherited_pythonpath = os.environ.get("PYTHONPATH", "").strip()
-    backend_dir = str(backend_root())
+    # Python needs the directory containing the ghost_backend package.
+    backend_dir = str(backend_root().parent)
     child_env = dict(os.environ)
     child_env["PYTHONPATH"] = (
         backend_dir

@@ -504,7 +504,7 @@ def resolve_automatic_plan(
     cost, and compression several times more.
     """
 
-    from ghost_backend.twod.solver import _solve_memory_limit_gb
+    from ghost_backend.bor.memory import solve_memory_limit_gb as _solve_memory_limit_gb
 
     supplied = dict(arguments)
     nested = supplied.pop('kwargs', None)
@@ -693,7 +693,7 @@ def _direct_dense_plan(supplied, layout, modes, order):
     from ghost_backend.bor.streaming import (BOR_STREAM_TILE_BUDGET_GB,
         combined_stream_mode_gb, estimate_streaming_block_gb,
         plan_combined_streaming_mode_block, plan_streaming_mode_block)
-    from ghost_backend.twod.solver import _solve_memory_limit_gb
+    from ghost_backend.bor.memory import solve_memory_limit_gb as _solve_memory_limit_gb
     workers = max(1, int(supplied.get('workers') or 1))
     assembly = str(supplied.get('assembly', 'auto')).strip().lower()
     budget = float(supplied.get('stream_budget_gb') or BOR_STREAM_BUDGET_GB_DEFAULT)

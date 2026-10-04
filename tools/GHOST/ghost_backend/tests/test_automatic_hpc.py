@@ -55,6 +55,9 @@ def test_default_automatic_request_reaches_fresh_headless_worker(tmp_path, densi
     assert manifest['solver_config']['solver_method']=='auto'
     # The saved profile remains authoritative in a fresh compute process.
     env['GHOST_CPU_FACTORIZATION']='invalid-launch-value'
+    # Match generated Slurm: select the frozen runtime before sitecustomize
+    # can import the legacy planner hooks.
+    env['PYTHONPATH']=os.pathsep.join((str(directory/'runtime'), env['PYTHONPATH']))
     output=run(['--worker',str(directory),'0','0'])
     assert 'Auto batch:' in output
     assert run_status(directory)['attestation_verified']

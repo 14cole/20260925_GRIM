@@ -333,6 +333,22 @@ def cpu_allocation_scope(cpus):
         yield count
 
 
+@contextmanager
+def memory_allocation_scope(memory_gib):
+    """Bound one solve's RAM without changing its execution profile."""
+    if memory_gib is None:
+        yield allocated_memory_budget()
+        return
+    memory = float(memory_gib)
+    if not math.isfinite(memory) or memory <= 0.0:
+        raise ValueError('Allocated solve memory must be positive and finite.')
+    inherited = allocated_memory_budget()
+    if inherited is not None:
+        memory = min(memory, inherited)
+    with _MEMORY_ALLOCATION.override(memory):
+        yield memory
+
+
 def blas_core_budget():
     """Threads for dense linear algebra: the CPU allocation, at most the physical cores.
 

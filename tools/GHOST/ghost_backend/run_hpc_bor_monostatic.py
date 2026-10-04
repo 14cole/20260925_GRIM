@@ -38,8 +38,16 @@ Internal worker invocation (called by SLURM, not by the user):
 if not __package__:
     import sys
     from pathlib import Path
-    if Path(__file__).resolve().parent.name == "ghost_backend":
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    _driver_directory = Path(__file__).resolve().parent
+    _runtime_directory = _driver_directory / "runtime"
+    if "--worker" in sys.argv:
+        _worker_index = sys.argv.index("--worker")
+        if len(sys.argv) > _worker_index + 1:
+            _runtime_directory = Path(sys.argv[_worker_index + 1]).resolve() / "runtime"
+    if (_runtime_directory / "ghost_backend" / "execution" / "paths.py").is_file():
+        sys.path.insert(0, str(_runtime_directory))
+    elif _driver_directory.name == "ghost_backend":
+        sys.path.insert(0, str(_driver_directory.parent))
 from ghost_backend.execution.paths import backend_root as _backend_root
 
 import argparse
@@ -67,6 +75,7 @@ from ghost_backend.execution.provenance import (
     describe_source_mismatch,
     manifest_solve_spec_fingerprint,
     runtime_environment_fingerprint,
+    runtime_environment_payload,
     stable_json_fingerprint,
     unit_solve_spec_fingerprint,
     embed_output_attestation,
@@ -378,7 +387,9 @@ def publish_monostatic(run_dir_str, require_complete=True):
                 )
     records = read_unit_grims(run_dir / str(manifest["unit_output_dir"]))
 
-    from ghost_backend.assembly.fields import outer_generatrix, save_monostatic_grim
+    from ghost_backend.assembly.fields import (
+        bor_output_profile, bor_output_profile_metadata, save_monostatic_grim,
+    )
     from ghost_backend.geometry.io import build_geometry_snapshot, parse_geometry
 
     grid = dict(manifest["radar_grid"])
@@ -400,7 +411,7 @@ def publish_monostatic(run_dir_str, require_complete=True):
         snapshot = build_geometry_snapshot(
             *parse_geometry(geometry.read_text(encoding="utf-8"))
         )
-        profile = outer_generatrix(
+        profile = bor_output_profile(
             snapshot, str(manifest["solver_config"]["geometry_units"])
         )
         save_monostatic_grim(
@@ -416,6 +427,7 @@ def publish_monostatic(run_dir_str, require_complete=True):
             source_path=str(matching[0].get("geometry_original", geometry)),
             solver_diagnostics=solver_diagnostics,
             artifact_metadata={
+                **bor_output_profile_metadata(snapshot),
                 "geometry_input_sha256": str(
                     matching[0].get("geometry_input_sha256", "")
                 ),
@@ -649,6 +661,7 @@ def _solve_and_export(pair, snapshot, material_base, run_dir_str):
     quality_kwargs = ({"mesh_convergence_policy": validate_mesh_convergence_policy(
         solver_config.get("mesh_convergence_policy")
     )} if certified else {})
+    execution_plan = dict(pair.get("execution_plan", {}) or {})
     result = solve(
         geometry_snapshot=snapshot,
         frequencies_ghz=[float(pair["frequency_ghz"])],
@@ -661,20 +674,21 @@ def _solve_and_export(pair, snapshot, material_base, run_dir_str):
         n_modes=solver_config.get("n_modes", N_MODES),
         mode_tol=float(solver_config.get("mode_tol", MODE_TOL)),
         max_elements=int(solver_config.get("max_elements", MAX_ELEMENTS)),
-        workers=int(solver_config.get(
-            "workers_per_unit", WORKERS_PER_UNIT
-        )),
-        table_precision=str(solver_config.get(
-            "table_precision", TABLE_PRECISION
-        )),
-        assembly=str(solver_config.get("assembly", ASSEMBLY)),
+        workers=int(execution_plan.get("workers",
+            solver_config.get("workers_per_unit", WORKERS_PER_UNIT))),
+        table_precision=str(execution_plan.get("table_precision",
+            solver_config.get("table_precision", TABLE_PRECISION))),
+        assembly=str(execution_plan.get("assembly", solver_config.get("assembly", ASSEMBLY))),
         stream_budget_gb=float(solver_config.get(
             "stream_budget_gb", STREAM_BUDGET_GB
         )),
-        bor_options=solver_config.get("bor_execution_options", {}),
+        bor_options=execution_plan.get("bor_execution_options",
+            solver_config.get("bor_execution_options", {})),
         expand_to_360=False,
         **quality_kwargs,
     )
+    if execution_plan:
+        result["metadata"]["hpc_execution_plan"] = execution_plan
     for w in result["metadata"].get("warnings", []) or []:
         print(f"      [warn] {pair['geometry_stem']}: {w}", flush=True)
     _verify_run_provenance(manifest)
@@ -704,14 +718,13 @@ def _solve_and_export(pair, snapshot, material_base, run_dir_str):
 
 
 def _solve_and_export_star(args):
-    # type: (tuple) -> tuple
-    """Pool entry point; the optional fifth argument is the unit's CPU
-    reservation, which bounds its native teams, near-preparation workers and
-    BLAS limits instead of letting every concurrent unit size to the node."""
+    """Execute within the CPU and RAM reservation admitted by the node."""
     u, snap, mat_base, run_dir_str = args[:4]
     cpus = args[4] if len(args) > 4 else None
+    memory_gib = args[5] if len(args) > 5 else None
     try:
-        with hpc_scheduler.cpu_allocation_scope(cpus):
+        from ghost_backend.execution.options import memory_allocation_scope
+        with hpc_scheduler.cpu_allocation_scope(cpus), memory_allocation_scope(memory_gib):
             status, path = _solve_and_export(u, snap, mat_base, run_dir_str)
         return ("ok", status, path, u)
     except Exception:
@@ -759,13 +772,9 @@ def _build_slurm(script_path, run_dir, job_index):
         "set -euo pipefail",
         f"cd {shlex.quote(str(script_path.parent))}",
         *JOB_PROLOGUE,
-        # The configured driver lives in the run directory, not beside its
-        # solver modules.  Put the exact Backend tree used to create the
-        # manifest first, even when the login environment inherited an older
-        # GHOST checkout on PYTHONPATH.  Without this, a new driver can import
-        # an old grim_io on compute nodes and fail only during derived export.
+        # The run owns its backend, independent of later checkout/config edits.
         ("export PYTHONPATH="
-         f"{shlex.quote(str(_backend_root().parent))}"
+         f"{shlex.quote(str(run_dir / 'runtime'))}"
          ":${PYTHONPATH:-}"),
         (f"exec {shlex.quote(PYTHON_EXE)} {shlex.quote(str(script_path))} "
          f"--worker {shlex.quote(str(run_dir))} {job_index} "
@@ -892,6 +901,8 @@ def submit():
             *parse_geometry(geom.read_text(encoding="utf-8"))
         )
         snapshot["source_path"] = str(geom.resolve())
+        from ghost_backend.assembly.fields import bor_output_profile
+        bor_output_profile(snapshot, GEOMETRY_UNITS)
         for frequency in frequencies:
             resource_estimates[(str(geom.resolve()), float(frequency))] = (
                 estimate_bor_resources(
@@ -938,7 +949,16 @@ def submit():
                     ].get("stream_spill_candidate_gb", 0.0) or 0.0),
                 })
 
+    from ghost_backend.hpc.runtime_snapshot import snapshot_backend_runtime
     source_driver = Path(__file__).resolve()
+    runtime_parent = snapshot_backend_runtime(_backend_root(), run_dir)
+    script_path = run_dir / "driver_configured.py"
+    shutil.copy2(str(source_driver), str(script_path))
+    copy_configuration(_ACTIVE_CONFIG_PATH, script_path)
+    source_records = {'driver_configured.py': str(script_path)}
+    if _ACTIVE_CONFIG_PATH is not None:
+        source_records['driver_configured.config.json'] = str(script_path.with_suffix('.config.json'))
+    frozen_backend = str(runtime_parent / "ghost_backend")
     manifest = {
         "schema":          "ghost.hpc.bor-run.v1",
         "run_id":          run_id,
@@ -958,10 +978,11 @@ def submit():
         "n_slots":         int(N_NODES) * int(N_JOBS),
         "n_units":         len(units),
         "resource_planning_method": "bor-frequency-specific-v1",
-        "solver_source_sha256": _solver_source_fingerprint(),
-        "solver_source_inventory": _solver_source_inventory(),
-        "runtime_environment_sha256":
-            runtime_environment_fingerprint(),
+        "solver_source_sha256": backend_source_fingerprint(frozen_backend, source_records),
+        "solver_source_inventory": backend_source_inventory(frozen_backend, source_records),
+        "runtime_pythonpath": "runtime",
+        "runtime_environment_sha256": runtime_environment_fingerprint(),
+        "submission_runtime_environment": runtime_environment_payload(),
         "solver_config": {
             "geometry_units":          GEOMETRY_UNITS,
             "cfie_alpha":              CFIE_ALPHA,
@@ -991,9 +1012,6 @@ def submit():
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    script_path = run_dir / "driver_configured.py"
-    shutil.copy2(str(source_driver), str(script_path))
-    copy_configuration(_ACTIVE_CONFIG_PATH, script_path)
     slurm_paths = []  # type: List[Path]
     for j in range(int(N_JOBS)):
         sp = run_dir / f"submit_job{j}.slurm"
@@ -1103,6 +1121,62 @@ def _plan_units(units, n_slots, manifest_aspects, geometry_units):
     return costs, slots
 
 
+def _compute_resource_plan(pair, snapshot, material_base, manifest, cpus, budget_gib):
+    """Price and bind a plan on its execution node without changing solve identity."""
+    from ghost_backend.bor.dispatch import estimate_bor_resources
+    from ghost_backend.execution.options import memory_allocation_scope
+
+    config = dict(manifest.get("solver_config", {}) or {})
+    workers = max(1, min(int(cpus), int(config.get("workers_per_unit", WORKERS_PER_UNIT))))
+    arguments = dict(
+        geometry_units=str(config.get("geometry_units", GEOMETRY_UNITS)),
+        material_base_dir=material_base, n_modes=config.get("n_modes", N_MODES),
+        max_elements=int(config.get("max_elements", MAX_ELEMENTS)), workers=workers,
+        table_precision=str(config.get("table_precision", TABLE_PRECISION)),
+        assembly=str(config.get("assembly", ASSEMBLY)),
+        stream_budget_gb=float(config.get("stream_budget_gb", STREAM_BUDGET_GB)),
+        bor_options=config.get("bor_execution_options", {}),
+        mesh_certification=bool(config.get("mesh_certification", True)),
+        fine_factor=float(validate_mesh_convergence_policy(
+            config.get("mesh_convergence_policy"))["fine_factor"]),
+    )
+    def estimate():
+        return estimate_bor_resources(snapshot, float(pair["frequency_ghz"]),
+            [float(value) for value in manifest["aspects_deg"]], **arguments)
+
+    with hpc_scheduler.cpu_allocation_scope(cpus), memory_allocation_scope(budget_gib) as admitted_budget:
+        resource = estimate()
+        options = dict(resource["bor_execution_options"])
+        if options["factorization"] not in {"dense", "compressed"}:
+            raise ValueError("BoR resource planning did not resolve its backend.")
+        assembly = str(resource["assembly_estimate"])
+        if assembly == "compressed":
+            assembly = "tables"
+        if assembly not in {"tables", "streaming"}:
+            raise ValueError("BoR resource planning did not resolve its assembly.")
+        precision = str(resource["table_precision_estimate"])
+        # Preserve the capacity priced on this node when execution enters its
+        # narrower reservation; automatic storage otherwise changes with RAM.
+        if options["factorization"] == "compressed" and options["compressed_storage_mib"] == 0:
+            from ghost_backend.compressed.runtime import automatic_storage_bytes
+            options["compressed_storage_mib"] = min(1048576,
+                max(16, int(math.ceil(automatic_storage_bytes() / 1024**2))))
+        arguments.update(bor_options=options, assembly=assembly, table_precision=precision)
+        resource = estimate()
+
+    peak = float(resource["estimated_peak_gb"])
+    if not math.isfinite(peak) or peak <= 0.0:
+        raise ValueError("BoR compute-node memory estimate must be positive and finite.")
+    from numpy import nextafter
+    # An oversized unit runs alone, but cannot reclaim excluded node headroom.
+    memory_gib = min(float(nextafter(hpc_scheduler.decimal_gb_to_gib(peak), math.inf)),
+                     float(admitted_budget))
+    return dict(estimated_peak_gb=peak,
+        estimated_spill_gb=float(resource.get("stream_spill_candidate_gb", 0.0) or 0.0),
+        workers=workers, cpu_reservation=int(cpus), memory_reservation_gib=memory_gib,
+        assembly=assembly, table_precision=precision, bor_execution_options=options)
+
+
 def worker(run_dir_str, job_index, node_index):
     # type: (str, int, int) -> None
     hpc_scheduler.install_fingerprint_cache()
@@ -1195,69 +1269,26 @@ def worker(run_dir_str, job_index, node_index):
         snap["source_path"] = str(p)
         snapshots[gpath] = (snap, str(p.parent))
 
-    unplanned = [
-        unit for unit in candidates if "estimated_peak_gb" not in unit
-    ]
-    if unplanned:
-        from ghost_backend.bor.dispatch import estimate_bor_resources
-    for unit in unplanned:
+    # Submit-host forecasts are hints. Reprice every unit on its execution
+    # node, then execute the same explicit backend, precision and assembly.
+    plans = {}
+    for unit in candidates:
         snapshot, material_base = snapshots[unit["geometry"]]
-        resource_estimate = estimate_bor_resources(
-            snapshot,
-            float(unit["frequency_ghz"]),
-            [float(value) for value in manifest["aspects_deg"]],
-            geometry_units=str(solver_config.get(
-                "geometry_units", GEOMETRY_UNITS
-            )),
-            material_base_dir=material_base,
-            n_modes=solver_config.get("n_modes", N_MODES),
-            max_elements=int(solver_config.get(
-                "max_elements", MAX_ELEMENTS
-            )),
-            workers=int(solver_config.get(
-                "workers_per_unit", WORKERS_PER_UNIT
-            )),
-            table_precision=str(solver_config.get(
-                "table_precision", TABLE_PRECISION
-            )),
-            assembly=str(solver_config.get("assembly", ASSEMBLY)),
-            stream_budget_gb=float(solver_config.get(
-                "stream_budget_gb", STREAM_BUDGET_GB
-            )),
-            bor_options=solver_config.get("bor_execution_options", {}),
-            mesh_certification=bool(solver_config.get(
-                "mesh_certification", True
-            )),
-            fine_factor=float(validate_mesh_convergence_policy(
-                solver_config.get("mesh_convergence_policy")
-            )["fine_factor"]),
-        )
-        unit["estimated_peak_gb"] = float(
-            resource_estimate["estimated_peak_gb"]
-        )
-        unit["estimated_spill_gb"] = float(
-            resource_estimate.get("stream_spill_candidate_gb", 0.0) or 0.0
-        )
-    # The planner prices decimal GB; the scheduler budgets GiB.  Each unit
-    # also reserves CPUs (cores // units that fit, as the 2-D worker does)
-    # and the scratch disk its far-block spill needs.
-    reservations_gib = {
-        _unit_claim_key(unit): hpc_scheduler.decimal_gb_to_gib(
-            float(unit["estimated_peak_gb"])
-        )
-        for unit in candidates
-    }
-    unit_cpus = {
-        key: hpc_scheduler.assembly_threads_for_unit(
-            cores, pool_size, budget_gb, peak_gib
-        )
-        for key, peak_gib in reservations_gib.items()
-    }
+        initial = _compute_resource_plan(unit, snapshot, material_base, manifest,
+            max(1, cores // pool_size), budget_gb)
+        cpus = hpc_scheduler.assembly_threads_for_unit(
+            cores, pool_size, budget_gb, initial["memory_reservation_gib"])
+        plan = (initial if cpus == initial["cpu_reservation"] else
+                _compute_resource_plan(unit, snapshot, material_base, manifest, cpus, budget_gb))
+        unit["execution_plan"] = plan
+        plans[_unit_claim_key(unit)] = plan
+    reservations_gib = {key: plan["memory_reservation_gib"] for key, plan in plans.items()}
+    unit_cpus = {key: plan["cpu_reservation"] for key, plan in plans.items()}
     spill_dir = _spill_directory()
     spill_free_gib = hpc_scheduler.free_disk_gib(spill_dir)
     spill_gib = {
         _unit_claim_key(unit): _spill_reservation_gib(
-            unit.get("estimated_spill_gb", 0.0), spill_free_gib
+            plans[_unit_claim_key(unit)]["estimated_spill_gb"], spill_free_gib
         )
         for unit in candidates
     }
@@ -1296,7 +1327,7 @@ def worker(run_dir_str, job_index, node_index):
             (_solve_and_export_star,
              ((unit, snapshots[unit["geometry"]][0],
                snapshots[unit["geometry"]][1], str(run_dir),
-               unit_cpus[key]),)),
+               unit_cpus[key], reservations_gib[key]),)),
         )
         all_outputs_exist = all(
             _unit_output_path(run_dir, channel).exists()

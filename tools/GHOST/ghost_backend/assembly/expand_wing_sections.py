@@ -677,6 +677,11 @@ def expand_wing_sections(
         from ghost_backend.assembly.workflow import bor_shadow_triangles
         from ghost_backend.geometry.occlusion import Occluder
 
+        if "body_profile_kind" in base_payload:
+            profile_kind = str(np.asarray(base_payload["body_profile_kind"]).item())
+            if profile_kind != "outer_boundary":
+                raise ValueError("A transmitting sheet profile cannot supply opaque body "
+                                 "shadowing. Disable body shadowing for this base response.")
         profile = np.column_stack((
             np.asarray(base_payload["body_profile_rho_m"], dtype=float).ravel(),
             np.asarray(base_payload["body_profile_z_m"], dtype=float).ravel(),

@@ -41,7 +41,10 @@ from ghost_backend.bor.kernels import (
     n_xi_for_pairs,
     physical_cpu_count,
 )
-from ghost_backend.twod.solver import _memory_gate_message, _solve_memory_limit_gb
+from ghost_backend.bor.memory import (
+    memory_gate_message as _memory_gate_message,
+    solve_memory_limit_gb as _solve_memory_limit_gb,
+)
 
 
 from ghost_backend.bor.options import configured, current_options, bounded_rhs_count, compressed_requested, option_scope, current_checkpoint, BorAdmissionError

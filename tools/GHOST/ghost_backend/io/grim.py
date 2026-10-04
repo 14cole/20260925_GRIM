@@ -698,6 +698,7 @@ def _save_grim_npz(payload: 'Dict[str, Any]', path: 'str') -> 'str':
                         'assembly_base_response_sha256',
                         'feature_library_manifest_json',
                         'requested_radar_grid_json',
+                        'body_profile_kind',
                         'body_profile_rho_m',
                         'body_profile_z_m',
                         'body_model_metadata_json',

@@ -2050,12 +2050,13 @@ class SolverTab(RunSetupMixin, QWidget):
         from ghost_backend.assembly.fields import (
             bodies_from_bor_solver_result,
             bor_solver_diagnostics_by_frequency,
-            outer_generatrix,
+            bor_output_profile,
+            bor_output_profile_metadata,
             save_monostatic_grim,
         )
 
         bodies = bodies_from_bor_solver_result(result)
-        profile = outer_generatrix(
+        profile = bor_output_profile(
             context["snapshot"], str(context["units"])
         )
         radar_grid = context.get("radar_grid")
@@ -2073,6 +2074,7 @@ class SolverTab(RunSetupMixin, QWidget):
             source_path=source_path,
             history=history,
             solver_diagnostics=bor_solver_diagnostics_by_frequency(result),
+            artifact_metadata=bor_output_profile_metadata(context["snapshot"]),
         )
         return [written]
 
