@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# Native libraries built for the host (see tools/GHOST/README.md); the wheel excludes them too.
+*.so
