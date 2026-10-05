@@ -640,15 +640,21 @@ def _iter_near_pairs(function: 'Callable', pairs, workers: 'int', process_functi
     count = min(_near_preparation_workers(workers), len(pairs))
     batched = process_function is not None and hasattr(process_function, 'run_batch')
     if count <= 1:
-        if not batched:
-            for pair in pairs:
-                yield function(pair)
-            return
-        for start in range(0, len(pairs), NEAR_LOCAL_BATCH):
-            if checkpoint is not None:
-                checkpoint()
-            for result in process_function.run_batch(pairs[start:start + NEAR_LOCAL_BATCH]):
-                yield result
+        # A serial preparation has the whole CPU allocation to itself: the
+        # native near rules run their pairs on an OpenMP team of that size
+        # (every pair is independent, so the values are those of one thread).
+        from ghost_backend.execution.options import blas_core_budget
+        from ghost_backend.bor.kernels import near_rule_threads
+        with near_rule_threads(blas_core_budget()):
+            if not batched:
+                for pair in pairs:
+                    yield function(pair)
+                return
+            for start in range(0, len(pairs), NEAR_LOCAL_BATCH):
+                if checkpoint is not None:
+                    checkpoint()
+                for result in process_function.run_batch(pairs[start:start + NEAR_LOCAL_BATCH]):
+                    yield result
         return
     from ghost_backend.bor.near_parallel import executor_for, run_near_batch
     process_executor = (executor_for(len(pairs), process_function.m_max)

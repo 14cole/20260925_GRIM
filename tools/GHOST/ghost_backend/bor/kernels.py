@@ -1505,6 +1505,16 @@ _NEAR_PIECES = {
 }
 _NEAR_SHARED = OrderedDict()
 _NEAR_SHARED_LOCK = threading.Lock()
+# OpenMP team of the native near-rule kernels.  Near preparation owns its
+# concurrency (process or thread workers each run their kernels on one
+# thread); a serial preparation hands the kernels the CPU budget instead.
+from ghost_backend.execution.runtime import ScopedValue as _ScopedValue
+_NEAR_RULE_THREADS = _ScopedValue('ghost_bor_near_rule_threads', default=1)
+
+
+def near_rule_threads(count):
+    """Scope in which the native near-rule kernels run on ``count`` OpenMP threads."""
+    return _NEAR_RULE_THREADS.override(max(1, int(count)))
 _NEAR_SHARED_ENTRIES = 256
 _NEAR_BYTES_PER_SAMPLE = {'native': 48, 'numpy': 400}
 
@@ -1659,14 +1669,15 @@ def _near_rule_moments(kind, stable, points, delta, k, layout, orders, count):
         tail = (delta.ctypes.data, wavenumber.real, wavenumber.imag, float(s_core), int(n_core),
                 u.ctypes.data, wu.ctypes.data, int(xi_shared.size), xi_shared.ctypes.data,
                 w_shared.ctypes.data, int(count))
+        threads = int(_NEAR_RULE_THREADS.get())
         if kind == 'g':
             out = np.empty((n, 2, count))
-            native(n, *[v.ctypes.data for v in arrays], *tail, out.ctypes.data, 1)
+            native(n, *[v.ctypes.data for v in arrays], *tail, out.ctypes.data, threads)
             return out
         cosines = np.empty((n, 4, count))
         sines = np.empty((n, 4, count))
         native(0 if kind == 'mfie' else 1, 1 if stable else 0, n,
-               *[v.ctypes.data for v in arrays], *tail, cosines.ctypes.data, sines.ctypes.data, 1)
+               *[v.ctypes.data for v in arrays], *tail, cosines.ctypes.data, sines.ctypes.data, threads)
         return cosines, sines
     xi, w = _near_nodes(layout, orders, delta)
     if kind == 'g':
@@ -1783,14 +1794,17 @@ def _graded_near_kernels(kind, args, k, m_max, order_floor=0, tail_floor=0, sign
             if int(fine.max()) > NEAR_ANGULAR_MAX_ORDER:
                 raise ValueError("BoR near angular quadrature exceeds its accuracy limit; refine the mesh or reduce modal bandwidth.")
             keys = np.column_stack([J, stable[index].astype(np.int64), orders])
-            _, group, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
-            inverse = np.asarray(inverse).ravel()
-            order = np.argsort(inverse, kind='stable')
-            bounds = np.searchsorted(inverse[order], np.arange(len(group) + 1))
+            # Group equal key rows: a stable lexicographic sort followed by
+            # breaks where consecutive rows differ (np.unique(axis=0) spent
+            # several hundred milliseconds per solve on the same partition).
+            order = np.lexsort(keys.T[::-1])
+            sorted_keys = keys[order]
+            breaks = np.flatnonzero(np.any(sorted_keys[1:] != sorted_keys[:-1], axis=1)) + 1
+            bounds = np.concatenate(([0], breaks, [len(order)]))
             delta = d / np.where(a > 0, a, 1.0)
-            for g in range(len(group)):
+            for g in range(len(bounds) - 1):
                 members = index[order[bounds[g]:bounds[g + 1]]]
-                first = int(group[g])
+                first = int(order[bounds[g]])
                 layout = int(J[first])
                 base = orders[first, :layout + 2] if layout >= 0 else orders[first, :1]
                 _run_near_group(kind, arrays, k, count, members, layout, base,

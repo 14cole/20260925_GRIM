@@ -24,6 +24,9 @@
  * Build and load-check with ghost_backend/bor/native/build_kernel.py (it
  * compiles -O3 -std=c99 [-fopenmp], no relaxed floating point).
  */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* sincos */
+#endif
 #include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -39,6 +42,16 @@
 /* exp(ki R) of exp(-j k R) with k = kr + j ki: exactly 1 for a real k, so
  * skipping the call there changes no value. */
 #define GHOST_DECAY(ki, x) ((ki) == 0.0 ? 1.0 : exp(x))
+
+/* cos and sin of one argument.  glibc's sincos evaluates both from one
+   reduction and returns the values of its sin and cos (bitwise, as the
+   near-rule tests check); elsewhere the two are evaluated separately. */
+#if defined(__GLIBC__)
+#define GHOST_SINCOS(x, s, c) sincos((x), (s), (c))
+#else
+#define GHOST_SINCOS(x, s, c) do { *(s) = sin(x); *(c) = cos(x); } while (0)
+#endif
+
 #if defined(_MSC_VER)
 #define GHOST_RESTRICT __restrict
 #else
@@ -684,8 +697,23 @@ GHOST_INLINE void green_value(double d2, double rr4, double x, double kr, double
     double R = sqrt(d2 + rr4 * (h * h));
     if (R < NEAR_R_MIN) R = NEAR_R_MIN;
     const double e = GHOST_DECAY(ki, ki * R), kR = kr * R, den = (4.0 * M_PI) * R;
-    *re = (e * cos(kR)) / den;
-    *im = (e * -sin(kR)) / den;
+    double sk, ck;
+    GHOST_SINCOS(kR, &sk, &ck);
+    *re = (e * ck) / den;
+    *im = (e * -sk) / den;
+}
+
+
+GHOST_INLINE void green_value_h(double d2, double rr4, double h, double kr, double ki,
+                                double *re, double *im)
+{
+    double R = sqrt(d2 + rr4 * (h * h));
+    if (R < NEAR_R_MIN) R = NEAR_R_MIN;
+    const double e = GHOST_DECAY(ki, ki * R), kR = kr * R, den = (4.0 * M_PI) * R;
+    double sk, ck;
+    GHOST_SINCOS(kR, &sk, &ck);
+    *re = (e * ck) / den;
+    *im = (e * -sk) / den;
 }
 
 /* The sampled MFIE/IBC brackets of near_brackets (same expressions, same
@@ -760,7 +788,9 @@ GHOST_INLINE void bracket_stable(int family, const stable_pair *q, double kr, do
     double R = sqrt(q->d2 + 2.0 * rp * rq * h);
     if (R < NEAR_R_MIN) R = NEAR_R_MIN;
     /* p = (1 + j k R) exp(-j k R) / (4 pi R^3) */
-    const double a = kr * R, b = ki * R, c = cos(a), s = sin(a);
+    const double a = kr * R, b = ki * R;
+    double c, s;
+    GHOST_SINCOS(a, &s, &c);
     const double scale = GHOST_DECAY(ki, b) / ((4.0 * M_PI) * R * R * R);
     const double pre = ((1.0 - b) * c + a * s) * scale;
     const double pim = (a * c - (1.0 - b) * s) * scale;
@@ -901,9 +931,21 @@ void near_green_rule(int npair,
                      int count, double *GHOST_RESTRICT out, int nthreads)
 {
     const int team = team_size(nthreads);
-    const int na_max = (n_core > 0 ? n_core : 0) + (n_shared > 0 ? n_shared : 0);
+    const int nc = n_core > 0 ? n_core : 0, ns = n_shared > 0 ? n_shared : 0;
+    const int na_max = nc + ns;
     if (npair <= 0 || count <= 0)
         return;
+    /* The shared nodes are the same for every pair of the call: their
+       cos(xi), sin(xi) and sin(xi/2) are evaluated once (same function, same
+       argument: bitwise the per-pair values). */
+    double *shared_c1 = (double *)malloc(sizeof(double) * 3 * (size_t)(ns > 0 ? ns : 1));
+    if (shared_c1 != (double *)0) {
+        for (int j = 0; j < ns; j++) {
+            shared_c1[j] = cos(xi_shared[j]);
+            shared_c1[ns + j] = sin(xi_shared[j]);
+            shared_c1[2 * ns + j] = sin(0.5 * xi_shared[j]);
+        }
+    }
     #pragma omp parallel num_threads(team)
     {
         const size_t stride = (size_t)(na_max > 0 ? na_max : 1) + 4;
@@ -911,7 +953,7 @@ void near_green_rule(int npair,
         #pragma omp for schedule(static)
         for (int i = 0; i < npair; i++) {
             double *o = out + (size_t)i * 2 * count;
-            if (scratch == (double *)0) {
+            if (scratch == (double *)0 || shared_c1 == (double *)0) {
                 for (int j = 0; j < 2 * count; j++) o[j] = NAN;
                 continue;
             }
@@ -919,18 +961,31 @@ void near_green_rule(int npair,
             double *x0 = scratch + 2 * stride, *x1 = scratch + 3 * stride;
             double *c = scratch + 4 * stride, *s = scratch + 5 * stride;
             double *c1 = scratch + 6 * stride, *s1 = scratch + 7 * stride;
-            const int na = rule_nodes(delta[i], s_core, n_core, u_core, w_core,
-                                      n_shared, xi_shared, w_shared, xi, w);
+            const int na = rule_nodes(delta[i], s_core, nc, u_core, w_core,
+                                      ns, xi_shared, w_shared, xi, w);
             const double dr = rho_p[i] - rho_q[i], dz = z_p[i] - z_q[i];
             const double d2 = dr * dr + dz * dz;
             const double rr4 = 4.0 * rho_p[i] * rho_q[i];
-            for (int a = 0; a < na; a++) {
+            for (int a = 0; a < nc; a++) {
                 double re, im;
                 green_value(d2, rr4, xi[a], kr, ki, &re, &im);
                 x0[a] = re * w[a];
                 x1[a] = im * w[a];
+                GHOST_SINCOS(xi[a], &s1[a], &c1[a]);
+                c[a] = 1.0;
+                s[a] = 0.0;
             }
-            init_state(na, xi, c, s, c1, s1);
+            for (int a = nc; a < na; a++) {
+                const int j = a - nc;
+                double re, im;
+                green_value_h(d2, rr4, shared_c1[2 * ns + j], kr, ki, &re, &im);
+                x0[a] = re * w[a];
+                x1[a] = im * w[a];
+                c1[a] = shared_c1[j];
+                s1[a] = shared_c1[ns + j];
+                c[a] = 1.0;
+                s[a] = 0.0;
+            }
             const double *rows[2];
             rows[0] = x0;
             rows[1] = x1;
@@ -939,7 +994,9 @@ void near_green_rule(int npair,
         }
         free(scratch);
     }
+    free(shared_c1);
 }
+
 
 void near_brackets_rule(int family, int stable, int npair,
                         const double *rho_p, const double *z_p,
@@ -952,9 +1009,18 @@ void near_brackets_rule(int family, int stable, int npair,
                         int count, double *out_cos, double *out_sin, int nthreads)
 {
     const int team = team_size(nthreads);
-    const int na_max = (n_core > 0 ? n_core : 0) + (n_shared > 0 ? n_shared : 0);
+    const int nc = n_core > 0 ? n_core : 0, ns = n_shared > 0 ? n_shared : 0;
+    const int na_max = nc + ns;
     if (npair <= 0 || count <= 0)
         return;
+    double *shared_c1 = (double *)malloc(sizeof(double) * 3 * (size_t)(ns > 0 ? ns : 1));
+    if (shared_c1 != (double *)0) {
+        for (int j = 0; j < ns; j++) {
+            shared_c1[j] = cos(xi_shared[j]);
+            shared_c1[ns + j] = sin(xi_shared[j]);
+            shared_c1[2 * ns + j] = sin(0.5 * xi_shared[j]);
+        }
+    }
     #pragma omp parallel num_threads(team)
     {
         const size_t stride = (size_t)(na_max > 0 ? na_max : 1) + 4;
@@ -963,7 +1029,7 @@ void near_brackets_rule(int family, int stable, int npair,
         for (int i = 0; i < npair; i++) {
             double *oc = out_cos + (size_t)i * 4 * count;
             double *os = out_sin + (size_t)i * 4 * count;
-            if (scratch == (double *)0) {
+            if (scratch == (double *)0 || shared_c1 == (double *)0) {
                 for (int j = 0; j < 4 * count; j++) oc[j] = os[j] = NAN;
                 continue;
             }
@@ -975,19 +1041,27 @@ void near_brackets_rule(int family, int stable, int npair,
             }
             double *c = scratch + 10 * stride, *s = scratch + 11 * stride;
             double *c1 = scratch + 12 * stride, *s1 = scratch + 13 * stride;
-            const int na = rule_nodes(delta[i], s_core, n_core, u_core, w_core,
-                                      n_shared, xi_shared, w_shared, xi, w);
+            const int na = rule_nodes(delta[i], s_core, nc, u_core, w_core,
+                                      ns, xi_shared, w_shared, xi, w);
             const double rp = rho_p[i], rq = rho_q[i], rz = z_p[i] - z_q[i];
             const double tp = tr_p[i], zp = tz_p[i], tq = tr_q[i], zq = tz_q[i];
             const stable_pair q = stable_setup(family, rp, z_p[i], tp, zp, rq, z_q[i], tq, zq);
             for (int a = 0; a < na; a++) {
                 double v[8];
-                c1[a] = cos(xi[a]);
-                s1[a] = sin(xi[a]);
+                double half;
+                if (a < nc) {
+                    GHOST_SINCOS(xi[a], &s1[a], &c1[a]);
+                    half = sin(0.5 * xi[a]);
+                } else {
+                    const int j = a - nc;
+                    c1[a] = shared_c1[j];
+                    s1[a] = shared_c1[ns + j];
+                    half = shared_c1[2 * ns + j];
+                }
                 c[a] = 1.0;
                 s[a] = 0.0;
                 if (stable)
-                    bracket_stable(family, &q, kr, ki, sin(0.5 * xi[a]), s1[a], v);
+                    bracket_stable(family, &q, kr, ki, half, s1[a], v);
                 else
                     bracket_sampled(family, rp, rq, rz, tp, zp, tq, zq, kr, ki, c1[a], s1[a], v);
                 const double ww = w[a];
@@ -1009,4 +1083,5 @@ void near_brackets_rule(int family, int stable, int npair,
         }
         free(scratch);
     }
+    free(shared_c1);
 }
