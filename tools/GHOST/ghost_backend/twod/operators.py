@@ -228,6 +228,7 @@ def _integrate_linear_pairs_box_sk_batched(
     order: 'int',
     compute_single_layer: 'bool' = True,
     compute_double_layer: 'bool' = True,
+    geometry=None,
 ) -> 'Tuple[np.ndarray, np.ndarray]':
     """Tensor-Gauss S/K blocks for many full-interval element pairs.
 
@@ -255,10 +256,17 @@ def _integrate_linear_pairs_box_sk_batched(
     phi = _polynomial_values(q, width - 1)
     obs_elems = [elements[int(index)] for index in obs_ids]
     src_elems = [elements[int(index)] for index in src_ids]
-    obs_p0 = np.asarray([elem.p0 for elem in obs_elems], dtype=float)
-    src_p0 = np.asarray([elem.p0 for elem in src_elems], dtype=float)
-    obs_seg = np.asarray([elem.p1 - elem.p0 for elem in obs_elems], dtype=float)
-    src_seg = np.asarray([elem.p1 - elem.p0 for elem in src_elems], dtype=float)
+    if geometry is not None:
+        # The assembly's own element arrays (the same floats the element
+        # objects hold): no per-batch rebuild from Python attribute lists.
+        p0_all, seg_all, lengths_all, normals_all = geometry
+        obs_p0, src_p0 = p0_all[obs_ids], p0_all[src_ids]
+        obs_seg, src_seg = seg_all[obs_ids], seg_all[src_ids]
+    else:
+        obs_p0 = np.asarray([elem.p0 for elem in obs_elems], dtype=float)
+        src_p0 = np.asarray([elem.p0 for elem in src_elems], dtype=float)
+        obs_seg = np.asarray([elem.p1 - elem.p0 for elem in obs_elems], dtype=float)
+        src_seg = np.asarray([elem.p1 - elem.p0 for elem in src_elems], dtype=float)
     obs_pts = obs_p0[:, None, :] + q[None, :, None] * obs_seg[:, None, :]
     src_pts = src_p0[:, None, :] + q[None, :, None] * src_seg[:, None, :]
     diff = obs_pts[:, :, None, :] - src_pts[:, None, :, :]
@@ -292,17 +300,15 @@ def _integrate_linear_pairs_box_sk_batched(
         if derivative is None:
             derivative = (0.25j * complex(k0)) * _hankel2_1_array(kr.reshape(-1)).reshape(dist.shape)
         if obs_normal_deriv:
-            normals = np.asarray(
-                [elem.normal for elem in obs_elems], dtype=float
-            )
+            normals = (normals_all[obs_ids] if geometry is not None else
+                       np.asarray([elem.normal for elem in obs_elems], dtype=float))
             proj = np.sum(
                 diff * normals[:, None, None, :], axis=3
             ) / dist_safe
             dk_vals = -derivative * proj
         else:
-            normals = np.asarray(
-                [elem.normal for elem in src_elems], dtype=float
-            )
+            normals = (normals_all[src_ids] if geometry is not None else
+                       np.asarray([elem.normal for elem in src_elems], dtype=float))
             proj = np.sum(
                 diff * normals[:, None, None, :], axis=3
             ) / dist_safe
@@ -312,10 +318,13 @@ def _integrate_linear_pairs_box_sk_batched(
     else:
         k_blocks = zero.copy()
 
-    scales = np.asarray(
-        [obs.length * src.length for obs, src in zip(obs_elems, src_elems)],
-        dtype=float,
-    )[:, None, None]
+    if geometry is not None:
+        scales = (lengths_all[obs_ids] * lengths_all[src_ids])[:, None, None]
+    else:
+        scales = np.asarray(
+            [obs.length * src.length for obs, src in zip(obs_elems, src_elems)],
+            dtype=float,
+        )[:, None, None]
     return s_blocks * scales, k_blocks * scales
 
 def _single_layer_self_block_exact(
@@ -1855,7 +1864,7 @@ def _maue_blocks(s_blocks, k0, obs_normals, src_normals, obs_lengths, src_length
 
 def _near_pair_blocks(elements, obs_idx, src_idx, k0, obs_normal_deriv, obs_order, src_order,
                       integrate_s, want_k, p0_arr, seg_arr, centers, lengths, node_ids, far_table,
-                      single_layer_blocks=None, double_layer_blocks=None):
+                      single_layer_blocks=None, double_layer_blocks=None, normals=None):
     """Integrate one bounded set of pairs, using the unchanged quadrature rules."""
     npairs, width = len(obs_idx), node_ids.shape[1]
     panel_index = np.asarray([e.panel_index for e in elements], dtype=np.int64)
@@ -1892,6 +1901,7 @@ def _near_pair_blocks(elements, obs_idx, src_idx, k0, obs_normal_deriv, obs_orde
             tensor_order,
             compute_single_layer=integrate_s,
             compute_double_layer=want_k,
+            geometry=None if normals is None else (p0_arr, seg_arr, lengths, normals),
         )
 
     from ghost_backend.twod.polynomial_quadrature import map_checked, solve_checkpoint
@@ -2404,7 +2414,8 @@ def _assemble_multi(
                 k0, obs_normal_deriv, obs_order, src_order, integrate_s, want_k,
                 p0_arr, seg_arr, centers, lengths, node_ids, far_table,
                 single_layer_blocks=near.arrays['S'][start:stop] if 'S' in near.arrays else None,
-                double_layer_blocks=near.arrays['K'][start:stop] if 'K' in near.arrays else None)
+                double_layer_blocks=near.arrays['K'][start:stop] if 'K' in near.arrays else None,
+                normals=normals_arr)
             if sb is not None:
                 near.write('S', start, sb)
             if kb is not None:

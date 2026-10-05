@@ -36,6 +36,7 @@ class SystemScatter:
         if rows.ndim == 2 and columns.ndim == 2 and rows.shape[1] == 1 and columns.shape[0] == 1:
             self._scatter_outer(rows[:, 0], columns[0], values)
             return
+        matrix = self.matrix
         for row_map, column_map, weights in self.routes:
             rr, cc = np.broadcast_arrays(row_map[rows], column_map[columns])
             keep = (rr >= 0) & (cc >= 0)
@@ -43,7 +44,15 @@ class SystemScatter:
                 scaled = np.broadcast_to(values, keep.shape)
                 if weights is not None:
                     scaled = scaled * np.broadcast_to(weights[rows], keep.shape)
-                np.add.at(self.matrix, (rr[keep], cc[keep]), scaled[keep])
+                # One-dimensional ufunc.at over a contiguous view adds the same
+                # entries in the same order several times faster than 2-D
+                # fancy indexing (see _scatter_outer).
+                if isinstance(matrix, np.ndarray) and matrix.flags.f_contiguous:
+                    np.add.at(matrix.reshape(-1, order='F'), rr[keep] + cc[keep] * matrix.shape[0], scaled[keep])
+                elif isinstance(matrix, np.ndarray) and matrix.flags.c_contiguous:
+                    np.add.at(matrix.reshape(-1), rr[keep] * matrix.shape[1] + cc[keep], scaled[keep])
+                else:
+                    np.add.at(matrix, (rr[keep], cc[keep]), scaled[keep])
 
     def scatter_add_columns(self, rows, columns, values):
         """scatter_add(rows[:, None], columns[None, :, b], values[b]) for each b in order.
