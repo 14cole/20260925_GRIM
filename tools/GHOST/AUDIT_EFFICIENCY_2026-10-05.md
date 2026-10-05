@@ -190,8 +190,9 @@ streaming-equivalence, batched and near-pair tests of `test_bor_physics_regressi
 `test_audit_fixes_2026_09_24.py::ModeWindowTests::test_window_stops_at_the_predicted_tail_with_identical_fields`,
 fails identically on the unmodified tree here: it expects the mode window of an eight-worker
 host (13 and 21 tasks started) and this container admits four workers (7 and 9). The Windows
-DLL `bor_stream_kernel.windows-amd64.dll` is not rebuilt in this checkout; until it is,
-Windows hosts load the old kernel (every Python change still applies).
+DLL `bor_stream_kernel.windows-amd64.dll` is not rebuilt on this branch; until it is,
+Windows hosts load the old kernel (every Python change still applies). The recommendations
+branch rebuilds it (section 7).
 
 ## 4. Recommendations not implemented on the branch
 
@@ -391,8 +392,19 @@ Files: `linalg/hierarchical.py`, `linalg/dense.py`, `bor/factor.py`, `bor/solver
 `bor/kernels.py`, `bor/streaming.py`, `bor/native/build_kernel.py`, `execution/policy.py`,
 `twod/solver.py`, `twod/assembly/native/far.c`, `far.py`, `build.py`, `scripts/check_speed_paths.py`,
 `BOR_PERFORMANCE.md` ("October 5 efficiency changes"), `NUMERICAL_METHODS.md`, and the tests
-named above. The Linux libraries are rebuilt locally and ignored by git as before; the Windows
-libraries (`ghost_far.dll`, `ghost_table.dll`, `bor_stream_kernel.windows-amd64.dll`) are not
-rebuilt in this checkout, and `ghost_far.dll` predates `ghost_far_block_simd`, so the release
-build (which compiles from source and load-checks that export) or `build.py` must rebuild it
-on Windows before the vectorized kernel reaches those hosts.
+named above. The Linux libraries are rebuilt locally and ignored by git as before. The two
+Windows libraries whose sources changed, `ghost_far.dll` and
+`bor_stream_kernel.windows-amd64.dll`, were cross-compiled on the branch with MinGW-w64 GCC 13
+(`x86_64-w64-mingw32-gcc-posix`, msvcrt runtime, OpenMP and the GCC runtime linked
+statically) using the same flags the build scripts pass on Windows (`-O3 -std=c99
+-ffp-contract=off -shared -static -static-libgcc -Wl,--no-insert-timestamp` for the 2-D
+kernel, `-fopenmp -O3 -std=c99 -shared -static -static-libgcc -Wl,--no-insert-timestamp` for
+the BoR kernel). Both import only `KERNEL32.dll` and `msvcrt.dll`, export every symbol the
+build scripts require (`ghost_far_block_simd` included), and were loaded under Wine by a
+small test program that evaluated a far block, the paired Green's function sampler and the
+graded near rule on fixed inputs: all 53 values agree bitwise with the Linux libraries. The
+load check of the build scripts itself cannot run on Linux, and Wine's C runtime is not
+Microsoft's, so `scripts/check_speed_paths.py` on a Windows host remains the final
+confirmation. `ghost_table.dll` is unchanged because `table.c` did not change. The earlier
+Windows DLLs were built with MSYS2 UCRT64 GCC and imported the UCRT (`api-ms-win-crt-*`);
+the cross-compiled ones use msvcrt, which every supported Windows provides.

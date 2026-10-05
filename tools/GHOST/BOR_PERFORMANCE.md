@@ -517,6 +517,12 @@ stated, measured on a 4-core container in fresh processes.
   but results are then not bitwise comparable between builds or hosts.
   `near_preparation.native_kernel` records `strict` or `fast-math`, and
   `scripts/check_speed_paths.py` reports the loaded variant.
+- Windows libraries: `bor_stream_kernel.windows-amd64.dll` and the 2-D `ghost_far.dll`
+  were cross-compiled from Linux with MinGW-w64 GCC 13 (`x86_64-w64-mingw32-gcc-posix`,
+  the flags of the build scripts, OpenMP and the GCC runtime linked statically, msvcrt
+  runtime) and checked under Wine against the Linux builds on fixed inputs (bitwise
+  identical values, every required export present). The build scripts' own load check
+  runs only on Windows, so `scripts/check_speed_paths.py` there is the final confirmation.
 - Mode factors follow the host's memory, not a fixed unknown count: the worker
   plan (`plan_bor_mode_workers`, `factor`) keeps LU with the largest worker
   count that fits and prices the HODLR factor only when no LU count fits, or
