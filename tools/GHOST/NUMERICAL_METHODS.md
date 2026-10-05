@@ -197,7 +197,15 @@ observer/source rules use the original assembly path. These optimizations
 preserve the previously introduced combined-potential formulation.
 
 The outer tile scheduler owns 2D assembly concurrency. Native far integration
-does not start a nested four-thread pool. Endpoint-touching pairs (one
+does not start a nested four-thread pool. Since 5 October 2026 the native far
+block evaluates its kernel table with 4-lane vectors (the real and imaginary
+coefficients of both channels of one power are adjacent in the table) and
+runs four source points' Horner chains interleaved, so the dependent
+multiply-add chains overlap instead of serializing; each lane performs the
+scalar chain's operations in order without contraction, so the blocks are
+bitwise the former ones, at 1.9 times the speed on the captured tiles of a
+10 GHz rectangle (2.67 to 1.38 s over 24 tiles; AVX2 lanes where the
+processor has them, `ghost_far_block_simd`). Endpoint-touching pairs (one
 1e-9 m touching tolerance, the node-snap width, plus a same-node rule) use a
 graded `t^4` corner rule with 20 points per direction and corner-stable
 distances: per block 2.6e-13 collinear and 1.3e-10 (K') at a 170 degree reflex
@@ -224,21 +232,33 @@ retain their existing storage. Spools close on completion or failure. BoR modal
 factors follow the same policy: a mode worker whose copy does not fit factors a
 system of 512 MiB or more in place and computes its residuals from the spool.
 
-A dense double-precision system of at least 10,000 unknowns
-(`linalg.hierarchical.HIERARCHICAL_MIN_UNKNOWNS`; the environment variable
-`GHOST_HIERARCHICAL_MIN_UNKNOWNS` overrides it, 0 keeps LU) is factored as a
-HODLR inverse under the `dense` and `auto` factorizations. Its off-diagonal
+A dense double-precision system is factored as a HODLR inverse under the
+`dense` and `auto` factorizations when its LU route (the matrix, its LU copy
+and one batch of right-hand-side workspace, `linalg.hierarchical.lu_route_bytes`)
+does not fit the admitted solve memory and it has at least 4,096 unknowns
+(`linalg.hierarchical.HIERARCHICAL_MIN_UNKNOWNS`); the environment variable
+`GHOST_HIERARCHICAL_MIN_UNKNOWNS` replaces that rule with a fixed threshold
+(0 keeps LU). At planning time the rule compares the LU plan's peak with the
+solve limit; at run time the dense factor asks whether the LU copy still fits
+(`residual_spool.copy_fits`), and a BoR mode sweep follows its worker plan,
+which keeps LU with the largest worker count that fits and prices the
+hierarchical factor only when no LU count does. Until 5 October 2026 the
+switch was a fixed 10,000 unknowns, measured on an 8-core workstation where
+the factor tied LU at 9,082 unknowns of the certified airfoil (4.2 against
+4.7 s, three batches of 256 right-hand sides) and was 1.7 times faster at
+13,618 (8.0 against 13.7 s, factor 182 MB against a 2,967 MB LU); on a 4-core
+host the same switch made the 12,096-unknown systems of a certified 10 GHz
+coupon solve 1.6 times slower end to end (271 against 167 s) to save 2.2 GB,
+because the HODLR work (gathers, narrow sampling products, Python recursion,
+exact-matrix residual products per solve batch) scales with memory bandwidth
+and interpreter speed while LU scales with the BLAS rate. Its off-diagonal
 blocks are compressed by an adaptive randomized range finder (products of the
 block with 32 Gaussian probes at a time, re-orthogonalized, until fresh
 samples leave less than `1e-10 ||A||_inf`; then a truncated SVD through the QR
 of the projected block), and the factor is accepted exactly as before: every
 solve is refined against the original matrix to a normwise backward error of
 3e-15, the result must then pass the dense backward-error gate, and a factor
-that does not converge is rebuilt once at `1e-12`, then replaced by LU. On the
-certified airfoil's systems (three batches of 256 right-hand sides, eight
-cores) the factor tied LU at 9,082 unknowns (4.2 against 4.7 s) and was 1.7
-times faster at 13,618 (8.0 against 13.7 s, factor 182 MB against a 2,967 MB
-LU); below the threshold LU is faster (7,348 unknowns: 3.4 against 2.8 s).
+that does not converge is rebuilt once at `1e-12`, then replaced by LU.
 The block tolerance sets the cost: at `1e-9` refinement needed two steps, at
 `1e-6` seven, each a product with the original matrix per batch. A cluster
 tree over the coordinates keeps coincident unknowns of different densities in
@@ -367,7 +387,18 @@ comparison is accepted only when every order actually grew: the former check
 could accept two identical saturated tail orders (4096) and returned kernels
 wrong by up to 1.1e-3 at `d/a = 1e-8` without an error (526 of 920 points of a
 tiny-element self cell above tolerance, worst 2.3e-2). The kernels now agree
-with independent references to 4e-14 for `d/a` from 1e-9 to 0.5.
+with independent references to 4e-14 for `d/a` from 1e-9 to 0.5. Since
+5 October 2026 the coarse level is evaluated, by default, only for the
+extreme points of each chunk of a layout group (every sixteenth point in order
+of `d/a`, the largest `d/a`, the smallest and largest radius product; at least
+eight points, `kernels.NEAR_CHECK_STRIDE`): when all of them agree with the
+fine level to `NEAR_ANGULAR_RTOL`, every point of the chunk is accepted at the
+fine level, which is the value the full check stores for a point that passes,
+so the kernels are unchanged wherever the full check passed at the first
+level, as the 24 September calibration found everywhere (coarse errors
+<= 4e-11, fine <= 3e-13). A sampled point that fails returns the chunk to the
+point-by-point check; `GHOST_BOR_NEAR_CHECK=full` keeps that check for every
+point. The coarse level was 40 % of the native near-rule work.
 
 BoR self and adjacent meridian quadrature uses a fixed graded rule (quadtree
 cells toward the singular set, 4 x 5 Gauss points per cell, depth `near_depth`).

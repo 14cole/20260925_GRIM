@@ -440,10 +440,12 @@ largest amplitude (1.5e-7 dB within 40 dB of the peak).
   streams now have a separately verified bounded representation, described below.
 - Tiles are sampled in spawn processes when the near-preparation scope admits
   a process pool (the same capability test and size); otherwise on threads.
-- Mode factors: a mode system of at least 10,000 unknowns on a single surface
-  is factored as the checked HODLR inverse of the 2-D dense factor (see
-  [numerical methods](NUMERICAL_METHODS.md)), priced at two matrix copies per
-  worker instead of three, and falls back to LU if rejected.
+- Mode factors: a single-surface mode system whose LU route does not fit the
+  admitted memory (or that `GHOST_HIERARCHICAL_MIN_UNKNOWNS` names; since
+  5 October 2026 the worker plan decides this per host instead of a fixed
+  10,000 unknowns, see [numerical methods](NUMERICAL_METHODS.md)) is factored
+  as the checked HODLR inverse of the 2-D dense factor, priced at two matrix
+  copies per worker instead of three, and falls back to LU if rejected.
   Dielectric, coated, partial-coating, and multi-region systems also supply
   their reduced-coordinate ordering to the same checked factor. These newer
   paths retain the conservative LU memory estimate; the original modal
@@ -464,12 +466,64 @@ status 1 when any would fall back). Each BoR frequency's
 (null for the dense store; its `backend` is `processes`, or `threads` when no
 process pool was admitted, for example because the entry script has no
 `if __name__ == "__main__":` guard), `stream_spill_gb`, `near_preparation.backend`,
+`near_preparation.native_kernel` (`strict`, or `fast-math` for the opt-in build),
 and in `modal_execution.systems` each mode's factor `backend` with any
 `mirror_fallback` or `hierarchical_fallback`. A top-level
 `automatic_factorization_fallback` marks a switch to the compressed
 factorization. 2-D results record `linear_backend` (`cpu_hierarchical` for the
 hierarchical factor, `cpu` for LU), `dense_fallback_reasons` and, for automatic
 runs, `backend_selection`.
+
+## October 5 efficiency changes
+
+Implemented from the 5 October efficiency audit (`AUDIT_EFFICIENCY_2026-10-05.md`,
+section 4); every change keeps the solved fields bitwise identical unless
+stated, measured on a 4-core container in fresh processes.
+
+- Streamed far tiles: `BOR_STREAM_TILE_BUDGET_GB` is 0.25 GB instead of 1.0.
+  Every concurrent tile is sized to its share of the budget, so the planner
+  prices a quarter of the former scratch into every streamed admission and a
+  streamed solve holds proportionally less: the ka = 30 CFIE sphere (300
+  elements, four workers) peaked at 630 MB instead of 1,456 MB. Smaller tiles
+  change the GEMM shapes of the band contractions, so streamed fields differ
+  from the former tiles at the rounding level (3e-15 relative on that sphere).
+- Banded far sampling in group order was implemented and measured, not kept:
+  on an 8,000-pair tile of the ka = 30 sphere the native sampler is 19 ms
+  (Green's function) and 39 ms (brackets) of a 25 and 45 ms call, the
+  projection GEMM 1.2 to 1.5 ms, and each fancy-indexed write of a chunk's
+  rows 0.4 ms; writing group-ordered buffers and scattering them once adds a
+  slab copy per output and a second copy of the outputs for nothing.
+- Near chunk contractions are batched: `_contract_near_chunks` stacks the
+  chunks of equal point count of one kernel block and forms each term as one
+  batched product `(C, 4, P) @ (C, P, modes)`, so a NumPy call serves tens of
+  chunks instead of one (the 3,152 per-chunk contractions of a 100-element
+  sphere spent 0.8 s in Python). Each chunk's products are the same GEMMs on
+  the same values, and the blocks are added in chunk order, so every pair's
+  block is bitwise the former one.
+- Subset convergence check of the graded near rule (`GHOST_BOR_NEAR_CHECK`,
+  default `subset`): the coarse level, 40 % of the native kernel work, is
+  evaluated for the extreme points of each chunk of a layout group only; see
+  [numerical methods](NUMERICAL_METHODS.md). `full` restores the per-point check.
+- Together, on this host: the ka = 10 sphere with one near worker 8.9 to 8.3 s,
+  with four workers 4.8 to 4.4 s, the lossy dielectric ka = 6 sphere 6.1 to
+  4.9 s, the streamed ka = 30 sphere 23.5 to 21.5 s, all bitwise identical to
+  the audit branch except the streamed case (above).
+- Opt-in fast-math kernels: `python ghost_backend/bor/native/build_kernel.py
+  --fast-math` builds `bor_stream_kernel.<tag>.fast` next to the strict
+  library, and a process with `GHOST_BOR_FAST_MATH=1` loads it (otherwise the
+  strict build loads even when the fast one exists). The near rules run about
+  twice as fast (1.99x on 3,074 captured calls); the kernels differ from the
+  strict build by up to about 6e-13 relative, within the 2e-8 angular check,
+  but results are then not bitwise comparable between builds or hosts.
+  `near_preparation.native_kernel` records `strict` or `fast-math`, and
+  `scripts/check_speed_paths.py` reports the loaded variant.
+- Mode factors follow the host's memory, not a fixed unknown count: the worker
+  plan (`plan_bor_mode_workers`, `factor`) keeps LU with the largest worker
+  count that fits and prices the HODLR factor only when no LU count fits, or
+  when `GHOST_HIERARCHICAL_MIN_UNKNOWNS` asks for it; the same rule serves the
+  2-D dense factor (see [numerical methods](NUMERICAL_METHODS.md)). On this
+  host the former 10,000-unknown switch made the 12,096-unknown systems of a
+  certified 10 GHz solve 1.6 times slower end to end.
 
 ## Bounded near and rectangular storage
 

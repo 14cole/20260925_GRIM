@@ -26,8 +26,7 @@ def stage_work(resources, n_angles, mode, assembly_threads=1, blas_threads=1):
     can bound their contributions without fitting an underdetermined mixture.
     The compressed inverse has no promised rank advantage in the prior.
     """
-    from ghost_backend.linalg.hierarchical import automatic_hierarchical, HIERARCHICAL_MIN_UNKNOWNS
-    import os
+    from ghost_backend.linalg.hierarchical import automatic_hierarchical, hierarchical_switch_size
     if mode not in BACKENDS:raise ValueError('Unknown automatic backend.')
     n=max(1,int(resources['nodes'])); d=max(1,int(resources['system_dofs']))
     angles=max(1,int(n_angles)); kernels=max(1.,resources.get('operator_matrices',3)/3.)
@@ -35,10 +34,12 @@ def stage_work(resources, n_angles, mode, assembly_threads=1, blas_threads=1):
     far=max(1.,float(resources.get('operator_entries',n*n*kernels)))
     near=max(0.,float(resources.get('geometric_near_pairs',0)))*width*width*kernels
     assembly_threads=max(1,int(assembly_threads));blas_threads=max(1,int(blas_threads))
-    threshold=int(os.environ.get('GHOST_HIERARCHICAL_MIN_UNKNOWNS','') or HIERARCHICAL_MIN_UNKNOWNS)
     hierarchical=automatic_hierarchical(d)
-    # Continuous at the actual LU/HODLR switch. Unknown rank does not promise
-    # a compressed speedup; local measured stages supersede the work prior.
+    # Continuous at the actual LU/HODLR switch (the fixed threshold, or the
+    # order whose LU route reaches this host's admitted memory). Unknown rank
+    # does not promise a compressed speedup; local measured stages supersede
+    # the work prior.
+    threshold=hierarchical_switch_size() or d
     factor=(min(d,max(1,threshold))*d*d*max(1.,math.log2(d)/math.log2(max(2,threshold)))
             if hierarchical else d**3)
     return dict(assembly_far=far/assembly_threads,assembly_near=near/assembly_threads,

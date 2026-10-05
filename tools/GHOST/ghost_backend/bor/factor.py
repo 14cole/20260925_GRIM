@@ -125,13 +125,17 @@ class ModalFactor:
     holds one dense matrix instead of the matrix plus its LU copy.  The
     caller must not use ``matrix`` afterwards (``solve_am`` never does).
 
-    With ``coordinates`` (the meridian position of every reduced unknown), a
-    system of at least ``linalg.hierarchical.HIERARCHICAL_MIN_UNKNOWNS`` is
-    factored hierarchically instead (the randomized HODLR of the 2-D dense
-    factor, refined against the exact matrix to the same backward error):
-    faster than LU there and a factor of a few percent of the matrix, so a
-    mode worker holds the matrix and that factor instead of two matrices.  A
-    rejected factor falls back to LU.
+    With ``coordinates`` (the meridian position of every reduced unknown) the
+    system is factored hierarchically instead (the randomized HODLR of the 2-D
+    dense factor, refined against the exact matrix to the same backward
+    error): a factor of a few percent of the matrix, so a mode worker holds
+    the matrix and that factor instead of two matrices.  The mode sweep passes
+    coordinates when its plan chose that factor for this host
+    (:func:`bor.solver.plan_bor_mode_workers`: the LU route does not fit the
+    admitted memory, or GHOST_HIERARCHICAL_MIN_UNKNOWNS asks for it); the
+    threshold variable still decides here when set, and systems below
+    ``linalg.hierarchical.HIERARCHICAL_MIN_UNKNOWNS`` keep LU.  A rejected
+    factor falls back to LU.
 
     With ``mirror = (target, sign)`` (the mirror map of a body symmetric about
     a plane normal to its axis, :class:`MirrorSplit`) the even and odd halves
@@ -176,7 +180,9 @@ class ModalFactor:
             self._factor_mirror(mirror)
         if self.mirror is None and coordinates is not None:
             from ghost_backend.linalg.hierarchical import automatic_hierarchical
-            if automatic_hierarchical(len(matrix)):
+            # Coordinates mean the caller's plan chose the hierarchical factor
+            # (its LU route did not fit); the threshold variable overrides.
+            if automatic_hierarchical(len(matrix), lu_fits=False):
                 self._factor_hierarchical(coordinates)
         if self.hierarchical is None and self.mirror is None:
             self._factor_lu(owned, residual_storage)

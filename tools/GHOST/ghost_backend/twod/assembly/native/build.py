@@ -12,7 +12,7 @@ import uuid
 REQUIRED_SYMBOLS = {
     'table': ('ghost_table_eval',),
     'far': ('ghost_far_block', 'ghost_scatter_columns', 'ghost_scatter_tile',
-            'ghost_scatter_has_fused'),
+            'ghost_scatter_has_fused', 'ghost_far_block_simd'),
 }
 _LOAD_CHECK = (
     'import ctypes, sys\n'

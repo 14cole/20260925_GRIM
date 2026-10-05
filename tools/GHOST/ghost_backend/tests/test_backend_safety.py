@@ -61,6 +61,31 @@ class NativeLoaderTrustTests(unittest.TestCase):
                 self.assertIsNone(bor_streaming._load_native())
         loader.assert_not_called()
 
+    def test_fast_math_library_is_loaded_only_when_requested(self) -> None:
+        loaded = []
+
+        def fake(path):
+            loaded.append(Path(path).name)
+            return SimpleNamespace(sample_g=mock.Mock(), sample_mfie=mock.Mock(), sample_ibc=mock.Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("bor_stream_kernel.linux-x86_64.so", "bor_stream_kernel.linux-x86_64.fast.so"):
+                (root / name).write_bytes(b"library")
+            with (
+                mock.patch.object(bor_streaming, "native_kernel_root", return_value=root),
+                mock.patch.object(platform, "system", return_value="Linux"),
+                mock.patch.object(platform, "machine", return_value="x86_64"),
+                mock.patch.object(ctypes, "CDLL", side_effect=fake),
+            ):
+                with mock.patch.dict(os.environ, {"GHOST_BOR_FAST_MATH": ""}):
+                    strict = bor_streaming._load_native()
+                with mock.patch.dict(os.environ, {"GHOST_BOR_FAST_MATH": "1"}):
+                    fast = bor_streaming._load_native()
+        self.assertEqual(loaded, ["bor_stream_kernel.linux-x86_64.so", "bor_stream_kernel.linux-x86_64.fast.so"])
+        self.assertEqual(strict._ghost_native_variant, "strict")
+        self.assertEqual(fast._ghost_native_variant, "fast-math")
+        self.assertEqual(bor_streaming._native_library_bases("linux", "x86_64")[0], "bor_stream_kernel.linux-x86_64")
+
     def test_native_candidates_never_come_from_working_directory(self) -> None:
         loaded = []
         fake_library = SimpleNamespace(

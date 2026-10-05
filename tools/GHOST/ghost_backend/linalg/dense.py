@@ -53,10 +53,13 @@ class DenseFactor:
             raise ValueError('This factorization requires a geometry-built compressed operator.')
         if self.factor_mode != 'dense' and requested_precision() == 'mixed':
             raise ValueError('Hierarchical CPU factorization requires double precision.')
-        # Large dense systems are factored hierarchically by default: accepted
-        # by the same exact-matrix backward-error gate as LU, with LU as fallback.
+        # A large dense system whose LU copy does not fit the admitted memory
+        # (or that GHOST_HIERARCHICAL_MIN_UNKNOWNS names) is factored
+        # hierarchically by default: accepted by the same exact-matrix
+        # backward-error gate as LU, with LU as fallback.
         automatic = (self.factor_mode in ('dense', 'auto') and requested_precision() == 'double'
-                     and self.a.ndim == 2 and automatic_hierarchical(len(self.a)))
+                     and self.a.ndim == 2
+                     and automatic_hierarchical(len(self.a), lu_fits=self._lu_copy_fits()))
         if self.factor_mode == 'hierarchical' or automatic:
             try:
                 self.hierarchical = timed_stage('factorization')(HierarchicalFactor)(
@@ -81,6 +84,16 @@ class DenseFactor:
             except BaseException:
                 self.close()
                 raise
+
+    def _lu_copy_fits(self):
+        """Whether this system's LU copy fits the remaining admitted memory
+        (:func:`residual_spool.copy_fits`), the input of the memory rule of
+        :func:`automatic_hierarchical`; True when that rule does not apply."""
+        from ghost_backend.linalg.hierarchical import HIERARCHICAL_MIN_UNKNOWNS, hierarchical_threshold
+        if self.a.ndim != 2 or len(self.a) < HIERARCHICAL_MIN_UNKNOWNS or hierarchical_threshold() is not None:
+            return True
+        from ghost_backend.linalg.residual_spool import copy_fits
+        return copy_fits(self.a.nbytes)
 
     def _sync_hierarchical_builds(self):
         if self.hierarchical is not None:

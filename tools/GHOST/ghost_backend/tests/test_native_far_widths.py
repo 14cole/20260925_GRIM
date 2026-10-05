@@ -60,5 +60,11 @@ class NativeFarWidthTests(unittest.TestCase):
                                 np.testing.assert_allclose(observed, expected, rtol=3e-12, atol=3e-14)
 
 
+class NativeFarVectorizationTests(unittest.TestCase):
+    def test_vectorized_table_evaluation_is_available(self):
+        if far.library() is None:
+            self.skipTest('Native far kernel is not installed.')
+        self.assertIn(far.simd_level(), (1, 2))
+
 if __name__ == '__main__':
     unittest.main()

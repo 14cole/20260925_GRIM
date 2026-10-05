@@ -364,3 +364,26 @@ class ModalProjectionTests(unittest.TestCase):
                     bracket[:, m_max + order], -bracket[:, m_max - order],
                     rtol=1e-12, atol=0.0,
                 )
+
+
+class BatchedNearContractionTests(unittest.TestCase):
+    def test_batched_chunk_contraction_matches_the_per_chunk_contraction_bitwise(self):
+        solver = bor.BorPecSolver(bor.sphere_generatrix(0.04, 24), 3.0e9)
+        gen, k, m_max = solver.gen, solver.k, 6
+        kinds, signed = ('efie', 'mfie'), False
+        modes = np.arange(0, m_max + 1)
+        chunks = []
+        for e, f in ((0, 0), (3, 4), (5, 9), (10, 10), (12, 20)):
+            points = (bor._same_surface_points(gen, e, f, kinds, solver.near_depth) if abs(e - f) <= 1
+                      else bor._gap_graded_points(gen, e, gen, f, 12))
+            chunks.extend(bor._near_point_chunks(gen, e, gen, f, points, len(modes)))
+        self.assertGreater(len({len(chunk[12]) for chunk in chunks}), 1)
+        kernels_all, edges = bor._near_block_kernels(chunks, k, m_max, kinds, signed=signed)
+        batched = bor._contract_near_chunks(chunks, kernels_all, edges, k, modes)
+        for chunk, values, blocks in zip(chunks, bor._near_chunk_kernels(chunks, k, m_max, kinds, signed=signed), batched):
+            reference = {kind: np.zeros((4, len(modes), 2, 2), complex) for kind in kinds}
+            bor._contract_near_chunk(reference, chunk, values, k, m_max, modes, signed)
+            for kind in kinds:
+                self.assertEqual(len(blocks[kind]), 4)
+                for uv in range(4):
+                    np.testing.assert_array_equal(blocks[kind][uv], reference[kind][uv])

@@ -504,5 +504,69 @@ class HousekeepingTests(unittest.TestCase):
         kernels._NOTICE_SHOWN.clear()
 
 
+class NearCheckPolicyTests(unittest.TestCase):
+    def test_subset_policy_checks_fewer_coarse_points_and_keeps_the_kernels(self):
+        # One layout group of 400 points (same radius and separation band), so
+        # the subset check is exercised rather than small groups checked in full.
+        rng = np.random.default_rng(5)
+        n = 400
+        rho = np.full(n, 0.1)
+        gap = rng.uniform(1.0e-3, 1.2e-3, n)
+        angle = rng.uniform(0, np.pi, n)
+        args = (rho, np.zeros(n), rho + gap * np.cos(angle), gap * np.sin(angle))
+        counted = []
+        original = kernels._near_rule_moments
+
+        def spy(kind, stable, points, delta, k, layout, orders, count):
+            counted.append(len(delta))
+            return original(kind, stable, points, delta, k, layout, orders, count)
+        results, points = {}, {}
+        for policy in ('full', 'subset'):
+            counted.clear()
+            with mock.patch.dict(os.environ, {'GHOST_BOR_NEAR_CHECK': policy}), \
+                    mock.patch.object(kernels, '_near_rule_moments', spy):
+                results[policy] = kernels.modal_kernels_near(*args, 30.0, 10)
+            points[policy] = sum(counted)
+        np.testing.assert_array_equal(results['subset'], results['full'])
+        self.assertLess(points['subset'], 0.75 * points['full'])
+        self.assertGreater(points['subset'], 0.5 * points['full'])
+
+    def test_subset_holds_the_extreme_points(self):
+        rng = np.random.default_rng(9)
+        delta = 10 ** rng.uniform(-7, -1, 300)
+        radius = rng.uniform(0.01, 0.4, 300)
+        picks = kernels._near_check_subset(delta, radius)
+        self.assertLess(len(picks), 60)
+        for index in (np.argmin(delta), np.argmax(delta), np.argmin(radius), np.argmax(radius)):
+            self.assertIn(index, picks)
+        self.assertTrue(np.all(np.diff(picks) > 0))
+        self.assertIsNone(kernels._near_check_subset(delta[:kernels.NEAR_CHECK_MIN_POINTS], radius[:kernels.NEAR_CHECK_MIN_POINTS]))
+        with mock.patch.dict(os.environ, {'GHOST_BOR_NEAR_CHECK': 'sometimes'}):
+            with self.assertRaises(ValueError):
+                kernels.near_check_policy()
+        with mock.patch.dict(os.environ, {'GHOST_BOR_NEAR_CHECK': ''}):
+            self.assertEqual(kernels.near_check_policy(), 'subset')
+
+
+class BandedOutputOrderTests(unittest.TestCase):
+    def test_pair_order_does_not_change_the_banded_kernels(self):
+        rng = np.random.default_rng(11)
+        n = 300
+        rp, rq = rng.uniform(0.05, 0.3, n), rng.uniform(0.05, 0.3, n)
+        zp, zq = rng.uniform(-0.2, 0.2, n), rng.uniform(-0.2, 0.2, n)
+        near = np.hypot(rp - rq, zp - zq) < 0.02
+        k = 60.0 - 1.0j
+        perm = rng.permutation(n)
+        green = kernels.banded_modal_kernels('g', (rp, zp, rq, zq), k, 8, near)
+        permuted = kernels.banded_modal_kernels('g', (rp[perm], zp[perm], rq[perm], zq[perm]), k, 8, near[perm])
+        np.testing.assert_array_equal(permuted, green[perm])
+        self.assertTrue(np.all(green[near] == 0))
+        tangent = rng.uniform(0, np.pi, n)
+        args = (rp, zp, np.cos(tangent), np.sin(tangent), rq, zq, np.cos(tangent + 0.3), np.sin(tangent + 0.3))
+        brackets = kernels.banded_modal_kernels('mfie', args, k, 8, near)
+        again = kernels.banded_modal_kernels('mfie', tuple(a[perm] for a in args), k, 8, near[perm])
+        for first, second in zip(brackets, again):
+            np.testing.assert_array_equal(second, first[perm])
+
 if __name__ == '__main__':
     unittest.main()

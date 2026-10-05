@@ -29,13 +29,22 @@ def checks():
     names = ('near_green', 'near_brackets_stable', 'parity_moments',
              'near_green_rule', 'near_brackets_rule')
     missing = [name for name in names if kernels._native_entry(name) is None]
-    rows.append(('BoR near kernels', not missing,
-                 'native' if not missing else 'NumPy fallback for ' + ', '.join(missing)))
+    detail = 'native' if not missing else 'NumPy fallback for ' + ', '.join(missing)
+    if streaming.native_kernel_variant() == 'fast-math':
+        detail += (' (fast-math build selected by GHOST_BOR_FAST_MATH: not bitwise comparable '
+                   'with the strict build)')
+    elif streaming.fast_math_requested():
+        detail += ' (GHOST_BOR_FAST_MATH is set but no fast-math build exists; the strict build loaded)'
+    rows.append(('BoR near kernels', not missing, detail))
 
     from ghost_backend.twod.assembly.native import far, table
-    for label, library in (('2D far library', far._dll()), ('2D table library', table.library())):
-        rows.append((label, library is not None,
-                     'loaded' if library is not None else 'not loadable here (NumPy fallback)'))
+    level = far.simd_level()
+    rows.append(('2D far library', bool(level),
+                 {2: 'loaded (AVX2 table evaluation)', 1: 'loaded (generic vector table evaluation)',
+                  0: 'loaded, but built before the vectorized table evaluation: rebuild with '
+                     'twod/assembly/native/build.py'}.get(level, 'not loadable here (NumPy fallback)')))
+    rows.append(('2D table library', table.library() is not None,
+                 'loaded' if table.library() is not None else 'not loadable here (NumPy fallback)'))
 
     from ghost_backend.execution.options import blas_core_budget, physical_core_count
     from ghost_backend.execution.thread_control import threadpool_info

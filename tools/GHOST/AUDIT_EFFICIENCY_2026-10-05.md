@@ -271,3 +271,128 @@ with a short calibration (LU rate against a sampled block build, or the existing
 history), or use HODLR only when the LU copy does not fit the admitted memory, which is the
 case it was built for; and reduce the solve-side cost, which pays several exact-matrix products
 per right-hand-side batch.
+
+## 7. Implementation of the recommendations (branch `perf/audit-recommendations-20261005`)
+
+Every item of section 4 was implemented on a branch based on the audit branch, measured with
+the same fresh-process suite on the same 4-core container, and compared bitwise with the
+audit branch's recorded amplitudes. One item (4) was implemented, measured and not kept.
+
+| Case | `main` | Audit branch | This branch | vs audit | vs `main` | Peak RSS `main` / this | Amplitudes vs audit |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| BoR PEC sphere ka = 10, 100 elements, tables, 1 worker | 16.92 s | 8.87 s | 6.91 s | 1.28x | 2.45x | 447 / 455 MB | bitwise |
+| BoR PEC sphere ka = 10, 100 elements, tables, 4 workers | 5.75 s | 4.76 s | 3.81 s | 1.25x | 1.51x | 414 / 416 MB | bitwise |
+| BoR PEC sphere ka = 30, 300 elements, streamed, 4 workers | 27.95 s | 23.53 s | 17.91 s | 1.31x | 1.56x | 1,450 / 716 MB | 1.8e-15 (tile shapes) |
+| BoR lossy dielectric sphere ka = 6, 80 elements, PMCHWT, 4 workers | 6.81 s | 6.09 s | 5.07 s | 1.20x | 1.34x | 368 / 369 MB | bitwise |
+| 2-D PEC rectangle 10 GHz, 181 angles, P1 2,270 unknowns | 7.73 s | 6.61 s | 6.38 s | 1.04x | 1.21x | 435 / 428 MB | bitwise |
+| 2-D PEC rectangle 10 GHz, certified hp (P2 1,140 + P3 1,710) | 4.65 s | 4.59 s | 4.41 s | 1.04x | 1.05x | 375 / 367 MB | bitwise |
+| 2-D dielectric rectangle 6 GHz, 2 x 2,362 unknowns | 15.23 s | 15.14 s | 13.60 s | 1.11x | 1.12x | 949 / 953 MB | bitwise |
+| 2-D coupon x16, 10 GHz, certified, P3 12,096 unknowns (section 6) | 270.9 s | 270.9 s | 157.5 s | 1.72x | 1.72x | 5,526 / 7,673 MB | LU instead of HODLR |
+
+Run-to-run variance of a case on this container is about 10 % (the ka = 10 one-worker sphere
+measured 8.33, 7.03 and 6.91 s in three runs of the same code), so ratios below about 1.1x
+are indicative only.
+
+0. **LU or HODLR per host** (`linalg/hierarchical.py`, `linalg/dense.py`, `bor/factor.py`,
+   `bor/solver.py`, `twod/solver.py`, `execution/policy.py`). The fixed 10,000-unknown switch
+   is replaced by a memory rule: a dense system is factored hierarchically by default only
+   when it has at least 4,096 unknowns (`HIERARCHICAL_MIN_UNKNOWNS`, now a floor) and its LU
+   route (matrix, LU copy and one batch of right-hand-side workspace, `lu_route_bytes`) does
+   not fit the admitted solve memory. The 2-D memory estimate applies the rule to the LU
+   plan's total against the solve limit and prices the factor it chose; the dense factor asks
+   at run time whether the LU copy still fits (`residual_spool.copy_fits`, the same question
+   that decided the disk spool); the BoR worker plan keeps LU with the largest worker count
+   that fits and prices the HODLR factor only when no LU count fits (`plan_bor_mode_workers`
+   returns `factor`, and the sweep hands coordinates to the modal factor only then).
+   `GHOST_HIERARCHICAL_MIN_UNKNOWNS` still replaces the rule with a fixed threshold in both
+   directions (0 keeps LU). On this host the switch now sits at 20,558 unknowns (13.6 GiB
+   admitted), so the coupon case of section 6 runs LU automatically: 157.5 s instead of
+   270.9 s, at 7.7 GB instead of 5.5 GB. The cost prior and the nearby-timing regime test use
+   the same switch size. Tests: the factor and pricing tests were rewritten for the plan
+   (`test_bor_hierarchical_modes`, `test_solver_compression`), with new tests of the rule.
+1. **Streamed far-tile budget 0.25 GB** (`BOR_STREAM_TILE_BUDGET_GB`). The ka = 30 streamed
+   sphere peaks at 716 MB instead of 1,456 MB, and every streamed admission is priced 0.75 GB
+   lower. Smaller tiles change the GEMM shapes of the band contractions, so the streamed
+   fields differ from the audit branch at 1.8e-15 relative; restoring the former budget on
+   this code reproduces the audit branch's fields to the bit, which attributes the
+   difference to the tile shapes alone. On this case the budget alone costs about 5 % of
+   wall time (20.4 s against 21.5 s with the former 1 GB on the same code), well within the
+   1.31x the branch gains overall.
+2. **Subset convergence check of the near rule** (`GHOST_BOR_NEAR_CHECK`, default `subset`,
+   `kernels.NEAR_CHECK_STRIDE`). The coarse level is evaluated for the extreme points of each
+   chunk of a layout group (every sixteenth point in order of d/a, the largest d/a, the
+   smallest and largest radius product; at least eight) and their agreement accepts the
+   chunk at the fine level, which is the value the full check stores for a point that
+   passes; a sampled failure returns the chunk to the point-by-point check, and `full`
+   restores it everywhere. Every suite case is bitwise the audit branch, as the calibration
+   predicted (no point fails at the first level). Documented in `NUMERICAL_METHODS.md`.
+3. **Batched near chunk contractions** (`_contract_near_chunks`): chunks of equal point count
+   are stacked and each term is one batched product, so a NumPy call serves tens of chunks;
+   the blocks are added in chunk order and are bitwise the per-chunk ones (new test in
+   `test_bor_performance_fixes`). Items 2 and 3 together: the operators stage of the
+   one-worker sphere fell from 6.5 to 5.0 s, of the four-worker sphere from 4.0 to 3.0 s.
+4. **Banded sampler output in group order**: implemented, measured and reverted. Timing the
+   pieces of a captured 8,000-pair tile of the ka = 30 sphere shows the native sampler at 19 ms
+   (Green's function) and 39 ms (brackets) of a 25 and 45 ms call, the projection GEMM at
+   1.2 to 1.5 ms, the coordinate gathers at 0.03 to 0.06 ms and each fancy-indexed write of
+   a chunk's rows at 0.4 ms. Writing group-ordered buffers and scattering them once adds a
+   slab copy per output and a second copy of the outputs for nothing, and the live-set model
+   had to grow to price the buffers (smaller tiles, 21.0 s on the ka = 30 case against
+   17.9 s without). Finding 5 of section 2 is therefore corrected: the glue of the far build
+   is not in `banded_modal_kernels`; what remains outside the samplers and GEMMs is the
+   band contraction's Python (`_efie_band`, `_bracket_band`) and the per-tile overhead, and
+   the sampler itself is 80 % of the sampling call.
+5. **Vectorized 2-D far-block table evaluation** (`twod/assembly/native/far.c`). The four
+   coefficients of one power (real and imaginary parts of both channels) are adjacent in the
+   table, so a point's four Horner chains form one 4-lane vector, and four source points run
+   interleaved so their dependent multiply-add chains overlap instead of serializing. Each
+   lane performs the scalar chain's operations in order without contraction, so the blocks
+   are bitwise the former ones (0 differing arrays on 24 captured tiles) at 1.93x the speed
+   (2.67 to 1.38 s over those tiles). AVX2 lanes are selected at run time where the processor
+   has them (`ghost_far_block_simd`, reported by `scripts/check_speed_paths.py`); the code
+   compiles with GCC and clang. The 2-D operators stage fell from 3.75 to 2.91 s (10 GHz
+   rectangle), 7.36 to 6.01 s (dielectric) and 35.3 to 29.9 s (coupon).
+6. **Opt-in fast-math kernels** (`build_kernel.py --fast-math`, `GHOST_BOR_FAST_MATH=1`). A
+   second library `bor_stream_kernel.<tag>.fast` is built with `-ffast-math` and loaded only
+   by processes that ask for it; the default stays strict and bitwise comparable. The loaded
+   variant is recorded in `near_preparation.native_kernel` and by `check_speed_paths.py`.
+   Measured on this branch: the one-worker ka = 10 sphere 7.03 to 6.24 s (1.13x), the
+   four-worker sphere 1.04x, the dielectric sphere 1.06x; the amplitudes differ from the
+   strict build by 2 to 3e-15 relative (the 6e-13 kernel-level differences average out),
+   but the builds are not bitwise comparable. The gain is smaller than the kernel's 2x
+   because items 2 and 3 already removed most of the near rule's share.
+
+The 2-D far kernel, the subset check, the batched contractions and the factor rule are the
+items worth merging on their own; the tile budget trades 5 % of streamed time for half the
+peak memory; the fast-math build is a per-site choice.
+
+Tests: thirty touched and neighbouring modules (`test_audit_fixes_bor_kernels`,
+`test_audit_fixes_bor_streaming`, `test_memory_safety`, `test_bor_capability_acceptance`,
+`test_bor_compute_reuse`, `test_bor_material_compute_reuse`, `test_september_round12_bor_grading`,
+`test_october_bor_accuracy`, `test_bor_hierarchical_modes`, `test_solver_compression`,
+`test_native_far_widths`, `test_backend_safety`, `test_native_distribution`,
+`test_bor_performance_fixes`, `test_stage_cost_model`, `test_nearby_timing_history`,
+`test_performance_updates`, `test_bor_execution`, `test_september_audit_regressions`,
+`test_assembly_equivalence`, `test_twod_remaining_performance`, `test_twod_audit_performance`,
+`test_assembly_performance_fixes`, `test_bor_memory_planning`, `test_bor_tile_cache`,
+`test_bor_compressed_far`, `test_hpc_bor_resource_binding`, `test_solver_efficiency`,
+`test_efficient_defaults`, `test_automatic_backend`): 359 passed, 1 skipped, 8 failed, 272
+subtests passed. Six failures are the host-dependent ones of section 3 (BLAS thread shares in
+`test_bor_performance_fixes`, memory-gate messages in `test_memory_safety`); the other two,
+`test_performance_updates::BorSamplingTests::test_workers_follow_cpu_and_memory_reservations_and_restore`
+(it expects 15 workers) and the degree-1 subtest of
+`test_twod_remaining_performance::NearStorageTests::test_forced_small_near_batches_and_disk_preserve_fused_coefficients`
+(a 3e-16 rounding mismatch), fail identically on `main` 042e6e3 and on the audit branch on this
+host. New tests cover the factor rule and the worker plan, the subset check, the batched
+contraction against the per-chunk one, pair-order invariance of the banded sampler, the
+fast-math build option and loader, and the presence of the vectorized far kernel.
+
+Files: `linalg/hierarchical.py`, `linalg/dense.py`, `bor/factor.py`, `bor/solver.py`,
+`bor/kernels.py`, `bor/streaming.py`, `bor/native/build_kernel.py`, `execution/policy.py`,
+`twod/solver.py`, `twod/assembly/native/far.c`, `far.py`, `build.py`, `scripts/check_speed_paths.py`,
+`BOR_PERFORMANCE.md` ("October 5 efficiency changes"), `NUMERICAL_METHODS.md`, and the tests
+named above. The Linux libraries are rebuilt locally and ignored by git as before; the Windows
+libraries (`ghost_far.dll`, `ghost_table.dll`, `bor_stream_kernel.windows-amd64.dll`) are not
+rebuilt in this checkout, and `ghost_far.dll` predates `ghost_far_block_simd`, so the release
+build (which compiles from source and load-checks that export) or `build.py` must rebuild it
+on Windows before the vectorized kernel reaches those hosts.

@@ -25,21 +25,91 @@ def factor_mode():
     return value
 
 
-# From this many unknowns a dense double-precision system ('dense' and 'auto')
-# is factored hierarchically, falling back to LU if the factor is rejected:
-# the randomized build tied LU at 9,082 unknowns of the certified airfoil
-# (4.2 against 4.7 s with three batches of 256 right-hand sides) and ran
-# 1.7 times faster at 13,618 (8.0 against 13.7 s), with a factor of 182 MB
-# against a 2,967 MB LU.  GHOST_HIERARCHICAL_MIN_UNKNOWNS overrides it
-# (0 keeps LU).
-HIERARCHICAL_MIN_UNKNOWNS = 10000
+# Below this many unknowns a dense double-precision system is never factored
+# hierarchically by default: the randomized build does not pay for itself there
+# and the memory it saves is small.  Above it the default is decided per host
+# by the memory rule of automatic_hierarchical; GHOST_HIERARCHICAL_MIN_UNKNOWNS
+# replaces both with a fixed threshold (0 keeps LU).
+#
+# The former fixed switch at 10,000 unknowns came from an 8-core workstation,
+# where the randomized build tied LU at 9,082 unknowns of the certified airfoil
+# (4.2 against 4.7 s with three batches of 256 right-hand sides) and ran 1.7
+# times faster at 13,618 (8.0 against 13.7 s, a factor of 182 MB against a
+# 2,967 MB LU).  On a 4-core host the same switch made the 12,096-unknown
+# systems of a certified 10 GHz solve 1.6 times slower end to end (271 against
+# 167 s) to save 2.2 GB: the HODLR work (index gathers, narrow sampling
+# products, Python recursion, exact-matrix residual products in every solve
+# batch) scales with memory bandwidth and interpreter speed, LU with the BLAS
+# rate, so no unknown count separates them on every host.
+HIERARCHICAL_MIN_UNKNOWNS = 4096
 
 
-def automatic_hierarchical(n):
-    """Whether a dense system of order ``n`` is factored hierarchically by default."""
+def hierarchical_threshold():
+    """The fixed threshold of GHOST_HIERARCHICAL_MIN_UNKNOWNS, or None when unset."""
     raw = os.environ.get('GHOST_HIERARCHICAL_MIN_UNKNOWNS', '').strip()
-    threshold = int(raw) if raw else HIERARCHICAL_MIN_UNKNOWNS
-    return threshold > 0 and int(n) >= threshold
+    return int(raw) if raw else None
+
+
+# Right-hand-side columns of one batch priced in the LU route.
+LU_ROUTE_RHS_COLUMNS = 256
+
+
+def lu_route_bytes(n, rhs_columns=LU_ROUTE_RHS_COLUMNS):
+    """Memory of the LU route of one dense system: the matrix, its LU copy and the
+    right-hand-side and refinement workspace of one batch."""
+    n = int(n)
+    return 2*16*n*n + 16*12*n*int(rhs_columns) + 64*1024**2
+
+
+def admitted_solve_bytes():
+    """The solve's admitted memory in bytes (the shared solve limit), 0 when unknown."""
+    from ghost_backend.twod.solver import _solve_memory_limit_gb
+    try:
+        return max(0., float(_solve_memory_limit_gb()))*1024**3
+    except (OSError, ValueError, RuntimeError):
+        return 0.
+
+
+def automatic_hierarchical(n, lu_fits=None):
+    """Whether a dense system of order ``n`` is factored hierarchically by default.
+
+    With GHOST_HIERARCHICAL_MIN_UNKNOWNS set, systems of at least that many
+    unknowns are (0 keeps LU).  Otherwise the decision is made per host from
+    memory: the checked HODLR inverse replaces LU only for a system of at
+    least HIERARCHICAL_MIN_UNKNOWNS unknowns whose LU route does not fit the
+    admitted solve memory (``lu_fits``; by default ``lu_route_bytes(n)``
+    against the solve limit, an unknown limit counting as fitting).  LU is the
+    faster factor on the hosts measured so far up to at least 12,000 unknowns;
+    the hierarchical factor keeps the matrix and a factor of a fraction of it
+    instead of two matrices, which is the case it is for.
+    """
+    threshold = hierarchical_threshold()
+    n = int(n)
+    if threshold is not None:
+        return threshold > 0 and n >= threshold
+    if n < HIERARCHICAL_MIN_UNKNOWNS:
+        return False
+    if lu_fits is None:
+        budget = admitted_solve_bytes()
+        lu_fits = budget <= 0 or lu_route_bytes(n) <= budget
+    return not bool(lu_fits)
+
+
+def hierarchical_switch_size():
+    """The smallest order factored hierarchically by default: the fixed threshold,
+    or the order whose LU route reaches the admitted memory; None when LU is kept
+    (threshold 0, or an unknown limit)."""
+    import math
+    threshold = hierarchical_threshold()
+    if threshold is not None:
+        return threshold if threshold > 0 else None
+    budget = admitted_solve_bytes()
+    if budget <= 0:
+        return None
+    # lu_route_bytes(n) = budget: 32 n^2 + 192 columns n + 64 MiB.
+    a, b, c = 32., 16.*12*LU_ROUTE_RHS_COLUMNS, 64*1024**2 - budget
+    n = (-b + math.sqrt(b*b - 4*a*c))/(2*a) if c < 0 else 0.
+    return max(HIERARCHICAL_MIN_UNKNOWNS, int(math.floor(n)) + 1)
 
 
 def factor_storage_budget(matrix_bytes):

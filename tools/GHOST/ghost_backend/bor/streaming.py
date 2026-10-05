@@ -576,12 +576,28 @@ def _load_library(path):
     return ctypes.CDLL(path)
 
 
+def fast_math_requested() -> 'bool':
+    """``GHOST_BOR_FAST_MATH`` is 1/on/true/yes: prefer the opt-in ``-ffast-math``
+    build of the native library (``build_kernel.py --fast-math``), whose kernels
+    are about twice as fast but not bitwise comparable with the strict build."""
+    return os.environ.get("GHOST_BOR_FAST_MATH", "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def _native_library_bases(sysname: 'str', machine: 'str') -> 'list[str]':
+    """Library basenames tried in order: the fast-math build only when requested,
+    then the strict platform-tagged and untagged builds."""
+    bases = [f"bor_stream_kernel.{sysname}-{machine}", "bor_stream_kernel"]
+    if fast_math_requested():
+        bases.insert(0, f"bor_stream_kernel.{sysname}-{machine}.fast")
+    return bases
+
+
 def _load_native():
     _prepare_windows_dll_search()
     sysname = platform.system().lower()
     machine = platform.machine().lower()
     here = str(native_kernel_root())
-    for base in (f"bor_stream_kernel.{sysname}-{machine}", "bor_stream_kernel"):
+    for base in _native_library_bases(sysname, machine):
         for extension in _native_extensions(sysname):
             path = os.path.join(here, base + extension)
             if not os.path.exists(path):
@@ -595,6 +611,7 @@ def _load_native():
                 for symbol in ("sample_g", "sample_mfie", "sample_ibc")
             ):
                 continue
+            lib._ghost_native_variant = "fast-math" if base.endswith(".fast") else "strict"
             dp = ctypes.POINTER(ctypes.c_double)
             ci = ctypes.c_int
             cd = ctypes.c_double
@@ -630,6 +647,14 @@ def _load_native():
 
 _NATIVE = _load_native()
 _FALLBACK_NOTICE_SHOWN = False
+
+
+def native_kernel_variant() -> 'Optional[str]':
+    """``'fast-math'`` when the opt-in ``-ffast-math`` build is loaded, ``'strict'``
+    for the default build, None without a native library."""
+    if _NATIVE is None:
+        return None
+    return getattr(_NATIVE, "_ghost_native_variant", "strict")
 
 
 def sampling_backend_name(stream=None) -> 'str':
@@ -680,7 +705,16 @@ def _dp(a: 'np.ndarray'):
 from ghost_backend.bor.kernels import n_xi_for_pairs
 
 
-BOR_STREAM_TILE_BUDGET_GB = 1.0
+# Scratch of the concurrent far-block tiles of one streamed build, priced in
+# every streamed plan as ``held blocks + BOR_STREAM_TILE_BUDGET_GB``.  Each
+# concurrent tile is sized to its share (:func:`_plan_banded_tiles`), so the
+# budget bounds the live tiles whatever the thread count.  Lowered from 1.0 GB
+# on 5 October 2026: a tile of a few megabytes of samples already saturates
+# the projection GEMMs, and on the ka = 30 streamed sphere (300 elements, four
+# tile threads) the solve took 28.3 s instead of 27.7 s (+2.5 %) while its
+# process peak fell from 1,432 to 764 MB (-47 %); the planner also stops
+# pricing a gigabyte of scratch into every streamed admission.
+BOR_STREAM_TILE_BUDGET_GB = 0.25
 
 
 BOR_STREAM_TILE_BYTES_PER_SAMPLE = 256.0

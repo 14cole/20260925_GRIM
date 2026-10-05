@@ -15,6 +15,19 @@ from scipy.special import roots_legendre
 NEAR_KERNEL_WORK_BYTES = 64_000_000
 NEAR_ANGULAR_MAX_ORDER = 4096
 NEAR_ANGULAR_RTOL = 2.0e-8
+# Convergence check of the graded near rule (_refine_near_chunk).  'subset',
+# the default, evaluates the coarse level only for the extreme points of each
+# chunk of a layout group: every NEAR_CHECK_STRIDE-th point in order of d/a,
+# the largest d/a and the smallest and largest radius product (at least
+# NEAR_CHECK_MIN_POINTS).  When all of them agree with the fine level to
+# NEAR_ANGULAR_RTOL, every point of the chunk is accepted at the fine level;
+# otherwise the chunk is checked point by point, as 'full' always does.  The
+# 24 September calibration found no point failing at the first level (coarse
+# errors <= 4e-11, fine <= 3e-13 of the largest kernel value) while the coarse
+# level was 40 % of the native kernel work.  GHOST_BOR_NEAR_CHECK=full keeps
+# the per-point check.
+NEAR_CHECK_MIN_POINTS = 8
+NEAR_CHECK_STRIDE = 16
 
 C0 = 299_792_458.0
 ETA0 = 376.730313668
@@ -1744,7 +1757,11 @@ def _graded_near_kernels(kind, args, k, m_max, order_floor=0, tail_floor=0, sign
     each point's result depends on its own coordinates only.  Every group is
     evaluated at a coarse and a fine level (orders x NEAR_LEVEL_GROWTH); a
     point is accepted when the two agree to NEAR_ANGULAR_RTOL of its largest
-    kernel value.  Pending points go on to the next level.  A level is only
+    kernel value.  Under the default 'subset' check policy the coarse level
+    is evaluated for the extreme points of each chunk only (NEAR_CHECK_STRIDE)
+    and their agreement accepts the chunk; a disagreement, or
+    GHOST_BOR_NEAR_CHECK=full, checks every point.  Pending points go on to
+    the next level.  A level is only
     compared when EVERY piece's order increased under NEAR_ANGULAR_MAX_ORDER
     (a capped piece would be shared by both results and its error cancel out
     of the check); when no valid level remains the bracket points restart
@@ -1815,6 +1832,27 @@ def _graded_near_kernels(kind, args, k, m_max, order_floor=0, tail_floor=0, sign
     return tuple(_parity_outputs(out[0], out[1], m))
 
 
+def near_check_policy():
+    """``'subset'`` or ``'full'`` (``GHOST_BOR_NEAR_CHECK``; see NEAR_CHECK_STRIDE)."""
+    value = os.environ.get('GHOST_BOR_NEAR_CHECK', '').strip().lower() or 'subset'
+    if value not in ('subset', 'full'):
+        raise ValueError("GHOST_BOR_NEAR_CHECK must be 'subset' or 'full'.")
+    return value
+
+
+def _near_check_subset(delta, radius):
+    """Positions of the points of one chunk whose coarse level the 'subset'
+    policy evaluates (see NEAR_CHECK_STRIDE), or None when that is every point."""
+    n = len(delta)
+    if n <= NEAR_CHECK_MIN_POINTS:
+        return None
+    order = np.argsort(delta, kind='stable')
+    stride = max(1, min(NEAR_CHECK_STRIDE, n // NEAR_CHECK_MIN_POINTS))
+    picks = np.unique(np.concatenate([order[::stride], order[-1:],
+                                      [int(np.argmin(radius)), int(np.argmax(radius))]]))
+    return None if len(picks) >= n else picks
+
+
 def _near_check(kind, fine, coarse):
     """Per point (largest |fine - coarse|, largest |fine|) over every kernel
     and order: the magnitudes of the complex values the outputs are made of
@@ -1860,24 +1898,51 @@ def _run_near_group(kind, arrays, k, count, members, layout, base_orders, stable
         grown = np.minimum(NEAR_ANGULAR_MAX_ORDER, np.ceil(orders * growth).astype(np.int64))
         return grown if np.all(grown > orders) else None
 
+    subset_policy = near_check_policy() == 'subset'
+    rp, rq = arrays[0], arrays[2 if kind == 'g' else 4]
+
+    def check_subset(ids):
+        if not subset_policy:
+            return None
+        return _near_check_subset(delta[ids], np.sqrt(np.maximum(4.0 * rp[ids] * rq[ids], 0.0)))
+
     # The coarse and fine moments of a chunk ([n, 2 or 8, count] each) stay
     # within the scratch budget as well.
     chunk = max(1, int(NEAR_KERNEL_WORK_BYTES // (2 * 8 * (8 if bracket else 2) * count)))
     for start in range(0, len(members), chunk):
         _refine_near_chunk(kind, arrays, np.asarray(members[start:start + chunk]), stable,
-                           base_orders, evaluate, next_orders, out)
+                           base_orders, evaluate, next_orders, out, check_subset)
 
 
-def _refine_near_chunk(kind, arrays, ids, stable, base_orders, evaluate, next_orders, out):
-    """Coarse/fine levels of one chunk of a layout group (_run_near_group)."""
+def _refine_near_chunk(kind, arrays, ids, stable, base_orders, evaluate, next_orders, out,
+                       check_subset=None):
+    """Coarse/fine levels of one chunk of a layout group (_run_near_group).
+
+    ``check_subset(ids)`` names the points whose coarse level stands for the
+    chunk under the 'subset' policy (NEAR_CHECK_STRIDE); None checks them all.
+    """
     bracket = kind != 'g'
     use_stable = stable
     coarse_orders = np.asarray(base_orders, dtype=np.int64)
     fine_orders = next_orders(coarse_orders)
     if fine_orders is None:
         raise ValueError("BoR near angular quadrature exceeds its accuracy limit; refine the mesh or reduce modal bandwidth.")
-    coarse = evaluate(ids, coarse_orders, use_stable)
     fine = evaluate(ids, fine_orders, use_stable)
+    subset = None if check_subset is None else check_subset(ids)
+    if subset is not None:
+        sampled = (fine[0][subset], fine[1][subset]) if bracket else fine[subset]
+        error, scale = _near_check(kind, sampled, evaluate(ids[subset], coarse_orders, use_stable))
+        if np.all(np.isfinite(error) & (error <= NEAR_ANGULAR_RTOL * np.maximum(scale, 1e-280))):
+            # Every sampled extreme point agrees with its coarse level: the
+            # whole chunk is accepted at the fine level (the values the full
+            # check would store for points that pass).
+            if bracket:
+                out[0][ids] = fine[0]
+                out[1][ids] = fine[1]
+            else:
+                out[ids] = 2.0 * (fine[:, 0] + 1j * fine[:, 1])
+            return
+    coarse = evaluate(ids, coarse_orders, use_stable)
     while True:
         error, scale = _near_check(kind, fine, coarse)
         converged = np.isfinite(error) & (error <= NEAR_ANGULAR_RTOL * np.maximum(scale, 1e-280))

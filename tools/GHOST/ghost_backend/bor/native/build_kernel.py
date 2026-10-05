@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Build and load-check the optional native BoR streaming sampler."""
+"""Build and load-check the optional native BoR streaming sampler.
+
+The default build is strict IEEE arithmetic (-O3 without -ffast-math), so its
+results are bitwise comparable between machines and builds.  ``--fast-math``
+builds a second, separately named library (``bor_stream_kernel.<tag>.fast``)
+with ``-ffast-math``: the near angular rules run about twice as fast and the
+kernels differ from the strict build by up to about 1e-12 relative (the
+angular convergence check accepts 2e-8), but results are then not bitwise
+comparable with a strict build or another host.  A site opts in per process
+with ``GHOST_BOR_FAST_MATH=1``; without that setting the strict library is
+loaded even when the fast one is present.
+"""
 
 import argparse
 import ctypes
@@ -35,6 +46,31 @@ _LOAD_CHECK = (
     "    sys.stderr.write('missing exports: ' + ', '.join(missing) + '\\n')\n"
     "    sys.exit(3)\n"
 )
+
+
+def output_name(tag: 'str', extension: 'str', fast_math: 'bool' = False) -> 'str':
+    """``bor_stream_kernel.<tag><extension>``, or the ``.fast`` variant of ``--fast-math``."""
+    return f"bor_stream_kernel.{tag}{'.fast' if fast_math else ''}{extension}"
+
+
+def compile_command(compiler: 'str', source, output, system_name: 'str',
+                    openmp: 'bool' = True, fast_math: 'bool' = False) -> 'list[str]':
+    """The compiler command of one build (strict by default; see the module notes)."""
+    command = [compiler]
+    if openmp:
+        command.append("-fopenmp")
+    command.extend(["-O3", "-std=c99", "-shared"])
+    if fast_math:
+        command.append("-ffast-math")
+    if system_name == "windows":
+        # A release must load in a fresh Python process without the compiler's
+        # bin directory. Link GCC/OpenMP/pthread runtime archives into the DLL;
+        # Windows system libraries remain normal system dependencies.
+        command.extend(["-static", "-static-libgcc", "-Wl,--no-insert-timestamp"])
+    else:
+        command.append("-fPIC")
+    command.extend(["-o", str(output), str(source), "-lm"])
+    return command
 
 
 def _find_compiler(requested: 'str | None') -> 'str | None':
@@ -102,6 +138,16 @@ def main() -> int:
         action="store_true",
         help="Build the native sampler without OpenMP parallel loops.",
     )
+    parser.add_argument(
+        "--fast-math",
+        action="store_true",
+        help=(
+            "Build the opt-in -ffast-math variant bor_stream_kernel.<tag>.fast instead of "
+            "the strict library: about twice the near-rule speed, kernels within about 1e-12 "
+            "relative of the strict build, results not bitwise comparable between builds. "
+            "GHOST_BOR_FAST_MATH=1 selects it at load time."
+        ),
+    )
     args = parser.parse_args()
 
     compiler = _find_compiler(args.compiler)
@@ -116,20 +162,14 @@ def main() -> int:
     output_extension = ".dll" if system_name == "windows" else ".so"
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"bor_stream_kernel.{tag}{output_extension}"
+    output = output_dir / output_name(tag, output_extension, args.fast_math)
     temporary = output.with_name(f".{output.name}.tmp.{os.getpid()}")
-    command = [compiler, "-O3", "-std=c99", "-shared"]
-    if system_name == "windows":
-        # A release must load in a fresh Python process without the compiler's
-        # bin directory. Link GCC/OpenMP/pthread runtime archives into the DLL;
-        # Windows system libraries remain normal system dependencies.
-        command.extend(["-static", "-static-libgcc", "-Wl,--no-insert-timestamp"])
-    else:
-        command.append("-fPIC")
-    command.extend(["-o", str(temporary), str(source), "-lm"])
+    command = compile_command(compiler, source, temporary, system_name,
+                              openmp=False, fast_math=args.fast_math)
     commands = [command]
     if not args.no_openmp:
-        commands.insert(0, command[:1] + ["-fopenmp"] + command[1:])
+        commands.insert(0, compile_command(compiler, source, temporary, system_name,
+                                           openmp=True, fast_math=args.fast_math))
     compiler_environment = _compiler_environment(compiler, system_name)
     try:
         completed = None
@@ -194,6 +234,9 @@ def main() -> int:
         "OpenMP sampling: "
         + ("enabled" if "-fopenmp" in command else "unavailable/disabled")
     )
+    if args.fast_math:
+        print("Fast-math variant: loaded only by processes with GHOST_BOR_FAST_MATH=1; "
+              "its results are not bitwise comparable with the strict build.")
     print("Re-run Python workers so they load the native kernel.")
     return 0
 

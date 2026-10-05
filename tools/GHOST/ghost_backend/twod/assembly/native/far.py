@@ -170,6 +170,23 @@ def scatter_columns(matrix, rows, columns, row_map, column_map, values):
 
 
 @lru_cache(None)
+def simd_level():
+    """How the loaded library evaluates the kernel table: 2 with 256-bit AVX2
+    lanes, 1 with the generic vector code (both interleave four source points),
+    0 for a library built before the vectorized evaluation, None without one."""
+    dll = _dll()
+    if dll is None:
+        return None
+    try:
+        fun = dll.ghost_far_block_simd
+    except AttributeError:
+        return 0
+    fun.restype = ct.c_int
+    fun.argtypes = []
+    return int(fun())
+
+
+@lru_cache(None)
 def library():
     try:
         fun = _dll().ghost_far_block

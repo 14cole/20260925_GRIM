@@ -1519,18 +1519,8 @@ def _estimate_memory_gb(
         return plan['peak_bytes']/1024**3
 
     from ghost_backend.twod.assembly.kernels import PROJECTION_CACHE_BYTES
-    solve = 2*matrix + 16*12*d*batch + 64*1024**2 + PROJECTION_CACHE_BYTES
-    from ghost_backend.linalg.hierarchical import automatic_hierarchical
-    # A large dense system is factored hierarchically by default: priced as the
-    # matrix and a factor within its storage budget (an LU fallback that finds
-    # no room for its copy spools the original, as any unforeseen shortage does).
-    hierarchical_default = (factorization in ('dense', 'auto') and not gpu
-                            and requested_precision() == 'double' and automatic_hierarchical(d))
-    if factorization == 'hierarchical' or hierarchical_default:
-
-
-        from ghost_backend.linalg.hierarchical import factor_storage_budget
-        solve = matrix + factor_storage_budget(matrix) + 16*12*d*max(256,batch) + 64*1024**2 + PROJECTION_CACHE_BYTES
+    # The LU route: the matrix, its LU copy and the right-hand-side workspace.
+    lu_solve = 2*matrix + 16*12*d*batch + 64*1024**2 + PROJECTION_CACHE_BYTES
     workspace = (64 + 128*get_assembly_threads()) * 1024**2 + 16*512*n
     if kind == 'multi_region' and 'operator_entries' in resources:
         assembly = matrix + 16*resources.get('assembly_operator_entries', resources['operator_entries']) + resources['operator_map_bytes']
@@ -1547,8 +1537,23 @@ def _estimate_memory_gb(
     extra += resources.get('moment_cache_bytes', MOMENT_CACHE_BYTES if resources.get('basis_width', 2) > 2 else 0)
     from ghost_backend.compressed.worker_pool import retained_bytes as retained_worker_bytes
     from ghost_backend.compressed.recycling import capacity_bytes as recycling_capacity_bytes
-    return (max(assembly, solve) + extra + count*4096 + retained_worker_bytes()
-            + recycling_capacity_bytes()) / 1024**3
+    fixed = extra + count*4096 + retained_worker_bytes() + recycling_capacity_bytes()
+
+    def total(solve):
+        return (max(assembly, solve) + fixed) / 1024**3
+    from ghost_backend.linalg.hierarchical import automatic_hierarchical, factor_storage_budget
+    # A large dense system whose LU route does not fit the admitted memory is
+    # factored hierarchically by default (GHOST_HIERARCHICAL_MIN_UNKNOWNS
+    # replaces that rule) and priced as the matrix and a factor within its
+    # storage budget; an LU fallback that finds no room for its copy spools
+    # the original, as any unforeseen shortage does.
+    hierarchical_default = (factorization in ('dense', 'auto') and not gpu
+                            and requested_precision() == 'double'
+                            and automatic_hierarchical(d, lu_fits=total(lu_solve) <= _solve_memory_limit_gb()))
+    if factorization == 'hierarchical' or hierarchical_default:
+        return total(matrix + factor_storage_budget(matrix) + 16*12*d*max(256,batch) + 64*1024**2
+                     + PROJECTION_CACHE_BYTES)
+    return total(lu_solve)
 
 
 def _solve_te_robin_mfie(mesh, infos, pol, k0, elevations_deg, obs_order=8, src_order=8,

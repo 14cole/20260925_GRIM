@@ -319,11 +319,11 @@ def estimate_bor_dense_peak_gb(
     ``mode_tasks`` is the number of independent absolute-mode tasks that can
     actually be scheduled (normally ``m_max + 1``).  Capping the requested
     worker count by it accounts for real concurrency without charging for
-    idle executor threads.  ``hierarchical`` tells that the sweep gives its
-    mode factors coordinates, so a large enough system is priced as a
-    hierarchical factor (:data:`BOR_HIERARCHICAL_MATRIX_EQUIVALENTS`), and
-    ``mirrored`` that every mode is factored as mirror halves (the same
-    price: the system, its two half systems and their assembly workspace).
+    idle executor threads.  ``hierarchical`` prices every mode as the
+    hierarchical factor (:data:`BOR_HIERARCHICAL_MATRIX_EQUIVALENTS`; the
+    plan of :func:`plan_bor_mode_workers` chooses it per host), and
+    ``mirrored`` as mirror halves (the same price: the system, its two half
+    systems and their assembly workspace).
     """
 
     try:
@@ -372,9 +372,8 @@ def estimate_bor_dense_peak_gb(
                    payload + rhs_workspace)
         return (active_workers * peak + options['tile_cache_mib'] * 1024**2 + field_bytes) / 1.e9
 
-    from ghost_backend.linalg.hierarchical import automatic_hierarchical
     equivalents = (BOR_HIERARCHICAL_MATRIX_EQUIVALENTS
-                   if mirrored or hierarchical and automatic_hierarchical(dofs)
+                   if mirrored or hierarchical
                    else BOR_DENSE_MATRIX_EQUIVALENTS)
     matrix_bytes = (
         equivalents
@@ -579,27 +578,51 @@ def plan_bor_mode_workers(n_dofs, n_rhs, workers, mode_tasks, assembly_peak_gb,
     including near-integration scratch, linear-system workspaces and safety
     margins. If one worker still cannot fit, return that honest minimum so the
     normal guard rejects before preparation.
+
+    ``hierarchical`` tells that the sweep can factor its modes hierarchically
+    (it has coordinates); the plan then chooses the factor per host, returned
+    as ``factor``: LU with the largest worker count that fits, and the checked
+    HODLR inverse (two matrix equivalents per worker instead of three) only
+    when no LU count fits, or when GHOST_HIERARCHICAL_MIN_UNKNOWNS asks for it
+    (:func:`linalg.hierarchical.automatic_hierarchical`).  ``mirrored`` prices
+    every mode as mirror halves (``factor`` 'mirror').
     """
     from ghost_backend.execution.options import allocated_cpu_budget
+    from ghost_backend.linalg.hierarchical import (HIERARCHICAL_MIN_UNKNOWNS, automatic_hierarchical,
+                                                    hierarchical_threshold)
     requested = max(1, int(workers))
     cpu_budget = allocated_cpu_budget()
     limit = _solve_memory_limit_gb() if memory_limit_gb is None else float(memory_limit_gb)
-    for count in range(min(requested, cpu_budget, max(1, int(mode_tasks))), 0, -1):
-        linear_peak = estimate_bor_dense_peak_gb(n_dofs, n_rhs, count, mode_tasks,
-                                                 **_factor_pricing(hierarchical, mirrored))
-        near = plan_near_preparation(requested, assembly_peak_gb, linear_peak, limit,
-                                     near_pairs=near_pairs, mode_tasks=mode_tasks)
-        # The preparation phase (retained operators plus near scratch) and the
-        # mode phase (retained operators plus linear workspaces) are
-        # sequential: the peak is the larger of the two, as the gate prices it.
-        peak = max(estimate_bor_total_peak_gb(assembly_peak_gb + near['scratch_gb'], 0.0),
-                   estimate_bor_total_peak_gb(assembly_peak_gb, linear_peak))
-        if peak <= limit:
+    if mirrored:
+        routes = ['mirror']
+    elif not hierarchical:
+        routes = ['lu']
+    elif hierarchical_threshold() is not None:
+        routes = ['hodlr'] if automatic_hierarchical(n_dofs) else ['lu']
+    else:
+        routes = ['lu', 'hodlr'] if int(n_dofs) >= HIERARCHICAL_MIN_UNKNOWNS else ['lu']
+    counts = range(min(requested, cpu_budget, max(1, int(mode_tasks))), 0, -1)
+    fits = False
+    for factor in routes:
+        for count in counts:
+            linear_peak = estimate_bor_dense_peak_gb(n_dofs, n_rhs, count, mode_tasks,
+                                                     **_factor_pricing(factor == 'hodlr', factor == 'mirror'))
+            near = plan_near_preparation(requested, assembly_peak_gb, linear_peak, limit,
+                                         near_pairs=near_pairs, mode_tasks=mode_tasks)
+            # The preparation phase (retained operators plus near scratch) and the
+            # mode phase (retained operators plus linear workspaces) are
+            # sequential: the peak is the larger of the two, as the gate prices it.
+            peak = max(estimate_bor_total_peak_gb(assembly_peak_gb + near['scratch_gb'], 0.0),
+                       estimate_bor_total_peak_gb(assembly_peak_gb, linear_peak))
+            fits = peak <= limit
+            if fits:
+                break
+        if fits:
             break
     return dict(requested_workers=requested, workers=count, cpu_budget=cpu_budget,
-                near_preparation=near,
+                near_preparation=near, factor=factor,
                 linear_peak_gb=linear_peak, estimated_peak_gb=peak,
-                memory_limit_gb=limit, fits_memory=peak <= limit)
+                memory_limit_gb=limit, fits_memory=fits)
 
 
 def _map_near_pairs(function: 'Callable', pairs, workers: 'int') -> 'List':
@@ -2827,8 +2850,11 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
     Shared adaptive azimuthal-mode loop for every BoR formulation.
 
     ``coordinates(m)``, when given, returns the meridian position of every
-    reduced unknown of mode ``m``: large mode systems are then factored
-    hierarchically (:class:`bor.factor.ModalFactor`) and priced as such.
+    reduced unknown of mode ``m``: the mode systems can then be factored
+    hierarchically (:class:`bor.factor.ModalFactor`), which the worker plan
+    chooses per host when their LU route does not fit the admitted memory
+    (:func:`plan_bor_mode_workers`), or GHOST_HIERARCHICAL_MIN_UNKNOWNS asks
+    for it; with ``hierarchical_pricing`` the plan prices that factor.
     ``mirror(m)``, for a body symmetric about a plane normal to its axis,
     returns the ``(target, sign)`` mirror map of those unknowns: every mode is
     then factored as its even and odd halves (:class:`bor.factor.MirrorSplit`).
@@ -2881,6 +2907,14 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
         mirrored=mirror is not None)
     workers = worker_plan['workers']
     near_plan = worker_plan['near_preparation']
+    if coordinates is not None and mirror is None:
+        # The factor of every mode on this host: the plan's choice when it
+        # priced the hierarchical factor, otherwise (conservative LU pricing)
+        # the default rule of linalg.hierarchical.  Coordinates are passed on
+        # only for a hierarchical factor.
+        from ghost_backend.linalg.hierarchical import automatic_hierarchical
+        if not (worker_plan['factor'] == 'hodlr' if hierarchical_pricing else automatic_hierarchical(n_dofs)):
+            coordinates = None
     _guard_bor_dense_memory(
         n_dofs,
         n_rhs,
@@ -2890,7 +2924,7 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
         context=memory_context,
         streaming=stream_mode_block is not None,
         preparation_peak_gb=assembly_peak_gb + near_plan['scratch_gb'],
-        hierarchical=coordinates is not None and hierarchical_pricing,
+        hierarchical=worker_plan['factor'] == 'hodlr',
         mirrored=mirror is not None,
     )
     if prepare is not None:
@@ -2899,6 +2933,8 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
             prepare(m_max)
         near_plan['backend'] = 'processes' if process_state['executor'] is not None else 'threads'
         near_plan['process_pair_jobs'] = process_state['jobs']
+        from ghost_backend.bor.streaming import native_kernel_variant
+        near_plan['native_kernel'] = native_kernel_variant()
         if process_state['executor'] is not None and not near_plan['process_overhead_bytes_per_worker']:
             # The workload was unknown when planning; record what actually ran.
             # process_workers was sized against the same limit, so it fits.
@@ -4654,25 +4690,34 @@ def _near_point_chunks(gp, e, gq, f, points, nm):
 NEAR_BATCH_KERNEL_BYTES = 64_000_000
 
 
-def _near_chunk_kernels(chunks, k, m_max, kinds, signed=True):
-    """Kernel values per chunk and kind: one graded-rule call per kind for all chunks."""
+def _near_block_kernels(chunks, k, m_max, kinds, signed=True):
+    """Kernel values of the points of every chunk, concatenated: one graded-rule
+    call per kind for all chunks.  Returns ``(kernels, edges)``: ``kernels['efie']``
+    is ``G[points, m_max + 2]``, a bracket kind a tuple of four ``[points, modes]``
+    arrays, and chunk ``c`` owns the rows ``edges[c]:edges[c + 1]``."""
     sizes = [len(chunk[12]) for chunk in chunks]
     edges = np.cumsum([0] + sizes)
     columns = {name: np.concatenate([np.broadcast_to(chunk[index], (size,))
                                      for chunk, size in zip(chunks, sizes)])
                for index, name in enumerate(('rp', 'zp', 'trp', 'tzp', 'rq', 'zq', 'trq', 'tzq'))}
-    values = []
+    kernels = {}
     for kind in kinds:
         if kind == 'efie':
-            G = modal_kernels_near(columns['rp'], columns['zp'], columns['rq'], columns['zq'], k, m_max)
-            values.append([G[a:b] for a, b in zip(edges[:-1], edges[1:])])
+            kernels[kind] = modal_kernels_near(columns['rp'], columns['zp'], columns['rq'], columns['zq'], k, m_max)
             continue
         kernel = mfie_kernels_near if kind == 'mfie' else ibc_kernels_near
-        brackets = kernel(columns['rp'], columns['zp'], columns['trp'], columns['tzp'],
-                          columns['rq'], columns['zq'], columns['trq'], columns['tzq'], k, m_max,
-                          signed=signed)
-        values.append([tuple(value[a:b] for value in brackets) for a, b in zip(edges[:-1], edges[1:])])
-    return [dict(zip(kinds, per_chunk)) for per_chunk in zip(*values)]
+        kernels[kind] = tuple(kernel(columns['rp'], columns['zp'], columns['trp'], columns['tzp'],
+                                     columns['rq'], columns['zq'], columns['trq'], columns['tzq'], k, m_max,
+                                     signed=signed))
+    return kernels, edges
+
+
+def _near_chunk_kernels(chunks, k, m_max, kinds, signed=True):
+    """Kernel values per chunk and kind (the rows of :func:`_near_block_kernels`)."""
+    kernels, edges = _near_block_kernels(chunks, k, m_max, kinds, signed=signed)
+    return [{kind: (value[a:b] if kind == 'efie' else tuple(v[a:b] for v in value))
+             for kind, value in kernels.items()}
+            for a, b in zip(edges[:-1], edges[1:])]
 
 
 def _contract_near_chunk(out, chunk, kernels, k, m_max, modes, signed):
@@ -4712,13 +4757,86 @@ def _contract_near_chunk(out, chunk, kernels, k, m_max, modes, signed):
             out[kind][uv] += contract(TT, 2 * np.pi * rr * value)
 
 
+# Chunks of equal point count are contracted together (_contract_near_chunks);
+# each kernel term of one such group (chunks x points x modes, complex) stays
+# within this many bytes, which bounds the group's temporaries.
+NEAR_CONTRACT_GROUP_BYTES = 2_000_000
+
+
+def _contract_near_chunks(chunks, kernels, edges, k, modes):
+    """Blocks ``[c][kind][uv] -> (nm, 2, 2)`` of every chunk: the
+    :func:`_contract_near_chunk` contributions of all chunks at once.
+
+    Chunks of equal point count are stacked and every term is one batched
+    product ``(C, 4, P) @ (C, P, nm)``, so a NumPy call serves tens of chunks
+    (the 3,152 per-chunk contractions of a 100-element sphere spent 0.8 s in
+    Python).  Each chunk's products are the same GEMMs on the same values as
+    its own contraction, so its block is the same bitwise, and the caller adds
+    the blocks in chunk order.
+    """
+    nm = len(modes)
+    am = np.abs(modes)
+    lower, upper, negative = np.abs(am - 1), am + 1, modes < 0
+    jm = (1j * modes)[None, :, None, None]
+    m2 = (modes ** 2)[None, :, None, None]
+    results = [None] * len(chunks)
+    sizes = np.array([len(chunk[12]) for chunk in chunks])
+    for size in np.unique(sizes)[::-1]:
+        size = int(size)
+        positions = np.flatnonzero(sizes == size)
+        group = max(1, NEAR_CONTRACT_GROUP_BYTES // (16 * size * nm))
+        for g0 in range(0, len(positions), group):
+            pos = positions[g0:g0 + group]
+            count = len(pos)
+            rows_index = np.concatenate([np.arange(edges[p], edges[p + 1]) for p in pos])
+
+            def stack(field):
+                return np.stack([chunks[p][field] for p in pos])
+
+            def scalars(field):
+                return np.array([chunks[p][field] for p in pos], dtype=float)[:, None, None]
+
+            def rows(left, right):
+                return (left[:, :, None, :] * right[:, None, :, :]).reshape(count, 4, size)
+
+            def contract(pairs, kernel):
+                return (pairs @ kernel).reshape(count, 2, 2, nm).transpose(0, 3, 1, 2)
+            rp, rq, w = stack(0), stack(4), stack(12)
+            Tp, Tq, Dp, Dq = stack(8), stack(9), stack(10), stack(11)
+            TT = rows(Tp, Tq)
+            rr = (rp * rq * w)[:, :, None]
+            blocks = {}
+            if 'efie' in kernels:
+                trp, tzp, trq, tzq = scalars(2), scalars(3), scalars(6), scalars(7)
+                G = kernels['efie'][rows_index].reshape(count, size, -1)
+                Gn = G[..., am]
+                Gc = 0.5 * (G[..., lower] + G[..., upper])
+                Gs = (G[..., lower] - G[..., upper]) / 2j
+                Gs[..., negative] *= -1
+                scalar = w[:, :, None] * Gn / k**2
+                blocks['efie'] = (
+                    contract(TT, rr * (trp * trq * Gc + tzp * tzq * Gn)) - contract(rows(Dp, Dq), scalar),
+                    contract(TT, rr * trp * Gs) - jm * contract(rows(Dp, Tq), scalar),
+                    contract(TT, -rr * trq * Gs) + jm * contract(rows(Tp, Dq), scalar),
+                    contract(TT, rr * Gc) - m2 * contract(TT, scalar))
+            for kind, values in kernels.items():
+                if kind == 'efie':
+                    continue
+                blocks[kind] = tuple(contract(TT, 2 * np.pi * rr * value[rows_index].reshape(count, size, nm))
+                                     for value in values)
+            for c, p in enumerate(pos):
+                results[p] = {kind: tuple(part[c] for part in parts) for kind, parts in blocks.items()}
+    return results
+
+
 def _contract_near_batch(jobs, k, m_max, kinds, signed=True):
     """:func:`_contract_near_points` of every ``(gp, e, gq, f, points)`` job.
 
     Chunks are formed per job exactly as one call would form them; their
     kernels are evaluated together in blocks of at most
-    NEAR_BATCH_KERNEL_BYTES and each job's chunks are contracted in order, so
-    every job's blocks equal those of its own call, bitwise.
+    NEAR_BATCH_KERNEL_BYTES, contracted together (:func:`_contract_near_chunks`)
+    and each job's chunk blocks are added in order, so every job's blocks
+    equal those of its own call, bitwise.
     """
     modes = np.arange(-m_max, m_max + 1) if signed else np.arange(0, m_max + 1)
     nm = len(modes)
@@ -4730,9 +4848,13 @@ def _contract_near_batch(jobs, k, m_max, kinds, signed=True):
     def flush():
         if not block:
             return
-        kernels = _near_chunk_kernels([chunk for _, chunk in block], k, m_max, kinds, signed=signed)
-        for (index, chunk), values in zip(block, kernels):
-            _contract_near_chunk(outs[index], chunk, values, k, m_max, modes, signed)
+        chunks = [chunk for _, chunk in block]
+        kernels, edges = _near_block_kernels(chunks, k, m_max, kinds, signed=signed)
+        for (index, _), blocks in zip(block, _contract_near_chunks(chunks, kernels, edges, k, modes)):
+            for kind, parts in blocks.items():
+                target = outs[index][kind]
+                for uv in range(4):
+                    target[uv] += parts[uv]
         block.clear()
 
     for index, (gp, e, gq, f, pts) in enumerate(jobs):

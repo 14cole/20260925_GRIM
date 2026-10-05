@@ -65,15 +65,67 @@ class HierarchicalModeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GHOST_HIERARCHICAL_MIN_UNKNOWNS": "100"}):
             self.assertIsNone(ModalFactor(a.copy(), 2, False).hierarchical)
 
-    def test_pricing_follows_the_factor(self):
-        n = hf.HIERARCHICAL_MIN_UNKNOWNS
+    def test_pricing_follows_the_planned_factor(self):
+        n = 12000
         lu = bor_solver.estimate_bor_dense_peak_gb(n, 64, 4, 10)
         hodlr = bor_solver.estimate_bor_dense_peak_gb(n, 64, 4, 10, hierarchical=True)
-        small = bor_solver.estimate_bor_dense_peak_gb(n // 2, 64, 4, 10, hierarchical=True)
-        self.assertEqual(small, bor_solver.estimate_bor_dense_peak_gb(n // 2, 64, 4, 10))
         ratio = bor_solver.BOR_HIERARCHICAL_MATRIX_EQUIVALENTS / bor_solver.BOR_DENSE_MATRIX_EQUIVALENTS
         self.assertLess(hodlr, lu)
         self.assertGreater(hodlr, ratio * lu * 0.9)
+        one_lu = bor_solver.estimate_bor_total_peak_gb(
+            0.0, bor_solver.estimate_bor_dense_peak_gb(n, 64, 1, 10))
+        one_hodlr = bor_solver.estimate_bor_total_peak_gb(
+            0.0, bor_solver.estimate_bor_dense_peak_gb(n, 64, 1, 10, hierarchical=True))
+        self.assertLess(one_hodlr, one_lu)
+
+        def plan(limit, **options):
+            return bor_solver.plan_bor_mode_workers(n, 64, 4, 10, 0.0, memory_limit_gb=limit,
+                                                    hierarchical=True, **options)
+        # The plan keeps LU with the largest worker count that fits and prices
+        # the hierarchical factor only when no LU count fits this host.
+        with mock.patch.dict(os.environ, {"GHOST_HIERARCHICAL_MIN_UNKNOWNS": ""}):
+            roomy = plan(100.0)
+            self.assertEqual((roomy["factor"], roomy["workers"]), ("lu", 4))
+            tight = plan(0.5 * (one_lu + one_hodlr))
+            self.assertEqual((tight["factor"], tight["workers"], tight["fits_memory"]), ("hodlr", 1, True))
+            none = plan(0.5 * one_hodlr)
+            self.assertEqual((none["factor"], none["workers"], none["fits_memory"]), ("hodlr", 1, False))
+            without = bor_solver.plan_bor_mode_workers(n, 64, 4, 10, 0.0, memory_limit_gb=100.0)
+            self.assertEqual(without["factor"], "lu")
+        # The threshold variable replaces the memory rule in both directions.
+        with mock.patch.dict(os.environ, {"GHOST_HIERARCHICAL_MIN_UNKNOWNS": "1000"}):
+            self.assertEqual(plan(100.0)["factor"], "hodlr")
+        with mock.patch.dict(os.environ, {"GHOST_HIERARCHICAL_MIN_UNKNOWNS": "0"}):
+            self.assertEqual(plan(0.5 * (one_lu + one_hodlr))["factor"], "lu")
+
+    def test_default_rule_follows_the_admitted_memory_not_a_fixed_count(self):
+        gib = 1024 ** 3
+        with mock.patch.dict(os.environ, {"GHOST_HIERARCHICAL_MIN_UNKNOWNS": ""}):
+            with mock.patch.object(hf, "admitted_solve_bytes", return_value=64 * gib):
+                switch = hf.hierarchical_switch_size()
+                self.assertGreater(switch, 12096)
+                self.assertFalse(hf.automatic_hierarchical(12096))
+                self.assertFalse(hf.automatic_hierarchical(switch - 1))
+                self.assertTrue(hf.automatic_hierarchical(switch))
+                self.assertLessEqual(hf.lu_route_bytes(switch - 1), 64 * gib)
+                self.assertGreater(hf.lu_route_bytes(switch), 64 * gib)
+            with mock.patch.object(hf, "admitted_solve_bytes", return_value=2 * gib):
+                self.assertTrue(hf.automatic_hierarchical(12096))
+                self.assertFalse(hf.automatic_hierarchical(hf.HIERARCHICAL_MIN_UNKNOWNS - 1))
+            with mock.patch.object(hf, "admitted_solve_bytes", return_value=0.0):
+                # An unknown limit keeps LU.
+                self.assertFalse(hf.automatic_hierarchical(12096))
+                self.assertIsNone(hf.hierarchical_switch_size())
+            self.assertTrue(hf.automatic_hierarchical(12096, lu_fits=False))
+            self.assertFalse(hf.automatic_hierarchical(12096, lu_fits=True))
+            self.assertFalse(hf.automatic_hierarchical(hf.HIERARCHICAL_MIN_UNKNOWNS - 1, lu_fits=False))
+        with mock.patch.dict(os.environ, {"GHOST_HIERARCHICAL_MIN_UNKNOWNS": "0"}):
+            self.assertFalse(hf.automatic_hierarchical(12096, lu_fits=False))
+            self.assertIsNone(hf.hierarchical_switch_size())
+        with mock.patch.dict(os.environ, {"GHOST_HIERARCHICAL_MIN_UNKNOWNS": "300"}):
+            self.assertTrue(hf.automatic_hierarchical(300, lu_fits=True))
+            self.assertFalse(hf.automatic_hierarchical(299, lu_fits=False))
+            self.assertEqual(hf.hierarchical_switch_size(), 300)
 
 
 if __name__ == "__main__":

@@ -187,3 +187,15 @@ def test_platform_mismatch_is_rejected(monkeypatch):
     monkeypatch.setattr(release.sysconfig, 'get_platform', lambda: 'win-amd64')
     with pytest.raises(RuntimeError, match='Cannot tag'):
         release.native_platform_tag()
+
+
+def test_bor_builder_is_strict_by_default_and_fast_math_is_a_separate_library():
+    strict = bor_builder.compile_command('gcc', 'kernel.c', 'out.so', 'linux')
+    assert '-O3' in strict and '-fopenmp' in strict and '-fPIC' in strict
+    assert '-ffast-math' not in strict
+    fast = bor_builder.compile_command('gcc', 'kernel.c', 'out.so', 'linux', fast_math=True)
+    assert '-ffast-math' in fast
+    windows = bor_builder.compile_command('gcc', 'kernel.c', 'out.dll', 'windows', openmp=False)
+    assert '-static' in windows and '-fopenmp' not in windows and '-ffast-math' not in windows
+    assert bor_builder.output_name('linux-x86_64', '.so') == 'bor_stream_kernel.linux-x86_64.so'
+    assert bor_builder.output_name('windows-amd64', '.dll', fast_math=True) == 'bor_stream_kernel.windows-amd64.fast.dll'

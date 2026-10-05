@@ -193,17 +193,25 @@ class SolverCompressionTests(unittest.TestCase):
                             assembly_workspace_bytes=10**8))
             with mock.patch.dict(os.environ, environment):
                 return rcs._estimate_memory_gb(**args)
-        # Below the automatic threshold 'dense' and 'auto' factor with LU (the
-        # original plus its copy); a strict hierarchical request saves the copy.
+        # Below the size floor 'dense' and 'auto' factor with LU (the original
+        # plus its copy); a strict hierarchical request saves the copy.
         small = hf.HIERARCHICAL_MIN_UNKNOWNS // 2
         self.assertEqual(estimate('dense', small), estimate('auto', small))
         self.assertLess(estimate('hierarchical', small), estimate('dense', small))
-        # From it both are factored hierarchically and priced so (an LU fallback
-        # spools the original); GHOST_HIERARCHICAL_MIN_UNKNOWNS=0 restores LU.
-        large = hf.HIERARCHICAL_MIN_UNKNOWNS + 6000
-        self.assertEqual(estimate('dense', large), estimate('auto', large))
-        self.assertEqual(estimate('dense', large), estimate('hierarchical', large))
-        self.assertLess(estimate('dense', large), estimate('dense', large, threshold='0'))
+        # Above it the default follows the admitted memory: with room for the
+        # LU route 'dense' and 'auto' price LU, and when it does not fit they
+        # price the hierarchical factor (an LU fallback spools the original);
+        # GHOST_HIERARCHICAL_MIN_UNKNOWNS replaces that rule in both directions.
+        large = 16000
+        with mock.patch.object(rcs, '_solve_memory_limit_gb', return_value=64.):
+            self.assertEqual(estimate('dense', large), estimate('auto', large))
+            self.assertEqual(estimate('dense', large), estimate('dense', large, threshold='0'))
+            self.assertLess(estimate('hierarchical', large), estimate('dense', large))
+            self.assertEqual(estimate('dense', large, threshold=str(large)), estimate('hierarchical', large))
+        with mock.patch.object(rcs, '_solve_memory_limit_gb', return_value=6.):
+            self.assertEqual(estimate('dense', large), estimate('auto', large))
+            self.assertEqual(estimate('dense', large), estimate('hierarchical', large))
+            self.assertLess(estimate('dense', large), estimate('dense', large, threshold='0'))
 
     def test_zero_contrast_layer_skips_operators_and_factorization(self):
         mesh = sheet_mesh([[-.05, 0], [.05, 0]], panels=16)
