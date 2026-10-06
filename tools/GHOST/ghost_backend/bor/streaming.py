@@ -367,14 +367,22 @@ def _add_band_to_packed(store, band, e0: 'int', f0: 'int', offsets) -> 'None':
             band[:, first - f0:stop - f0, i, :].transpose(0, 2, 1))
 
 
+# Row chunks of blocks up to this many nodes keep the (row, column) index pair
+# of their strict-upper positions (16 bytes per position) beside the mask.
+UNPACK_INDEX_MAX_NODES = 3072
+
+
 def _unpack_upper_into(packed, out, factor, offsets, rows=None, mask=None) -> 'None':
     """``out = factor * U`` for the packed strict-upper ``U``; the rest of ``out`` is zeroed
     (the node rows ``rows = (lo, hi)`` only, when given).
 
     The upper positions of a row chunk, in row-major order, are exactly its
-    packed segment, so one masked assignment fills them (the per-row copies
-    it replaces were two Python-level calls per row, serialized on the GIL
-    across mode workers).  ``mask`` is ``_upper_mask(n, lo, hi)`` when cached.
+    packed segment, so one assignment fills them (the per-row copies it
+    replaces were two Python-level calls per row, serialized on the GIL
+    across mode workers).  ``mask`` is ``_upper_mask(n, lo, hi)`` when cached,
+    or ``(mask, (row_index, column_index))`` with the mask's nonzero positions
+    precomputed: a boolean assignment scans the whole mask on every mode,
+    an indexed one only writes.
     """
     n = out.shape[0]
     lo, hi = (0, n) if rows is None else rows
@@ -385,7 +393,13 @@ def _unpack_upper_into(packed, out, factor, offsets, rows=None, mask=None) -> 'N
     block = out[lo:hi]
     block[...] = 0.0
     if stop > start:
-        block[_upper_mask(n, lo, hi) if mask is None else mask] = packed[start:stop] * factor
+        indices = None
+        if isinstance(mask, tuple):
+            mask, indices = mask
+        if indices is not None:
+            block[indices[0], indices[1]] = packed[start:stop] * factor
+        else:
+            block[_upper_mask(n, lo, hi) if mask is None else mask] = packed[start:stop] * factor
 
 
 def _upper_mask(n: 'int', lo: 'int', hi: 'int') -> 'np.ndarray':
@@ -861,6 +875,12 @@ def _largest_fitting(fits, upper: 'int') -> 'int':
     return low
 
 
+# A banded tile has at least this many test-element rows when the source
+# elements can be split to afford them (see _plan_banded_tiles).
+STREAM_TILE_MIN_ROWS = 16
+STREAM_TILE_MIN_SOURCES = 8
+
+
 def _plan_banded_tiles(ne_p, go_p, ne_q, go_q, n_orders, n_modes, efie, brackets,
                        tile_budget_gb, threads, n_xi=0):
     """``(threads, test elements, source elements, sampler bytes)`` of a banded tile plan.
@@ -887,6 +907,16 @@ def _plan_banded_tiles(ne_p, go_p, ne_q, go_q, n_orders, n_modes, efie, brackets
 
         if cost(1, ne_q) <= per_tile:
             rows = _largest_fitting(lambda te: cost(te, ne_q) <= per_tile, ne_p)
+            if rows < STREAM_TILE_MIN_ROWS < ne_p:
+                # Taller, narrower tiles at the same live set: the test-side
+                # contraction's inner dimension is rows x Gauss points, so a
+                # one-row full-width tile runs its products at a few percent
+                # of GEMM speed (measured 1.9x on a 3,000-element mesh and
+                # 12-14% at 800 elements, bitwise-equivalent blocks).
+                sources = _largest_fitting(
+                    lambda fe: cost(STREAM_TILE_MIN_ROWS, fe) <= per_tile, ne_q)
+                if sources >= min(ne_q, STREAM_TILE_MIN_SOURCES):
+                    return count, STREAM_TILE_MIN_ROWS, sources, work
             return count, rows, ne_q, work
         sources = _largest_fitting(lambda fe: cost(1, fe) <= per_tile, ne_q)
         if sources >= 1:
@@ -1540,7 +1570,8 @@ def spill_directory(required_gb: 'float'):
     return base if free >= required else None
 
 
-def plan_stream_spill(mode_block: 'int', mode_count: 'int', per_mode_gb: 'float'):
+def plan_stream_spill(mode_block: 'int', mode_count: 'int', per_mode_gb: 'float',
+                      allow_spill: 'bool' = True):
     """``(base directory or None, mode block, resident GB)`` for one far stream.
 
     A retained-block budget that cannot hold every mode used to mean one far
@@ -1556,7 +1587,7 @@ def plan_stream_spill(mode_block: 'int', mode_count: 'int', per_mode_gb: 'float'
     """
     mode_block = int(mode_block)
     mode_count = int(mode_count)
-    if mode_block >= mode_count:
+    if mode_block >= mode_count or not allow_spill:
         return None, mode_block, None
     base = spill_directory(mode_count * float(per_mode_gb))
     if base is None:
@@ -1772,6 +1803,9 @@ class StreamingFarBlocks:
         """Stored entries of one EFIE block of one mode (packed triangle or full)."""
         return packed_upper_size(self.Nn) if self._packed_efie else self.Nn * self.Nn
 
+    def _run_build_tiles(self, tiles, operation):
+        _run_tiles(tiles, operation, self._workers)
+
     def _build_range(self, lo: 'int', hi: 'int') -> 'None':
         Nn, go, mm = self.Nn, self.go, self.m_max
         ne = self.solver.gen.n_elems
@@ -1822,7 +1856,9 @@ class StreamingFarBlocks:
                 if s0 < f1:
                     Gn = self._sample_G(rows, k, self._nx_e, ph_e, ord_lo, hi,
                                         (s0, f1), symmetric)
-                    self._zero_near(Gn, e0, e1, s0, f1, symmetric)
+                    if not modal_kernels.BANDED_FFT:
+                        # The banded sampler never samples a masked pair.
+                        self._zero_near(Gn, e0, e1, s0, f1, symmetric)
                     left = self._left_all[:, :, rows].reshape(2 * len(_LEFT_KINDS), re, go)
                     band = _efie_band(Gn, left, self._right_groups, self._positive_modes,
                                       ord_lo, k, s0, f1, re, go)
@@ -1836,7 +1872,8 @@ class StreamingFarBlocks:
                                            (f0, f1))
                 band = _bracket_band(
                     Fs, self._lv["1"][:, rows].reshape(2, re, go), right, f0, f1, re, go,
-                    lambda kernel: self._zero_near(kernel, e0, e1, f0, f1))
+                    None if modal_kernels.BANDED_FFT else
+                    (lambda kernel: self._zero_near(kernel, e0, e1, f0, f1)))
                 Fs = None
                 self._add_band(which, getattr(self, attribute), band, e0, f0)
                 band = None
@@ -1844,7 +1881,7 @@ class StreamingFarBlocks:
                 release.tile_done(e0)
 
         tiles = [(e0, f0) for e0 in range(0, ne, te) for f0 in range(0, ne, fe)]
-        _run_tiles(tiles, do_tile, self._workers)
+        self._run_build_tiles(tiles, do_tile)
         if release is not None:
             release.finish()
         if self._efie and symmetric and not self._packed_efie:
@@ -1978,6 +2015,39 @@ class StreamingFarBlocks:
                 Kt[row, :(min(e + 1, f1) - f0) * go] = 0.0
 
 
+    def query_blocks(self, family, m, rows, cols):
+        """Owned nodal slices for compressed modal assembly, without expansion.
+
+        The exact streamed coefficients use the same angular rule as direct
+        coefficient queries. Packed EFIE reciprocity is applied locally.
+        """
+        rows, cols = np.asarray(rows, dtype=np.intp), np.asarray(cols, dtype=np.intp)
+        with self._range_lock:
+            self._ensure(abs(int(m)))
+            store = {'efie': self.Z, 'mfie': self.K, 'ibc': self.B}[family]
+            if store is None:
+                raise ValueError('The requested streamed operator family was not prepared.')
+            mi = self._sidx[abs(int(m))]
+            if family != 'efie' or not self._packed_efie:
+                return [np.asarray(store[uv, mi][np.ix_(rows, cols)], dtype=complex)
+                        * mode_sign(uv, m) for uv in range(4)]
+            rr, cc = np.broadcast_arrays(rows[:, None], cols[None, :])
+            off = rr != cc
+            low = rr > cc
+            a, b = np.minimum(rr, cc), np.maximum(rr, cc)
+            indices = self._offsets[a[off]] + b[off] - a[off] - 1
+            result = []
+            for uv in range(4):
+                value = np.zeros(rr.shape, complex)
+                component = np.full(indices.shape, uv, dtype=np.intp)
+                if uv in (1, 2):
+                    component[low[off]] = 3 - uv
+                value[off] = store[component, mi, indices]
+                if uv in (1, 2):
+                    value[low] *= -1
+                result.append(value * mode_sign(uv, m))
+            return result
+
     def write_efie_blocks(self, m: 'int', quads, scale) -> 'None':
         """``quads[uv] = scale * mode_sign(uv, m) * Z_uv(m)``: the four full far
         EFIE blocks of one signed mode, written into the caller's quadrants.
@@ -2018,9 +2088,17 @@ class StreamingFarBlocks:
         key = tuple(chunks)
         cached = getattr(self, "_mask_cache", None)
         if cached is None or cached[0] != key:
-            masks = [_upper_mask(self.Nn, lo, hi) for lo, hi in chunks]
-            for mask in masks:
+            masks = []
+            for lo, hi in chunks:
+                mask = _upper_mask(self.Nn, lo, hi)
                 mask.setflags(write=False)
+                if self.Nn <= UNPACK_INDEX_MAX_NODES:
+                    rows_index, cols_index = np.nonzero(mask)
+                    rows_index.setflags(write=False)
+                    cols_index.setflags(write=False)
+                    masks.append((mask, (rows_index, cols_index)))
+                else:
+                    masks.append(mask)
             cached = self._mask_cache = (key, masks)
         return cached[1]
 
@@ -2137,7 +2215,7 @@ class StreamingCrossFarBlocks:
 
     Test and source generatrices may have different element/node counts.  The
     stored blocks match :class:`StreamingFarBlocks`: four final EFIE blocks
-    and four unit-source rotated-PV blocks for nonnegative modes. Near pairs
+    and, when requested, four unit-source rotated-PV blocks for nonnegative modes. Near pairs
     remain excluded here and are added by ``BorCrossOperators`` with its
     existing high-order/graded quadrature.  Tiles, threads and spill files
     follow :class:`StreamingFarBlocks` (every pair is sampled: the two
@@ -2152,6 +2230,7 @@ class StreamingCrossFarBlocks:
                  spill: 'Optional[str]' = None,
                  tile_threads: 'Optional[int]' = None):
         self.cross = cross
+        self._has_ibc = cross.need_p
         self.sp, self.sq = cross.sp, cross.sq
         self.m_max = int(m_max)
         self.dtype = dtype
@@ -2206,13 +2285,13 @@ class StreamingCrossFarBlocks:
             )
             self._nx_b = _n_xi_bracket(
                 self.k, rho_max, self.m_max, cross._far_gap
-            )
+            ) if self._has_ibc else self._nx_e
             nx_worst = max(self._nx_e, self._nx_b)
             # Tile threads are capped at the physical cores like the self
             # streams (the mode workers only align the ranges).
             _apply_tile_plan(self, tile_budget_gb, tile_threads, nx_worst,
                              self.sp.gen.n_elems, self.go_p, ne_q, self.go_q, self.Pq,
-                             True, True)
+                             True, self._has_ibc)
             self._native = (
                 _NATIVE if _NATIVE is not None and abs(self.k.imag) == 0.0
                 else None
@@ -2270,7 +2349,7 @@ class StreamingCrossFarBlocks:
         modes = list(range(lo, hi+1))
         self.Z = self.B = None
         if self._spill is not None:
-            self._spill.reserve(2 * 4 * len(modes) * self.Np * self.Nq
+            self._spill.reserve((1 + int(self._has_ibc)) * 4 * len(modes) * self.Np * self.Nq
                                 * np.dtype(self.dtype).itemsize)
         self.Z = self._allocate(
             "efie", (4, hi-lo+1, self.Np, self.Nq)
@@ -2279,7 +2358,7 @@ class StreamingCrossFarBlocks:
         self._sidx = {m: index for index, m in enumerate(modes)}
         self.B = self._allocate(
             "ibc", (4, len(modes), self.Np, self.Nq)
-        )
+        ) if self._has_ibc else None
         self._ord_lo = ord_lo
         orders = np.arange(ord_lo, hi + 2)
         phase_e = (
@@ -2293,7 +2372,8 @@ class StreamingCrossFarBlocks:
             np.exp(1j * np.pi * mode_array) * (2.0 * np.pi / self._nx_b)
         )
         te, fe = self._tile_rows, self._tile_sources
-        release = (_SpilledRowRelease([(self.Z, ("full", self.Nq)), (self.B, ("full", self.Nq))],
+        release = (_SpilledRowRelease([(store, ("full", self.Nq))
+                                      for store in (self.Z, self.B) if store is not None],
                                       ne, te, len(range(0, ne_q, fe)), self.Np)
                    if self._spill is not None else None)
 
@@ -2304,19 +2384,22 @@ class StreamingCrossFarBlocks:
             rows = slice(e0 * go_p, e1 * go_p)
             re = e1 - e0
             Gn = self._sample_G(rows, phase_e, ord_lo, hi, (f0, f1))
-            self._zero_near(Gn, e0, e1, f0, f1)
+            if not modal_kernels.BANDED_FFT:
+                self._zero_near(Gn, e0, e1, f0, f1)
             left = self._left_all[:, :, rows].reshape(2 * len(_LEFT_KINDS), re, go_p)
             band = _efie_band(Gn, left, self._right_groups, self._positive_modes,
                               ord_lo, self.k, f0, f1, re, go_p)
             Gn = left = None
             self._add_band("efie", self.Z, band, e0, f0)
             band = None
-            brackets = self._sample_brackets(rows, re, bins_b, phase_b, (f0, f1))
-            band = _bracket_band(
-                brackets, self._lv["1"][:, rows].reshape(2, re, go_p), self._right_one,
-                f0, f1, re, go_p, lambda kernel: self._zero_near(kernel, e0, e1, f0, f1))
-            brackets = None
-            self._add_band("ibc", self.B, band, e0, f0)
+            if self._has_ibc:
+                brackets = self._sample_brackets(rows, re, bins_b, phase_b, (f0, f1))
+                band = _bracket_band(
+                    brackets, self._lv["1"][:, rows].reshape(2, re, go_p), self._right_one,
+                    f0, f1, re, go_p, None if modal_kernels.BANDED_FFT else
+                    (lambda kernel: self._zero_near(kernel, e0, e1, f0, f1)))
+                brackets = None
+                self._add_band("ibc", self.B, band, e0, f0)
             if release is not None:
                 release.tile_done(e0)
 
@@ -2343,6 +2426,8 @@ class StreamingCrossFarBlocks:
 
     def write_blocks(self, which, m, targets):
         """Copy a cross mode straight into its final matrix quadrants."""
+        if which == 'ibc' and not self._has_ibc:
+            raise ValueError('This cross stream was prepared for EFIE only.')
         with self._range_lock:
             self._ensure(abs(m))
             store = self.Z if which == 'efie' else self.B
@@ -2487,6 +2572,8 @@ class StreamingCrossFarBlocks:
             return self._read_mode(self.Z, m)
 
     def bracket_blocks(self, m: 'int'):
+        if not self._has_ibc:
+            raise ValueError('This cross stream was prepared for EFIE only.')
         with self._range_lock:
             self._ensure(abs(m))
             return self._read_mode(self.B, m)
@@ -2685,8 +2772,8 @@ def estimate_streaming_block_gb(
         raise ValueError("Streaming block estimate dimensions are invalid.")
     from ghost_backend.bor.compressed_far import far_compression_selected
     if far_compression_selected(ne + 1):
-        # The compressed store holds every mode at once, whatever the block.
-        return estimate_streaming_gb(ne, mm, formulation, has_ibc, single_blocks)
+        # A shared spatial basis is retained for the live mode band only.
+        return estimate_streaming_gb(ne, block - 1, formulation, has_ibc, single_blocks)
     nodes = float(ne + 1)
     item_bytes = 8.0 if single_blocks else 16.0
     worst = 0.0
@@ -2724,12 +2811,6 @@ def plan_streaming_mode_block(
     if not np.isfinite(budget) or budget <= 0.0:
         raise ValueError("Streaming block budget must be positive and finite.")
     mode_count = int(m_max) + 1
-    from ghost_backend.bor.compressed_far import far_compression_selected
-    if far_compression_selected(int(n_elems) + 1):
-        # The block budget bounds a dense range; a compressed store holds
-        # every mode and is priced by the solve's memory admission instead.
-        return mode_count, estimate_streaming_gb(
-            n_elems, m_max, formulation, has_ibc, single_blocks), max(1, int(workers))
     minimum = estimate_streaming_block_gb(
         n_elems, m_max, 1, formulation, has_ibc, single_blocks
     )

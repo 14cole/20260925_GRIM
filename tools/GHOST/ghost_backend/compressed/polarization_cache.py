@@ -1,8 +1,9 @@
 """Finalize two polarized operators from each shared geometry tile query."""
-from ghost_backend.compressed.operator import StreamedOperator, TileWriter, tile_values, take_pilot
+from ghost_backend.compressed.operator import StreamedOperator, TileWriter, tile_values, take_pilot, assembly_tasks, tile_batch_values
 from pathlib import Path
 import numpy as np
 import os,tempfile,hashlib
+from ghost_backend.execution.metrics import timed_stage
 
 
 class SpooledOperator(StreamedOperator):
@@ -21,6 +22,7 @@ class SpooledOperator(StreamedOperator):
             try:self.assemble_tiles(args[0])
             except BaseException:
                 self.close();raise
+    @timed_stage('compressed_spool_write')
     def store_tile(self,compressed):
         super().store_tile(compressed)
         i,j=compressed[:2]
@@ -31,6 +33,7 @@ class SpooledOperator(StreamedOperator):
             records.append((value.shape,self.file.tell(),value.size,hashlib.sha256(raw).digest()))
             self.file.write(raw);self.spool_bytes+=value.nbytes
         self.records[i,j]=records;self.tiles[i,j]=None
+    @timed_stage('compressed_spool_read')
     def load(self):
         if self.loaded:return
         if self.file is None:raise ValueError('Compressed spool is closed.')
@@ -56,9 +59,9 @@ class SpooledOperator(StreamedOperator):
     def _get(self,rows,cols,row_plan=None,col_plan=None):
         if not self.loaded:raise ValueError('Load the compressed spool before querying it.')
         return super()._get(rows,cols,row_plan,col_plan)
-    def block_matmul(self,rows,cols,x,row_plan=None,col_plan=None):
+    def block_matmul(self,rows,cols,x,row_plan=None,col_plan=None,trans=0):
         if not self.loaded:raise ValueError('Load the compressed spool before multiplying it.')
-        return super().block_matmul(rows,cols,x,row_plan,col_plan)
+        return super().block_matmul(rows,cols,x,row_plan,col_plan,trans=trans)
     def matmul(self,b,trans=0):
         if not self.loaded:raise ValueError('Load the compressed spool before multiplying it.')
         return super().matmul(b,trans)
@@ -100,18 +103,17 @@ def build_pair(oracle,coordinates,tile=512,budget=512*1024**2,checkpoint=None,sp
                 for index in range(2):_store(operators,budget,index)(results[index])
         else:
             with TileWriter() as writer:
-                for j,cols in enumerate(operators[0].groups):
-                    if hasattr(oracle,'prepare_columns'):oracle.prepare_columns(cols)
-                    for i,rows in enumerate(operators[0].groups):
+                for task in assembly_tasks(oracle,operators):
+                    if hasattr(oracle,'prepare_columns'):oracle.prepare_columns(operators[0].groups[task[0][1]])
+                    batches=tile_batch_values(oracle,operators[0].groups,task)
+                    for (i,j,_),values in zip(task,batches):
                         known = [take_pilot(op,i,j) for op in operators]
-                        missing = [index for index,value in enumerate(known) if value is None]
-                        values=tile_values(oracle,rows,cols,missing) if missing else {}
                         for index in range(2):
                             if known[index] is not None:
                                 writer.submit_prepared(known[index],_store(operators,budget,index))
                             else:
                                 writer.submit(operators[index].compress_tile,_store(operators,budget,index),i,j,*values[index])
-                        values=None
+                    batches=None
         for op,source in zip(operators,oracle.oracles):op.finalize(source)
     except BaseException:
         for op in operators:

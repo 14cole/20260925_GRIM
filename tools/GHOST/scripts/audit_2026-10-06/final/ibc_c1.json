@@ -1,0 +1,73 @@
+{
+ "case": "ibc_c1",
+ "spec": {
+  "kind": "2d",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\tools\\GHOST\\ghost_backend\\validation\\material_examples\\type2_csv_ibc.geo",
+  "units": "meters",
+  "ghz": 1.0,
+  "set": "quick"
+ },
+ "import_seconds": 0.21286359999794513,
+ "wall": 0.33294509999541333,
+ "stage_seconds": {
+  "operators": 0.04375390000495827,
+  "condition_scaling": 0.00013849999231752008,
+  "factorization": 0.0001635999942664057,
+  "condition_estimation": 0.0011721999981091358,
+  "excitation": 0.0021217999965301715,
+  "rhs_solve": 0.00036410001484910026,
+  "linear_solve": 0.0008818999922368675,
+  "rhs_compression": 0.0009839000122155994,
+  "far_field": 0.004076900004292838,
+  "mesh_certification": 0.00217279999924358
+ },
+ "backend": "dense",
+ "planning_seconds": 0.1149721000037971,
+ "adaptive_used": false,
+ "adaptive_fallback": null,
+ "steps": [],
+ "panel_count": 44,
+ "nodes": 44,
+ "degree": 1,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": true,
+ "warnings": [],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 28,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.0013136999987182207
+  },
+  {
+   "label": null,
+   "unknowns": 28,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.0006811999992351048
+  },
+  {
+   "label": null,
+   "unknowns": 44,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.0007911000066087581
+  },
+  {
+   "label": null,
+   "unknowns": 44,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.0007473999939975329
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

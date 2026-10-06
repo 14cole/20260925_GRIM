@@ -374,7 +374,8 @@ def compressed_storage_budget(options, workers):
     return int(total) // max(1, int(workers))
 
 
-def compressed_factor(oracle, mode, monitor_cond, options, workers, checkpoint=None):
+def compressed_factor(oracle, mode, monitor_cond, options, workers, checkpoint=None,
+                      recycling_key=None, recycling_frequency=None, exact_far_cache=False):
     from scipy.sparse.linalg import LinearOperator, onenormest
     from ghost_backend.compressed.operator import StreamedOperator
     from ghost_backend.compressed.factor import CompressedFactor
@@ -382,13 +383,19 @@ def compressed_factor(oracle, mode, monitor_cond, options, workers, checkpoint=N
     # 0 sizes the cap from the solve memory limit; a fixed cap starves an
     # electrically large body, whose modes each need their own share.
     budget = compressed_storage_budget(options, workers)
+    from ghost_backend.bor.options import resolved_compression_tile
+    tile = resolved_compression_tile(options, exact_far_cache)
     coordinates = oracle.row_coordinates
     if coordinates is None:
         coordinates = np.arange(oracle.n, dtype=float)[:, None]
     operator = timed_stage('modal_compressed_assembly')(StreamedOperator)(oracle, coordinates,
-        tile=options['compression_tile'], budget=budget, checkpoint=checkpoint)
+        tile=tile, budget=budget, checkpoint=checkpoint)
     factor = CompressedFactor(operator, label='BoR mode m={}'.format(mode), checkpoint=checkpoint,
-                              storage_budget_bytes=budget, check_precision=False)
+                              storage_budget_bytes=budget, check_precision=False,
+                              recycling_key=recycling_key, recycling_frequency=recycling_frequency,
+                              recycling_coordinate_units='Hz')
+    factor.event['compression_tile_requested'] = options['compression_tile']
+    factor.event['compression_tile'] = tile
     factor.event['refinement_steps'] = 0
     factor.condition = math.nan
     if monitor_cond:

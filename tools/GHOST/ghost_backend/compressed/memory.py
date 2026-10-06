@@ -194,7 +194,9 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
     from ghost_backend.compressed.recycling import capacity_bytes
     worker_bytes = forecast_bytes(d, threads, groups=groups)
     recycle_bytes = capacity_bytes()
-    overhead = 128*MIB + 6144*n + count*4096 + tile_metadata + moment_cache + PILOT_BYTES + worker_bytes + recycle_bytes
+    from ghost_backend.twod.assembly.polynomial_pair import retained_bytes as polynomial_retained_bytes
+    polynomial_bytes=polynomial_retained_bytes('compressed')
+    overhead = 128*MIB + 6144*n + count*4096 + tile_metadata + moment_cache + PILOT_BYTES + worker_bytes + recycle_bytes + polynomial_bytes
 
     from ghost_backend.twod.operators import _ASSEMBLY_TILE
     from ghost_backend.execution.options import option
@@ -204,7 +206,8 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
 
 
         kernel_work = max(kernel_work,312*min(n,_ASSEMBLY_TILE)**2)
-    assembly_work = 64*MIB + max(1,threads)*kernel_work + 16*512*min(n,1024)
+    # Reciprocal traversal keeps at most two directional tile destinations.
+    assembly_work = 96*MIB + max(1,threads)*kernel_work + 16*512*min(n,1024)
 
 
     from ghost_backend.twod.assembly.kernels import PROJECTION_CACHE_BYTES
@@ -220,6 +223,7 @@ def forecast(n, d, count, batch, threads, storage_limit, resources=None, safety=
         projection_cache_bytes=PROJECTION_CACHE_BYTES,
         retained_worker_allowance_bytes=worker_bytes,
         frequency_preconditioner_cache_bytes=recycle_bytes,
+        retained_polynomial_operator_bytes=polynomial_bytes,
         moment_cache_bytes=moment_cache,
         assembly_workspace_bytes=int(assembly_work),
         tile_metadata_bytes=int(tile_metadata),

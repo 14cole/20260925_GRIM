@@ -75,7 +75,7 @@ class AdaptivePolynomialTests(unittest.TestCase):
         self.assertTrue(all(step['backend_selection'] for step in steps))
 
     def test_admitted_whole_request_backend_preference_is_retained(self):
-        def prefer_compressed(selection, key, batch=False):
+        def prefer_compressed(selection, key, batch=False, entries=None):
             self.assertIn('compressed', selection['candidates'])
             return dict(selection, selected='compressed', retry_order=['dense'])
         with patch('ghost_backend.execution.timing_history.adjust', prefer_compressed):
@@ -107,7 +107,8 @@ class AdaptivePolynomialTests(unittest.TestCase):
                 seen.append(fine['metadata']['panel_count'])
                 raise ValueError('Certified 2-D mesh convergence failed: injected unresolved field error')
             return real_finish(base, fine, policy)
-        with patch.object(s, '_finish_certified_2d_pair', finish):
+        with patch.object(s, '_finish_certified_2d_pair', finish), \
+                patch('ghost_backend.twod.adaptive_geometry.initial_coarsening', return_value=4.):
             result = s.solve_monostatic_rcs_2d_certified(snapshot, [1.], [0.,67.], geometry_units='meters',
                 execution_options=dict(mesh_strategy='adaptive', factorization='dense'))
         self.assertEqual(len(seen), 3)
@@ -121,6 +122,140 @@ class AdaptivePolynomialTests(unittest.TestCase):
             execution_options=dict(mesh_strategy='adaptive', factorization='dense'))
         self.assertFalse(result['metadata']['adaptive_mesh']['used'])
         self.assertEqual(result['metadata']['polynomial_degree'],1)
+
+    def test_aggressive_policy_requires_resolved_wavelength_requests(self):
+        from ghost_backend.twod.adaptive_geometry import initial_coarsening, predicted_hp_size
+        from ghost_backend.twod.constants import DEFAULT_PANELS_PER_WAVELENGTH
+        shape = wavelength_fixture()
+        for density in (0, -20, -100):
+            shape['segments'][0]['properties'][1] = str(density)
+            expected = 8. if density or DEFAULT_PANELS_PER_WAVELENGTH >= 20 else 4.
+            self.assertEqual(initial_coarsening(shape), expected)
+        for density in (-1, -4, -8, -19, 24):
+            shape['segments'][0]['properties'][1] = str(density)
+            self.assertEqual(initial_coarsening(shape), 4.)
+        other = copy.deepcopy(shape['segments'][0])
+        shape['segments'][0]['properties'][1] = '-20'
+        shape['segments'].append(other)  # Explicit counts are left alone.
+        self.assertEqual(initial_coarsening(shape), 8.)
+        other['properties'][1] = '-8'
+        self.assertEqual(initial_coarsening(shape), 4.)
+        self.assertEqual(predicted_hp_size([(80,False),(9,True)],8.), (89,19))
+
+    def test_aggressive_convergence_rejection_retries_conservative_controller_once(self):
+        from ghost_backend.twod import adaptivity
+        from ghost_backend.execution.options import option
+        calls = []
+        comparisons = []
+        def low_level(**kwargs):
+            calls.append((kwargs['geometry_snapshot']['_2d_hp_coarsening'], option('basis_order')))
+            return {'metadata': {'panel_count': 16, 'linear_node_count': 48}}
+        def finish(base, fine, policy):
+            comparisons.append(policy)
+            if len(comparisons) <= 3:
+                raise ValueError('Certified 2-D mesh convergence failed: injected unresolved field error')
+            return fine
+        options = validate_options(dict(mesh_strategy='adaptive', factorization='dense'))
+        with execution_scope(options), patch.object(s, '_finish_certified_2d_pair', finish):
+            result = adaptivity.run_certified(low_level, wavelength_fixture(),
+                dict(frequencies_ghz=[1.], elevations_deg=[0.], geometry_units='meters'), None, None)
+        self.assertEqual([degree for _,degree in calls], [2,3,3,3,2,3])
+        np.testing.assert_allclose([coarse for coarse,_ in calls], [8.,8.,8/1.5,8/1.5**2,4.,4.])
+        evidence = result['metadata']['adaptive_mesh']
+        self.assertEqual(len(evidence['steps']), 6)
+        np.testing.assert_allclose([step['coarsening'] for step in evidence['steps']],
+                                   [coarse for coarse,_ in calls])
+        self.assertFalse(evidence['fallback'])
+        self.assertEqual(evidence['conservative_retry']['completed_steps'], 4)
+        self.assertGreaterEqual(evidence['elapsed_seconds'], evidence['conservative_retry']['seconds'])
+        self.assertTrue(all(policy['complex_max_limit'] <= .002 for policy in comparisons))
+
+    def test_ineligible_conservative_retry_readmits_the_reference_pair(self):
+        from ghost_backend.twod import adaptivity
+        from ghost_backend.execution.options import option
+        options = validate_options(dict(mesh_strategy='adaptive', factorization='dense'))
+        def reference(*args):
+            self.assertEqual(option('factorization'), 'compressed')
+            self.assertEqual(option('mesh_strategy'), 'global')
+            return {'metadata': {}}
+        low_level = unittest.mock.Mock(side_effect=ValueError('Quality gate failed: injected condition rejection'))
+        with execution_scope(options), \
+                patch('ghost_backend.twod.adaptive_geometry.eligible_snapshot',
+                      side_effect=[(True,''),(False,'Drawn primitives limit coarsening')]), \
+                patch.object(adaptivity, 'automatic_backend_requested', return_value=True), \
+                patch('ghost_backend.execution.selection.select_backend',
+                      side_effect=[{'selected':'dense','retry_order':[]},
+                                   {'selected':'compressed','retry_order':[]}]) as select, \
+                patch.object(s, '_run_certified_2d_pair_impl', side_effect=reference) as solve_reference:
+            result = adaptivity.run_certified(low_level, wavelength_fixture(),
+                dict(frequencies_ghz=[1.], elevations_deg=[0.], geometry_units='meters'), None, None)
+        self.assertEqual(low_level.call_count, 1)
+        self.assertEqual(solve_reference.call_count, 1)
+        self.assertTrue(select.call_args.kwargs['certified'])
+        evidence = result['metadata']['adaptive_mesh']
+        self.assertFalse(evidence['used'])
+        self.assertTrue(evidence['fallback'])
+        self.assertEqual(evidence['final_backend'], 'compressed')
+        self.assertEqual(evidence['conservative_retry']['to_coarsening'], 4.)
+
+    def test_cancellation_and_unrelated_errors_do_not_trigger_conservative_retry(self):
+        from ghost_backend.twod import adaptivity
+        options = validate_options(dict(mesh_strategy='adaptive', factorization='dense'))
+        for failure in (InterruptedError('cancelled'), ValueError('unrelated invalid input')):
+            with execution_scope(options):
+                with self.assertRaises(type(failure)), patch.object(s, '_finish_certified_2d_pair') as finish:
+                    low_level = unittest.mock.Mock(side_effect=failure)
+                    adaptivity.run_certified(low_level, wavelength_fixture(),
+                        dict(frequencies_ghz=[1.], elevations_deg=[0.], geometry_units='meters'), None, None)
+                self.assertEqual(low_level.call_count, 1)
+                finish.assert_not_called()
+
+    def test_known_numerical_failures_retry_only_the_aggressive_candidate(self):
+        from ghost_backend.twod import adaptivity
+        from ghost_backend.execution.errors import BackendNumericalError
+        options = validate_options(dict(mesh_strategy='adaptive', factorization='dense'))
+        for failure_type in (BackendNumericalError, np.linalg.LinAlgError):
+            calls = []
+            def low_level(**kwargs):
+                coarsening = kwargs['geometry_snapshot']['_2d_hp_coarsening']
+                calls.append(coarsening)
+                if coarsening > 4.:
+                    raise failure_type('injected numerical rejection')
+                return {'metadata': {'panel_count': 16, 'linear_node_count': 48}}
+            with execution_scope(options), \
+                    patch.object(s, '_finish_certified_2d_pair', side_effect=lambda base,fine,policy: fine):
+                result = adaptivity.run_certified(low_level, wavelength_fixture(),
+                    dict(frequencies_ghz=[1.], elevations_deg=[0.], geometry_units='meters'), None, None)
+            self.assertEqual(calls, [8.,4.,4.])
+            self.assertIn('numerical failure', result['metadata']['adaptive_mesh']['conservative_retry']['reason'])
+            with execution_scope(options), \
+                    patch('ghost_backend.twod.adaptive_geometry.initial_coarsening', return_value=4.), \
+                    patch.object(s, '_finish_certified_2d_pair') as finish:
+                failing = unittest.mock.Mock(side_effect=failure_type('original failure'))
+                with self.assertRaises(failure_type):
+                    adaptivity.run_certified(failing, wavelength_fixture(),
+                        dict(frequencies_ghz=[1.], elevations_deg=[0.], geometry_units='meters'), None, None)
+                self.assertEqual(failing.call_count, 1)
+                finish.assert_not_called()
+
+    def test_mixed_high_frequency_keeps_previously_successful_conservative_path(self):
+        shape = wavelength_fixture('mixed')
+        for segment in shape['segments']: segment['properties'][1] = '-20'
+        args = dict(geometry_snapshot=shape, frequencies_ghz=[30.],
+            elevations_deg=np.arange(0.,360.,20.), geometry_units='meters', solver_method='experimental_cpu',
+            execution_options=dict(mesh_strategy='adaptive', factorization='dense', assembly_threads=1, blas_threads=1))
+        with patch('ghost_backend.twod.adaptive_geometry.initial_coarsening', return_value=4.):
+            reference = s.solve_monostatic_rcs_2d_certified(**args)
+        result = s.solve_monostatic_rcs_2d_certified(**args)
+        evidence = result['metadata']['adaptive_mesh']
+        self.assertTrue(result['metadata']['mesh_convergence_certified'])
+        self.assertTrue(result['metadata']['quality_gate']['passed'])
+        self.assertFalse(evidence['fallback'])
+        self.assertEqual(evidence['conservative_retry']['to_coarsening'], 4.)
+        self.assertIn('Quality gate failed:', evidence['conservative_retry']['reason'])
+        for pol in ('VV','HH'):
+            field = lambda r: np.array([complex(x['rcs_amp_real'],x['rcs_amp_imag']) for x in r['co_solved_samples'][pol]])
+            np.testing.assert_allclose(field(result),field(reference),rtol=2e-10,atol=2e-12)
 
 
 if __name__ == '__main__': unittest.main()

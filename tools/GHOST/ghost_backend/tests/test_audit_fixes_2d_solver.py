@@ -314,11 +314,18 @@ class KernelTablePathTests(unittest.TestCase):
             self.assertLess(relative(value(actual), value(expected)), 1e-10)
         self.assertIsNone(cpu.current_state())
 
-    def test_plain_api_keeps_diagnostic_thread_defaults(self):
+    def test_plain_api_uses_host_threads_like_the_automatic_profile(self):
+        # October 2026: a bare automatic request resolves its threads on the
+        # host (physical cores), as the GUI and batch profiles do; an explicit
+        # GHOST_ASSEMBLY_THREADS launch override still pins the count.
+        from ghost_backend.execution.options import host_assembly_threads
         with mock.patch.dict(os.environ, {'GHOST_ASSEMBLY_THREADS': ''}):
             result = rcs.solve_monostatic_rcs_2d(mixed_body(), [3.0], [0.0], geometry_units='meters')
-        self.assertEqual(result['metadata']['execution_threads']['assembly'], 1)
+        self.assertEqual(result['metadata']['execution_threads']['assembly'], host_assembly_threads())
         self.assertEqual(result['metadata']['solver_method_requested'], 'auto')
+        with mock.patch.dict(os.environ, {'GHOST_ASSEMBLY_THREADS': '1'}):
+            pinned = rcs.solve_monostatic_rcs_2d(mixed_body(), [3.0], [0.0], geometry_units='meters')
+        self.assertEqual(pinned['metadata']['execution_threads']['assembly'], 1)
 
 
 class ConditionEstimateTests(unittest.TestCase):

@@ -9,6 +9,7 @@ import platform
 import posixpath
 import sys
 import tempfile
+import threading
 from typing import Any, Dict, List, Sequence
 
 
@@ -55,13 +56,44 @@ def sha256_file(path: 'str') -> 'str':
     return digest.hexdigest()
 
 
+_SOURCE_DIGESTS = {}
+_SOURCE_DIGEST_LOCK = threading.Lock()
+
+
+def source_file_digest(path: 'str') -> 'str':
+    """``sha256_file`` of a backend source file, memoized on (path, size, mtime_ns).
+
+    The source bundle (178 files, 4.4 MB) is hashed by the provenance
+    manifest, the timing-history key and the checkpoint identity of every
+    public call; one process re-reads it only when a file's stat changes.
+    Output artifacts are never memoized (``sha256_file``).
+    """
+
+    path = os.path.abspath(path)
+    try:
+        status = os.stat(path)
+    except OSError:
+        return sha256_file(path)
+    key = (path, int(status.st_size), int(status.st_mtime_ns))
+    with _SOURCE_DIGEST_LOCK:
+        cached = _SOURCE_DIGESTS.get(key)
+    if cached is not None:
+        return cached
+    digest = sha256_file(path)
+    with _SOURCE_DIGEST_LOCK:
+        if len(_SOURCE_DIGESTS) >= 4096:
+            _SOURCE_DIGESTS.clear()
+        _SOURCE_DIGESTS[key] = digest
+    return digest
+
+
 def source_bundle_fingerprint(records: 'Dict[str, str]') -> 'str':
     """Hash logical source names and exact bytes, independent of location."""
 
     payload = [
         {
             "path": str(logical_name),
-            "sha256": sha256_file(os.path.abspath(path)),
+            "sha256": source_file_digest(path),
         }
         for logical_name, path in sorted(records.items())
     ]
@@ -103,7 +135,7 @@ def backend_source_inventory(
     """
 
     return {
-        name: sha256_file(os.path.abspath(path))
+        name: source_file_digest(path)
         for name, path in sorted(backend_source_records(
             backend_dir, extra_records
         ).items())

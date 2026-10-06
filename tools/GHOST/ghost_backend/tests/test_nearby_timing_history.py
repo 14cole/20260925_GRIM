@@ -106,12 +106,14 @@ def test_exact_history_still_overrides_nearby_and_worker_ram_is_preserved():
 @pytest.mark.parametrize('failure', [
     dict(backend_selection=dict(failed_attempts=[dict(backend='compressed')])),
     dict(adaptive_mesh=dict(fallback=True)),
+    dict(adaptive_mesh=dict(fallback=False, conservative_retry=dict(from_coarsening=8., to_coarsening=4.))),
     dict(dense_fallback_reasons=['hierarchical solve rejected']),
     dict(compressed_factors=[dict(coarse_rejection='stalled')]),
     dict(hierarchical_factors=[dict(builds=2)]),
     dict(hierarchical_factors=dict(VV=[dict(coarse_rejection='rank')],HH=[])),
     dict(channel_metadata=dict(VV=dict(compressed_factors=[dict(compact_preconditioner='RAM')]))),
     dict(frequency_metadata=[dict(metadata=dict(backend_selection=dict(failed_attempts=[{}])))]),
+    dict(frequency_metadata=[dict(metadata={'adaptive_mesh': {'conservative_retry': {'reason': 'quality'}}})]),
 ])
 def test_retried_or_fallback_runs_never_train(failure):
     metadata=dict(quality_gate=dict(passed=True),dense_largest_system=1000,**failure)
@@ -153,3 +155,19 @@ def test_exact_timing_identity_includes_inherited_fixed_mesh_frequencies():
         second=history.request_key(args,validate_options({}),'solve_monostatic_rcs_2d')
     assert first!=second
     assert first.nearby['family']!=second.nearby['family']
+
+
+@pytest.mark.parametrize('kind', ['exact', 'nearby', 'absent'])
+def test_one_snapshot_preserves_exact_nearby_and_uncalibrated_rankings(kind):
+    if kind != 'absent':
+        train(key('source'))
+    request = key('source') if kind == 'exact' else key('target', 1.01)
+    expected = history.adjust(choice(1010), request)
+    entries = history.read()
+    # A later cache change must not split one decision across different data.
+    with mock.patch.object(history, 'read', side_effect=[entries, {}]) as read:
+        actual = history.adjust(choice(1010), request)
+    read.assert_called_once_with()
+    assert actual == expected
+    assert actual['selected'] == ('dense' if kind == 'absent' else 'compressed')
+    assert actual['candidates']['dense']['peak_gb'] == 4.

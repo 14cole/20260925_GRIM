@@ -107,8 +107,9 @@ _MEMORY_HEADROOM = 0.75
 _MEMORY_SAFETY = 1.35
 _MAX_PANELS = 100_000
 # Pool workers are replaced after this many units so allocator growth from a
-# big solve cannot accumulate across a long sweep.
-_TASKS_PER_CHILD = 4
+# big solve cannot accumulate across a long sweep (a respawn costs about half
+# a second of imports and cold hashing, 60 ms per unit at this interval).
+_TASKS_PER_CHILD = 8
 _GEOMETRY_EXTS = (".geo",)
 
 MANIFEST_SCHEMA = "ghost.local.2d-run.v3"

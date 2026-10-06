@@ -2,7 +2,8 @@
 
 Expressions preserve block signs, material weights and sparse pole/junction
 constraints while deferring coefficient evaluation until a tile is requested.
-No full nodal far block or assembled modal matrix is created on this path.
+An optional bounded cache supplies exact nodal far coefficients; the modal
+system itself is still assembled directly into compressed tile storage.
 """
 import math
 import numpy as np
@@ -63,13 +64,32 @@ class TileExpression:
         col_lookup = {int(value): i for i, value in enumerate(cols)}
         # Immutable snapshots make block += safe, including repeated regional terms.
         def query(r, c):
-            out = old(r, c)
             ri = [i for i, value in enumerate(r) if int(value) in row_lookup]
             ci = [i for i, value in enumerate(c) if int(value) in col_lookup]
+            if not ri or not ci:
+                return old(r, c)
             rr = np.array([row_lookup[int(r[i])] for i in ri], dtype=np.intp)
             cc = np.array([col_lookup[int(c[i])] for i in ci], dtype=np.intp)
-            if len(ri) and len(ci):
-                out[np.ix_(ri, ci)] = new(rr, cc)
+            replacement = new(rr, cc)
+            if len(ri) == len(r) and len(ci) == len(c):
+                # Coefficient providers may return cached storage. Assignment
+                # queries must own their result just as the partial path does.
+                return replacement.copy()
+            # Query only the two disjoint rectangles that survive assignment.
+            # In particular, += already includes the old block in ``new``;
+            # evaluating the overwritten rectangle again duplicates its work.
+            other_rows = np.flatnonzero(~np.isin(np.arange(len(r)), ri))
+            other_cols = np.flatnonzero(~np.isin(np.arange(len(c)), ci))
+            pieces = []
+            if len(other_rows):
+                pieces.append((other_rows, np.arange(len(c)), old(r[other_rows], c)))
+            if len(other_cols):
+                pieces.append((ri, other_cols, old(r[ri], c[other_cols])))
+            out = np.empty((len(r), len(c)), dtype=np.result_type(
+                replacement, *(piece[2] for piece in pieces)))
+            out[np.ix_(ri, ci)] = replacement
+            for pr, pc, values in pieces:
+                out[np.ix_(pr, pc)] = values
             return out
         self._query = query
 
@@ -203,7 +223,9 @@ class Primitive:
     def query(self, rows, cols):
         # Chunk the nodal contraction as well as the angular FFT workspace.
         out = np.zeros((len(rows), len(cols)), complex)
-        if self.tile_cache is not None and self.tile_cache.budget:
+        stream = None if self.cross else getattr(self.owner, '_stream', None)
+        streamed = stream is not None and hasattr(stream, 'query_blocks')
+        if not streamed and self.tile_cache is not None and self.tile_cache.budget:
             # Canonical nodal tiles are reused across t/phi field families,
             # matrix tiles and sparse constraint routes within this mode.
             width = max(1, min(4, int(math.sqrt(8e6 / (64.*(2*self.mm+3))) /
@@ -226,8 +248,10 @@ class Primitive:
                     out[np.ix_(ri, ci)] = blocks[field, (r % self.sp.Nn-rn[0])[:, None],
                                                  (c % self.sq.Nn-cn[0])[None, :]]
             return out
-        width = max(1, min(8, int(math.sqrt(8e6 / (64.*(2*self.mm+3))) /
-                                  (2*max(self.sp.gauss_order, self.sq.gauss_order)))))
+        # Retained nodal coefficients need no Gauss-pair/angular workspace.
+        # Bypass the tiny canonical integration tiles and their duplicate cache.
+        width = (128 if streamed else max(1, min(8, int(math.sqrt(8e6 / (64.*(2*self.mm+3))) /
+                                  (2*max(self.sp.gauss_order, self.sq.gauss_order))))))
         for i in range(0, len(rows), width):
             for j in range(0, len(cols), width):
                 self.checkpoint()
@@ -248,52 +272,57 @@ class Primitive:
         if key == self.cache_key:
             return self.cache
         sp, sq, owner = self.sp, self.sq, self.owner
-        ip, tp, dp = support(sp, rows)
-        iq, tq, dq = support(sq, cols)
-        gp, gq = sp.g, sq.g
-        ep, eq = gp.elem[ip], gq.elem[iq]
-        near = np.zeros((len(ip), len(iq)), bool)
-        pairs = owner.near_set if self.cross else None
-        for e in np.unique(ep):
-            fs = [f for f in np.unique(eq) if ((int(e), int(f)) in pairs if self.cross
-                    else int(f) in owner._near_sources_by_element[int(e)])]
-            near[np.ix_(ep == e, np.isin(eq, fs))] = True
-        gap = owner._far_gap if self.cross else owner._far_gap()
-        rho = max(float(np.max(gp.rho)), float(np.max(gq.rho)))
-        bracket = self.kind != 'T'
-        nx = n_xi_for_pairs(owner.k, rho, self.mm, gap, bracket=bracket)
-        args = (gp.rho[ip, None], gp.z[ip, None], gp.trho[ip, None], gp.tz[ip, None],
-                gq.rho[None, iq], gq.z[None, iq], gq.trho[None, iq], gq.tz[None, iq])
-        # Use the exact production angular rule, retaining only this mode.
-        if not bracket:
-            if kernels.BANDED_FFT:
-                am = abs(self.m)
-                table = kernels.banded_modal_kernels('g',
-                    (args[0], args[1], args[4], args[5]), owner.k, self.mm,
-                    near, [am, abs(am-1), am+1])
-                gs = (table[..., 0], (table[..., 1]+table[..., 2])*.5,
-                      (table[..., 1]-table[..., 2])/(2j) * (-1 if self.m < 0 else 1))
-            else:
-                table = modal_kernels_fft(args[0], args[1], args[4], args[5],
-                    owner.k, abs(self.m), n_xi=nx, near_mask=near)
-                gs = kernels_for_mode(table, self.m)
-            blocks = list(_pair_blocks(self.m, owner.k,
-                gp.rho[ip], gp.trho[ip], gp.tz[ip], tp, dp, gp.w[ip],
-                gq.rho[iq], gq.trho[iq], gq.tz[iq], tq, dq, gq.w[iq], *gs))
+        stream = None if self.cross else getattr(owner, '_stream', None)
+        if stream is not None and hasattr(stream, 'query_blocks'):
+            family = 'efie' if self.kind == 'T' else ('mfie' if self.kind == 'K' else 'ibc')
+            blocks = stream.query_blocks(family, self.m, rows, cols)
         else:
-            fn = mfie_kernels_fft if self.kind == 'K' else ibc_kernels_fft
-            inputs = args if self.kind == 'K' else tuple(a.ravel() for a in args)
-            tables = (kernels.banded_modal_kernels('mfie' if self.kind == 'K' else 'ibc',
-                args, owner.k, self.mm, near, [self.m]) if kernels.BANDED_FFT else
-                fn(*inputs, owner.k, abs(self.m), n_xi=nx, near_mask=near))
-            wp, wq = gp.w[ip]*gp.rho[ip], gq.w[iq]*gq.rho[iq]
-            if self.weight is not None:
-                wq = wq*self.weight[iq]
-            blocks = []
-            for table in tables:
-                value = table[..., 0 if kernels.BANDED_FFT else self.m+abs(self.m)].copy()
-                value[near] = 0.
-                blocks.append(2*np.pi*(tp*wp) @ value @ (tq*wq).T)
+            ip, tp, dp = support(sp, rows)
+            iq, tq, dq = support(sq, cols)
+            gp, gq = sp.g, sq.g
+            ep, eq = gp.elem[ip], gq.elem[iq]
+            near = np.zeros((len(ip), len(iq)), bool)
+            pairs = owner.near_set if self.cross else None
+            for e in np.unique(ep):
+                fs = [f for f in np.unique(eq) if ((int(e), int(f)) in pairs if self.cross
+                        else int(f) in owner._near_sources_by_element[int(e)])]
+                near[np.ix_(ep == e, np.isin(eq, fs))] = True
+            gap = owner._far_gap if self.cross else owner._far_gap()
+            rho = max(float(np.max(gp.rho)), float(np.max(gq.rho)))
+            bracket = self.kind != 'T'
+            nx = n_xi_for_pairs(owner.k, rho, self.mm, gap, bracket=bracket)
+            args = (gp.rho[ip, None], gp.z[ip, None], gp.trho[ip, None], gp.tz[ip, None],
+                    gq.rho[None, iq], gq.z[None, iq], gq.trho[None, iq], gq.tz[None, iq])
+            # Use the exact production angular rule, retaining only this mode.
+            if not bracket:
+                if kernels.BANDED_FFT:
+                    am = abs(self.m)
+                    table = kernels.banded_modal_kernels('g',
+                        (args[0], args[1], args[4], args[5]), owner.k, self.mm,
+                        near, [am, abs(am-1), am+1])
+                    gs = (table[..., 0], (table[..., 1]+table[..., 2])*.5,
+                          (table[..., 1]-table[..., 2])/(2j) * (-1 if self.m < 0 else 1))
+                else:
+                    table = modal_kernels_fft(args[0], args[1], args[4], args[5],
+                        owner.k, abs(self.m), n_xi=nx, near_mask=near)
+                    gs = kernels_for_mode(table, self.m)
+                blocks = list(_pair_blocks(self.m, owner.k,
+                    gp.rho[ip], gp.trho[ip], gp.tz[ip], tp, dp, gp.w[ip],
+                    gq.rho[iq], gq.trho[iq], gq.tz[iq], tq, dq, gq.w[iq], *gs))
+            else:
+                fn = mfie_kernels_fft if self.kind == 'K' else ibc_kernels_fft
+                inputs = args if self.kind == 'K' else tuple(a.ravel() for a in args)
+                tables = (kernels.banded_modal_kernels('mfie' if self.kind == 'K' else 'ibc',
+                    args, owner.k, self.mm, near, [self.m]) if kernels.BANDED_FFT else
+                    fn(*inputs, owner.k, abs(self.m), n_xi=nx, near_mask=near))
+                wp, wq = gp.w[ip]*gp.rho[ip], gq.w[iq]*gq.rho[iq]
+                if self.weight is not None:
+                    wq = wq*self.weight[iq]
+                blocks = []
+                for table in tables:
+                    value = table[..., 0 if kernels.BANDED_FFT else self.m+abs(self.m)].copy()
+                    value[near] = 0.
+                    blocks.append(2*np.pi*(tp*wp) @ value @ (tq*wq).T)
         near_kind = 'efie' if self.kind == 'T' else ('mfie' if self.kind == 'K' else 'ibc')
         rmap, cmap = {int(r): i for i, r in enumerate(rows)}, {int(c): i for i, c in enumerate(cols)}
         if self.cross:

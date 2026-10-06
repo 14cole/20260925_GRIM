@@ -84,7 +84,9 @@ def test_work_scaling_uses_independent_successful_backend_samples_across_half_gh
     train('dense',request('dense-at-10',10.),scale=1.)
     train('compressed',request('compressed-at-10.1',10.1),scale=.35)
     # The original 2% proximity heuristic cannot transfer this 5% frequency step.
-    revised=history.adjust(selection(1050),request('target',10.5))
+    with mock.patch.object(history, 'read', wraps=history.read) as read:
+        revised=history.adjust(selection(1050),request('target',10.5))
+    read.assert_called_once_with()
     assert revised['selected']=='compressed'
     assert revised['timing_model']=='matched_stage_rates_v1'
     evidence=revised['stage_timing_evidence']['predictions']

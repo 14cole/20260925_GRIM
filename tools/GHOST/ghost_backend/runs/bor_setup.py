@@ -1,6 +1,7 @@
 """Portable BOR physics settings, with explicit aspect-angle semantics."""
 import math
 from ghost_backend.bor.options import option_scope, validate_options
+from ghost_backend.twod.preparation import preparation_scope
 
 
 def validate_bor_setup(value):
@@ -71,11 +72,12 @@ def driver_settings(value):
                 BOR_EXECUTION_OPTIONS=value['bor_options'])
 
 
-def resource_summary(snapshot, base_dir, value, checkpoint=None):
+@preparation_scope()
+def resource_summary(snapshot, base_dir, value, checkpoint=None, forecast_frequencies=None):
     import os
     from ghost_backend.bor.dispatch import estimate_bor_resources, resolve_automatic_plan
     from ghost_backend.runs.quality import accuracy_target_policy
-    from ghost_backend.runs.setup import geometry_dimensions
+    from ghost_backend.runs.setup import geometry_dimensions, validate_material_coverage
     value = validate_bor_setup(value)
     from ghost_backend.assembly.fields import bor_output_profile
     bor_output_profile(snapshot, value["units"])
@@ -84,14 +86,22 @@ def resource_summary(snapshot, base_dir, value, checkpoint=None):
     workers = max(1, (os.cpu_count() or 2)-1)
     if checkpoint is not None:
         checkpoint()
+    frequencies = (value['frequencies_ghz'] if forecast_frequencies is None
+                   else list(forecast_frequencies))
+    if forecast_frequencies is not None:
+        # Cached fields remove the need for a numerical resource forecast,
+        # but input validation still covers the entire requested sweep.
+        from ghost_backend.twod.preparation import prepare_geometry
+        _, _, library, _ = prepare_geometry(snapshot, base_dir, value['units'])
+        validate_material_coverage(snapshot, library, value['frequencies_ghz'], checkpoint)
     assembly = {}
-    if options['factorization'] == 'auto':
+    if frequencies and options['factorization'] == 'auto':
         # The same plan as the solve: backend, and streamed far blocks when it imposes
         # them. The resolver prices under the active options (they size the aspect
         # batches), so scope the caller's, as `configured` does for a public call.
         with option_scope(dict(options)):
             chosen, imposed = resolve_automatic_plan(dict(
-                geometry_snapshot=snapshot, frequencies_ghz=value['frequencies_ghz'],
+                geometry_snapshot=snapshot, frequencies_ghz=frequencies,
                 elevations_deg=value['aspects_deg'], geometry_units=value['units'],
                 material_base_dir=base_dir, workers=workers,
                 mesh_certification=value['mesh_certification'], fine_factor=policy['fine_factor'],
@@ -101,7 +111,7 @@ def resource_summary(snapshot, base_dir, value, checkpoint=None):
             assembly = dict(assembly=imposed)
     peak, elements = 0., 0
     mode_workers = set()
-    for frequency in value['frequencies_ghz']:
+    for frequency in frequencies:
         if checkpoint is not None:
             checkpoint()
         estimate = estimate_bor_resources(snapshot, frequency, value['aspects_deg'],
@@ -113,14 +123,18 @@ def resource_summary(snapshot, base_dir, value, checkpoint=None):
         peak = max(peak, estimate['estimated_peak_gb'])
         elements = max(elements, estimate['mesh_elements'])
         mode_workers.add(estimate['active_mode_workers'])
-    worker_note = (str(min(mode_workers)) if len(mode_workers) == 1
-                   else '{}\u2013{}'.format(min(mode_workers), max(mode_workers)))
+    worker_note = (str(min(mode_workers)) if len(mode_workers) == 1 else
+                   '{}\u2013{}'.format(min(mode_workers), max(mode_workers)) if mode_workers else '')
     backend_note = options['factorization'] + (' (streamed far blocks)' if assembly else '')
-    if value['bor_options']['factorization'] == 'auto':
+    if frequencies and value['bor_options']['factorization'] == 'auto':
         backend_note = 'auto \u2192 ' + backend_note
     grid = value['radar_grid']
     grid_note = ("Output: {} azimuths \u00d7 {} elevations; radar VV, HH and VH.\n".format(
         len(grid['azimuths_deg']), len(grid['elevations_deg'])) if grid is not None else '')
+    resource_note = ('Up to {} mesh elements; estimated peak {:.2f} GB with {} simultaneous mode workers (memory limited). '.format(elements, peak, worker_note)
+        + 'This is an allocation forecast, not measured RAM. Numerical quality and convergence are checked during the solve.'
+        if frequencies else 'Matching checkpoints found for every frequency; no new solve forecast needed. '
+        + 'Checkpoint integrity is verified again when loading the results.')
     return ('BOR geometry and material checks passed. ' + geometry_dimensions(snapshot, value['units']) + '\n'
         + '{} frequencies; {} aspects from +z; VV + HH. '.format(len(value['frequencies_ghz']), len(value['aspects_deg']))
         + ('Base/fine mesh comparison' if value['mesh_certification'] else 'Survey; no mesh certificate')
@@ -128,5 +142,4 @@ def resource_summary(snapshot, base_dir, value, checkpoint=None):
         + grid_note
         + '{} factorization; {} aspects per batch; {} incident basis reuse.\n'.format(
             backend_note, options['angle_batch_size'], options['rhs_compression'])
-        + 'Up to {} mesh elements; estimated peak {:.2f} GB with {} simultaneous mode workers (memory limited). '.format(elements, peak, worker_note)
-        + 'This is an allocation forecast, not measured RAM. Numerical quality and convergence are checked during the solve.')
+        + resource_note)

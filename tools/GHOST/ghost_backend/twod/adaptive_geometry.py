@@ -85,7 +85,8 @@ def panel_parameters(snapshot, segment, a, b, base_count, fixed_count, refinemen
     return key, points
 
 
-def eligible_snapshot(snapshot, materials, frequencies=None, scale=1., mesh_reference=None):
+def eligible_snapshot(snapshot, materials, frequencies=None, scale=1., mesh_reference=None,
+                      coarsening=None):
     from ghost_backend.twod.formulations.thin_layer import ThinLayerDefinition
     from ghost_backend.twod.geometry import ImpedanceTaper
     if any(isinstance(value, ThinLayerDefinition) for value in materials.impedance_models.values()):
@@ -110,7 +111,8 @@ def eligible_snapshot(snapshot, materials, frequencies=None, scale=1., mesh_refe
             wavelength = (_conservative_mesh_wavelength_for_frequencies(snapshot, materials, served)[0]
                           if mesh_reference else _mesh_wavelength_for_snapshot(snapshot, materials, frequency)[0])
             sizes.append(predicted_hp_size(
-                _reference_panel_counts(snapshot, scale, wavelength, materials, served)))
+                _reference_panel_counts(snapshot, scale, wavelength, materials, served),
+                initial_coarsening(snapshot) if coarsening is None else coarsening))
         reference, elements = max(sizes, default=(0, 0))
         if reference < MIN_AUTOMATIC_REFERENCE_PANELS:
             return False, 'Small reference mesh retains linear basis to avoid polynomial quadrature overhead.'
@@ -124,6 +126,8 @@ def eligible_snapshot(snapshot, materials, frequencies=None, scale=1., mesh_refe
 # The hp candidate coarsens wavelength-sized counts by this factor, but never
 # below one element per drawn primitive; the accuracy check runs at this degree.
 HP_COARSENING = 4.
+HP_RESOLVED_COARSENING = 8.
+HP_RESOLVED_MIN_PANELS_PER_WAVELENGTH = 20
 HP_CHECK_DEGREE = 3
 # The cubic candidate may have at most this multiple of the P1 reference
 # unknowns (at most one element per two reference panels; the P2/P3 LU flops
@@ -133,10 +137,31 @@ HP_CHECK_DEGREE = 3
 HP_MAX_DOF_FRACTION = 1.5
 
 
-def predicted_hp_size(counts):
+def initial_coarsening(snapshot):
+    """Spend less on the first candidate only for adequately sampled inputs.
+
+    Total panel count alone does not establish wavelength resolution: a large
+    sparse request can pass the size gate and still alias both polynomial
+    candidates. Explicit counts are never coarsened. Failed aggressive
+    candidates retry the existing factor-four controller before P1 fallback.
+    """
+    from ghost_backend.twod.constants import DEFAULT_PANELS_PER_WAVELENGTH
+    from ghost_backend.twod.geometry import _segment_mesh_flags
+    densities = []
+    for segment in snapshot.get('segments', []):
+        count = _segment_mesh_flags(segment)[1]
+        if count <= 0:
+            densities.append(abs(count) if count else DEFAULT_PANELS_PER_WAVELENGTH)
+    if densities and min(densities) >= HP_RESOLVED_MIN_PANELS_PER_WAVELENGTH:
+        return HP_RESOLVED_COARSENING
+    return HP_COARSENING
+
+
+def predicted_hp_size(counts, coarsening=None):
     """(P1 reference panels, hp elements) for per-primitive (count, explicit) records."""
     reference = sum(count for count, _ in counts)
-    elements = sum(count if explicit else max(1, int(math.ceil(count / HP_COARSENING)))
+    coarsening = HP_COARSENING if coarsening is None else coarsening
+    elements = sum(count if explicit else max(1, int(math.ceil(count / coarsening)))
                    for count, explicit in counts)
     return reference, elements
 
@@ -151,7 +176,7 @@ def candidate_meshes(snapshot, materials, factor, adaptive, frequencies=None, sc
     from ghost_backend.runs.quality import scale_snapshot_panel_density
     if factor > 1 and adaptive and eligible_snapshot(snapshot, materials, frequencies, scale, mesh_reference)[0]:
         candidate = copy.deepcopy(snapshot)
-        candidate['_2d_hp_coarsening'] = HP_COARSENING
+        candidate['_2d_hp_coarsening'] = initial_coarsening(snapshot)
         candidate['_2d_hp_refinements'] = {}
         return [('base', candidate, 2), ('fine', candidate, 3)]
     records = [('base', snapshot, 1)]

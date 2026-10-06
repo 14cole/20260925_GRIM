@@ -53,6 +53,8 @@ from ghost_backend.execution.runtime import ScopedValue
 
 from ghost_backend.bor.tiled import TileExpression, primitive, mass_expression, modal_matrix, modal_block
 from ghost_backend.bor.near_storage import mode_blocks, mode_sign
+from ghost_backend.bor.preparation import prepared_surface as _prepared_surface
+from ghost_backend.bor.preparation import prepared_cross as _prepared_cross
 from ghost_backend.bor.streaming import sampling_backend_name
 
 
@@ -419,7 +421,10 @@ def estimate_bor_total_peak_gb(
         raise ValueError(
             "BoR peak-memory components must be finite and non-negative."
         )
-    raw_peak = assembly_peak + dense_peak
+    from ghost_backend.compressed.recycling import capacity_bytes
+    # Optional inverses from completed frequencies remain live in either
+    # phase. Current modal factors are priced separately above, per worker.
+    raw_peak = assembly_peak + dense_peak + capacity_bytes() / 1.e9
     return max(
         BOR_PEAK_FIXED_MARGIN_GB,
         BOR_PEAK_FIXED_MARGIN_GB + BOR_PEAK_SAFETY_FACTOR * raw_peak,
@@ -552,7 +557,7 @@ def plan_near_preparation(workers, assembly_peak_gb, dense_peak_gb, memory_limit
         process_workers = fit(_NEAR_TASK_SCRATCH_BYTES + PROCESS_OVERHEAD_BYTES)
         if process_workers <= 1:
             process_workers = 0  # Serial preparation runs in the owning interpreter.
-    if process_workers and processes_selected(near_pairs, mode_tasks):
+    if process_workers and processes_selected(near_pairs, mode_tasks, process_workers):
         process_bytes = PROCESS_OVERHEAD_BYTES
         count, worker_bytes = process_workers, _NEAR_TASK_SCRATCH_BYTES + PROCESS_OVERHEAD_BYTES
     return dict(workers=count, scratch_gb=count * worker_bytes / 1.e9,
@@ -572,22 +577,33 @@ def _near_preparation_workers(workers: 'int') -> 'int':
 
 def plan_bor_mode_workers(n_dofs, n_rhs, workers, mode_tasks, assembly_peak_gb,
                           memory_limit_gb=None, near_pairs=None, hierarchical=False,
-                          mirrored=False):
+                          mirrored=False, preparation_workers=None):
     """Treat requested modal concurrency as a ceiling, sharing runtime admission.
 
     Keep the largest worker count within the unit's CPU allocation that fits,
     including near-integration scratch, linear-system workspaces and safety
     margins. If one worker still cannot fit, return that honest minimum so the
-    normal guard rejects before preparation.
+    normal guard rejects before preparation. ``preparation_workers`` preserves
+    the caller's separate near-phase ceiling when a short modal cache band
+    limits simultaneous mode systems; its full scratch is admitted separately.
     """
-    from ghost_backend.execution.options import allocated_cpu_budget
+    from ghost_backend.execution.options import allocated_cpu_budget, physical_core_count
     requested = max(1, int(workers))
+    preparation_requested = requested if preparation_workers is None else max(1, int(preparation_workers))
     cpu_budget = allocated_cpu_budget()
+    if preparation_requested > 1:
+        # The near phase is 64-86% of a conductor solve and its workers are
+        # independent of the mode workers: a parallel request uses the CPU
+        # allocation (the physical cores of a lone solve, the unit's share
+        # under a driver), not the mode-worker count (8 instead of 4 workers
+        # cut near preparation 20-24% on an 8-core host).  A serial request
+        # (workers=1) stays serial.
+        preparation_requested = max(preparation_requested, min(cpu_budget, physical_core_count()))
     limit = _solve_memory_limit_gb() if memory_limit_gb is None else float(memory_limit_gb)
     for count in range(min(requested, cpu_budget, max(1, int(mode_tasks))), 0, -1):
         linear_peak = estimate_bor_dense_peak_gb(n_dofs, n_rhs, count, mode_tasks,
                                                  **_factor_pricing(hierarchical, mirrored))
-        near = plan_near_preparation(requested, assembly_peak_gb, linear_peak, limit,
+        near = plan_near_preparation(preparation_requested, assembly_peak_gb, linear_peak, limit,
                                      near_pairs=near_pairs, mode_tasks=mode_tasks)
         # The preparation phase (retained operators plus near scratch) and the
         # mode phase (retained operators plus linear workspaces) are
@@ -597,6 +613,7 @@ def plan_bor_mode_workers(n_dofs, n_rhs, workers, mode_tasks, assembly_peak_gb,
         if peak <= limit:
             break
     return dict(requested_workers=requested, workers=count, cpu_budget=cpu_budget,
+                requested_preparation_workers=preparation_requested,
                 near_preparation=near,
                 linear_peak_gb=linear_peak, estimated_peak_gb=peak,
                 memory_limit_gb=limit, fits_memory=peak <= limit)
@@ -1104,6 +1121,7 @@ class _AngularChunk:
         th = np.radians(thetas)
         self.st = np.sin(th)[:, None]
         self.ct = np.cos(th)[:, None]
+        self.st[(np.asarray(thetas) == 0.0) | (np.asarray(thetas) == 180.0)] = 0.0
         # Real, as _bessel_triplet takes it (the excitation medium is air).
         u = np.asarray(k * self.st * rho[None, :], dtype=float)
         self.phase = np.exp(1j * k * self.ct * z[None, :])
@@ -1400,7 +1418,11 @@ class BorPecSolver:
         self.close_streaming()
         # A large surface keeps its far blocks compressed (all modes, in RAM):
         # the planners price that store through the same estimates.
-        store = CompressedFarBlocks if far_compression_selected(self.Nn) else StreamingFarBlocks
+        if self._compressed and spill is not None:
+            from ghost_backend.bor.spooled_far import SpooledFarBlocks
+            store = SpooledFarBlocks
+        else:
+            store = CompressedFarBlocks if far_compression_selected(self.Nn) else StreamingFarBlocks
         self._stream = store(
             self, m_max, efie=efie, mfie=mfie, ibc_zs_pt=ibc_zs_pt,
             pmchwt=pmchwt,
@@ -2227,61 +2249,89 @@ class BorPecSolver:
 
     def _prepared_near(self, kind, m_max):
         """Direct operator callers get the same bounded, checked integration."""
-        key = (kind, int(m_max))
-        if key not in self._near_contractions:
-            pairs = [(e, f) for e, sources in enumerate(self._near_sources_by_element)
-                     for f in sources]
-            self._prepare_near_contractions(kind, pairs, m_max)
-        return self._near_contractions[key]
+        available = [(cap, data) for (family, cap), data in self._near_contractions.items()
+                     if family == kind and cap >= int(m_max)]
+        if available:
+            return min(available, key=lambda item: item[0])[1]
+        pairs = [(e, f) for e, sources in enumerate(self._near_sources_by_element) for f in sources]
+        self._prepare_near_contractions(kind, pairs, m_max)
+        return self._near_contractions[(kind, int(m_max))]
 
     def _prepare_near_contractions(self, kind, pairs, m_max, workers=1):
-        """Prepare compact mode blocks with bounded point-level scratch."""
-        key = (kind, int(m_max))
-        if key in self._near_contractions:
-            return
-        from ghost_backend.bor.near_storage import compact_layout, reciprocal_pair_order, EfieReciprocity
+        self._prepare_near_families((kind,), pairs, m_max, workers)
+
+    def _prepare_near_families(self, kinds, pairs, m_max, workers=1):
+        """Share near geometry/traversal; extend only missing modal bands.
+
+        Each angular rule still uses the new cap and its coarse/fine check.
+        Already accepted modes retain their original checked coefficients.
+        """
+        groups = {}
+        for kind in kinds:
+            previous = [(cap, data) for (family, cap), data in self._near_contractions.items()
+                        if family == kind]
+            cap, data = max(previous, key=lambda item: item[0]) if previous else (-1, None)
+            if cap < m_max:
+                groups.setdefault(cap + 1, {})[kind] = data
+        for start, previous in groups.items():
+            self._prepare_near_family_band(tuple(previous), pairs, m_max, start, previous, workers)
+
+    def _prepare_near_family_band(self, kinds, pairs, m_max, mode_start, previous, workers):
+        from ghost_backend.bor.near_storage import compact_layout, reciprocal_pair_order, EfieReciprocity, ModalBands
+        if not hasattr(self, 'near_preparation_bands'):
+            self.near_preparation_bands = []
+        self.near_preparation_bands.append(dict(kinds=list(kinds), first_mode=int(mode_start),
+                                                last_mode=int(m_max), pairs=len(pairs)))
         # Keep the original independent pair integrations and their diagnostic,
         # but accumulate directly into unique destinations. Source-element
         # identity remains part of an IBC entry for later impedance weighting.
-        pairs = reciprocal_pair_order(pairs) if kind == 'efie' else pairs
-        layout, destinations = compact_layout(pairs, self.Nn, preserve_sources=kind == 'ibc')
-        values = np.zeros((4, m_max + 1, len(layout['rows'])), complex)
-        reciprocity = EfieReciprocity(m_max + 1) if kind == 'efie' else None
+        pairs = reciprocal_pair_order(pairs) if 'efie' in kinds else pairs
+        width = m_max + 1 - mode_start
+        layouts = {kind: compact_layout(pairs, self.Nn, preserve_sources=kind == 'ibc') for kind in kinds}
+        values = {kind: np.zeros((4, width, len(layouts[kind][0]['rows'])), complex) for kind in kinds}
+        reciprocity = EfieReciprocity(width) if 'efie' in kinds else None
 
         def integrate(pair):
             if self._checkpoint is not None:
                 self._checkpoint()
             e, f = pair
             if abs(e - f) <= 1:
-                points = _same_surface_points(self.gen, e, f, (kind,), self.near_depth)
+                points = _same_surface_points(self.gen, e, f, kinds, self.near_depth)
                 blocks = _contract_near_points(self.gen, e, self.gen, f,
-                    self.k, m_max, (kind,), points, signed=False)
-                return blocks[kind], None
+                    self.k, m_max, kinds, points, signed=False, mode_start=mode_start)
+                return blocks, None
             blocks, order, error = _converged_disjoint_blocks(
-                self.gen, e, self.gen, f, self.k, m_max, (kind,), signed=False)
-            return blocks[kind], (order, error)
+                self.gen, e, self.gen, f, self.k, m_max, kinds, signed=False, mode_start=mode_start)
+            return blocks, (order, error)
 
         from ghost_backend.bor.near_parallel import NearTask
-        task = NearTask(self.gen, self.gen, self.k, m_max, (kind,), depth=self.near_depth)
+        task = NearTask(self.gen, self.gen, self.k, m_max, kinds, depth=self.near_depth,
+                        mode_start=mode_start, return_families=True)
         with contextlib.closing(_iter_near_pairs(integrate, pairs, workers, task, self._checkpoint)) as results:
-            for pi, ((e, f), (block, refinement)) in enumerate(zip(pairs, results)):
+            for pi, ((e, f), (blocks, refinement)) in enumerate(zip(pairs, results)):
                 if refinement is not None:
                     order, error = refinement
                     self.near_quadrature_order_max = max(
                         getattr(self, 'near_quadrature_order_max', 0), order)
                     self.near_quadrature_error_max = max(
                         getattr(self, 'near_quadrature_error_max', 0.), error)
-                retained = block if block.shape[1] == m_max + 1 else block[:, m_max:]
                 if reciprocity is not None:
-                    reciprocity.add((e, f), retained)
+                    reciprocity.add((e, f), blocks['efie'])
                 # The four corners within one element pair are distinct;
                 # contributions from previous pairs have already been summed.
-                values[:, :, destinations[pi]] += retained.reshape(4, m_max + 1, 4)
+                for kind in kinds:
+                    values[kind][:, :, layouts[kind][1][pi]] += blocks[kind].reshape(4, width, 4)
         if reciprocity is not None:
             self.near_efie_asymmetry = max(getattr(self, 'near_efie_asymmetry', 0.0),
                                            reciprocity.value())
-        self._near_contractions[key] = dict(layout, values=values)
-        self._near_cache.pop(m_max if kind == 'efie' else (kind, m_max), None)
+        for kind in kinds:
+            retained = values[kind]
+            if previous[kind] is not None:
+                retained = ModalBands(previous[kind]['values'], retained)
+            for key in [key for key in self._near_contractions if key[0] == kind]:
+                del self._near_contractions[key]
+            self._near_contractions[(kind, int(m_max))] = dict(layouts[kind][0], values=retained)
+            self._near_cache.pop(m_max if kind == 'efie' else (kind, m_max), None)
 
 
     def prepare_operators(self, m_max: 'int', efie: 'bool' = True,
@@ -2302,9 +2352,8 @@ class BorPecSolver:
             for f in sources
         ]
         if self._compressed:
-            for kind, enabled in (('efie', efie), ('mfie', mfie), ('ibc', ibc)):
-                if enabled:
-                    self._prepare_near_contractions(kind, pairs, m_max, workers)
+            self._prepare_near_families(tuple(kind for kind, enabled in
+                (('efie', efie), ('mfie', mfie), ('ibc', ibc)) if enabled), pairs, m_max, workers)
             return
         streaming = self._stream is not None
         # Table assembly contracts element-locally (_efie_tables_into,
@@ -2318,12 +2367,8 @@ class BorPecSolver:
         if ibc:
             if not (streaming and self._stream.B is not None):
                 self._ibc_tables(m_max)
-        if efie:
-            self._prepare_near_contractions("efie", pairs, m_max, workers)
-        if mfie:
-            self._prepare_near_contractions("mfie", pairs, m_max, workers)
-        if ibc:
-            self._prepare_near_contractions("ibc", pairs, m_max, workers)
+        self._prepare_near_families(tuple(kind for kind, enabled in
+            (('efie', efie), ('mfie', mfie), ('ibc', ibc)) if enabled), pairs, m_max, workers)
 
 
     def basis_mask(self, m: 'int') -> 'np.ndarray':
@@ -2502,6 +2547,7 @@ class BorPecSolver:
             th = np.radians(thetas)
             st = np.sin(th)[:, None]
             ct = np.cos(th)[:, None]
+            st[(thetas == 0.0) | (thetas == 180.0)] = 0.0
             u = self.k * st * g.rho[None, :]
             phase = np.exp(1j * self.k * ct * g.z[None, :])
             j_lo, j_0, j_hi = _bessel_triplet(int(m), u)
@@ -2816,7 +2862,10 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
                      stream_mode_block: 'Optional[int]' = None,
                      coordinates: 'Optional[Callable]' = None,
                      mirror: 'Optional[Callable]' = None,
-                     hierarchical_pricing: 'bool' = True):
+                     hierarchical_pricing: 'bool' = True,
+                     axial_mode_only: 'bool' = False,
+                     exact_far_cache: 'Optional[Callable]' = None,
+                     preparation_workers: 'Optional[int]' = None):
     """
     Shared adaptive azimuthal-mode loop for every BoR formulation.
 
@@ -2861,6 +2910,7 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
         farfield = metrics.wrap("far_field", farfield)
         farfield_batch = metrics.wrap("far_field", farfield_batch)
     thetas = np.atleast_1d(np.asarray(thetas, dtype=float))
+    axial_mode_only = bool(axial_mode_only and _all_axial_aspects(thetas) and m_max >= 1)
     pols = list(pols)
     mode_tol = float(mode_tol)
     if not math.isfinite(mode_tol) or mode_tol <= 0.0:
@@ -2870,16 +2920,16 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
     from ghost_backend.bor.options import output_reserved_gb
     assembly_peak_gb += output_reserved_gb()
     worker_plan = plan_bor_mode_workers(n_dofs, n_rhs, workers,
-        max(1, int(m_max) + 1), assembly_peak_gb,
+        1 if axial_mode_only else max(1, int(m_max) + 1), assembly_peak_gb,
         hierarchical=coordinates is not None and hierarchical_pricing,
-        mirrored=mirror is not None)
+        mirrored=mirror is not None, preparation_workers=preparation_workers)
     workers = worker_plan['workers']
     near_plan = worker_plan['near_preparation']
     _guard_bor_dense_memory(
         n_dofs,
         n_rhs,
         workers,
-        max(1, int(m_max) + 1),
+        1 if axial_mode_only else max(1, int(m_max) + 1),
         assembly_peak_gb=assembly_peak_gb,
         context=memory_context,
         streaming=stream_mode_block is not None,
@@ -2910,6 +2960,9 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
     from ghost_backend.linalg.sweep import CompressionHint, SweepBasis, solve as solve_sweep
     from scipy.sparse import issparse
     options = current_options()
+    has_exact_far_cache = bool(exact_far_cache is not None and exact_far_cache())
+    from ghost_backend.bor.options import current_recycling_parameters
+    recycling_identity, recycling_frequency = current_recycling_parameters()
     batch_size = options['angle_batch_size']
     # Resolved here: mode tasks run on executor threads without this context.
     residual_storage = residual_storage_settings()
@@ -2945,7 +2998,10 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
             A, mask = assemble(m)
             # The assembled system is this task's own buffer: a large one is
             # factored in place with its coefficients spooled for residuals.
-            factor = (compressed_factor(A, m, monitor_cond, options, min(workers, m_max+1), checkpoint)
+            factor = (compressed_factor(A, m, monitor_cond, options, min(workers, m_max+1), checkpoint,
+                                        recycling_key=None if recycling_identity is None else (recycling_identity, int(m)),
+                                        recycling_frequency=recycling_frequency,
+                                        exact_far_cache=has_exact_far_cache)
                       if isinstance(A, TileExpression)
                       else ModalFactor(A, m, monitor_cond, checkpoint, owned=True,
                                        residual_storage=residual_storage,
@@ -3016,6 +3072,9 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
             refinement_count += factor.event['refinement_steps']
             if monitor_cond:
                 cond = max(cond, factor.condition)
+            retain = getattr(factor, 'retain_preconditioner', None)
+            if retain is not None:
+                retain()
             events.append(dict(factor.event, mode=int(m)))
             # Release both factors and retained incident basis before assembling the next mode.
             close = getattr(factor, 'close', None)
@@ -3077,7 +3136,7 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
         # can break the worker/block alignment; the resident block is
         # finished before any worker advances the stream cache).
         pending = deque()
-        next_am = am
+        next_am = 1 if axial_mode_only else am
         # The last mode worth starting (_predicted_mode_horizon).
         horizon = _initial_mode_horizon(min_mode_before_tail, m_max)
         previous_increment = math.inf
@@ -3085,7 +3144,7 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
             while quiet < 2 and (pending or next_am <= m_max):
                 if check_abort is not None:
                     check_abort()
-                while len(pending) < workers and next_am <= m_max and (
+                while len(pending) < workers and next_am <= (1 if axial_mode_only else m_max) and (
                         not pending or (next_am <= horizon
                                         and block_of(next_am) == block_of(pending[0][0]))):
                     pending.append((next_am, ex.submit(scoped_solve_am, next_am)))
@@ -3136,7 +3195,13 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
                 last_absolute_increment = float(
                     increment_abs[worst_tail_index]
                 )
-                if (
+                if axial_mode_only:
+                    # Rotational invariance makes the other incident Fourier
+                    # coefficients identically zero. This is an analytic
+                    # finite expansion, not a relaxed numerical tail test.
+                    quiet = 2
+                    last_relative_increment = last_absolute_increment = 0.0
+                elif (
                     w_am >= min_mode_before_tail
                     and last_relative_increment < mode_tol
                 ):
@@ -3164,7 +3229,8 @@ def _mode_sweep_impl(n_dofs: 'int', thetas, pols, m_max: 'int', mode_tol: 'float
         "linear_backward_error": max_backward_error,
         "linear_refinement_steps": int(refinement_steps),
         "mode_converged": bool(quiet >= 2),
-        "mode_tasks_started": int(next_am),
+        "mode_tasks_started": 1 if axial_mode_only else int(next_am),
+        "mode_selection": "exact_axial_first_order" if axial_mode_only else "adaptive_tail",
         "mode_cap": int(m_max),
         "mode_tail_start": int(min_mode_before_tail),
         "mode_quiet_count": int(quiet),
@@ -3408,7 +3474,7 @@ def estimate_bor_table_gb(n_elems: 'int', m_max: 'int', formulation: 'str' = "cf
 def estimate_bor_cross_table_gb(
     n_test_elements: 'int', n_source_elements: 'int', m_max: 'int',
     test_gauss_order: 'int' = FAR_GAUSS_ORDER, source_gauss_order: 'int' = FAR_GAUSS_ORDER,
-    single_tables: 'bool' = False,
+    single_tables: 'bool' = False, has_rotated_pv: 'bool' = True,
 ) -> 'float':
     """Persistent far tables for one directed rectangular T/P mapping."""
 
@@ -3418,7 +3484,7 @@ def estimate_bor_cross_table_gb(
     if test_points <= 0.0 or source_points <= 0.0 or modes < 0:
         raise ValueError("Cross-table estimate dimensions are invalid.")
     item_bytes = 8.0 if single_tables else 16.0
-    modal_values = (modes + 2) + 4.0 * (modes + 1)
+    modal_values = (modes + 2) + int(has_rotated_pv) * 4.0 * (modes + 1)
     return test_points * source_points * modal_values * item_bytes / 1.0e9
 
 
@@ -3457,9 +3523,9 @@ def bor_near_cache_bytes(pair_count, node_count, kinds, modes) -> 'float':
     return values + int(kinds) * (4.0 * (4 * int(pair_count)) + int(node_count) + 1) * index_bytes
 
 
-def bor_cross_near_cache_bytes(pair_count, modes) -> 'float':
+def bor_cross_near_cache_bytes(pair_count, modes, has_rotated_pv=True) -> 'float':
     """Retained near contractions of one directed cross-surface operator."""
-    return int(pair_count) * 2 * 4 * (int(modes) + 1) * 4 * _COMPLEX128_BYTES
+    return int(pair_count) * (1 + int(has_rotated_pv)) * 4 * (int(modes) + 1) * 4 * _COMPLEX128_BYTES
 
 
 from collections import namedtuple
@@ -3472,7 +3538,8 @@ from collections import namedtuple
 BorSurfaceStorage = namedtuple(
     'BorSurfaceStorage', 'points nodes table_bytes near_pairs efie mfie ibc fft_samples')
 BorCrossStorage = namedtuple(
-    'BorCrossStorage', 'points_p points_q table_bytes near_pairs near_max_order fft_samples')
+    'BorCrossStorage', 'points_p points_q table_bytes near_pairs near_max_order fft_samples has_rotated_pv',
+    defaults=(True,))
 
 
 def bor_operator_storage_bytes(modes, surfaces, crosses=(), constraint_dofs=0,
@@ -3529,13 +3596,15 @@ def bor_operator_storage_bytes(modes, surfaces, crosses=(), constraint_dofs=0,
         pair_points = float(cross.points_p) * float(cross.points_q)
         if not streaming:
             tables += pair_points * (modes + 2) * cross.table_bytes
-            tables += 4.0 * pair_points * (modes + 1) * cross.table_bytes
-            if not kernels.BANDED_FFT:
+            if cross.has_rotated_pv:
+                tables += 4.0 * pair_points * (modes + 1) * cross.table_bytes
+            if cross.has_rotated_pv and not kernels.BANDED_FFT:
                 fft_workspace = max(fft_workspace, 4.0 * pair_points * signed_modes * _COMPLEX128_BYTES)
             scalar, bracket = cross.fft_samples if cross.fft_samples is not None else (None, None)
-            fft_workspace = max(fft_workspace, fft_bytes(pair_points, scalar, 4.0),
-                                fft_bytes(pair_points, bracket, 18.0))
-        near += bor_cross_near_cache_bytes(cross.near_pairs, modes)
+            fft_workspace = max(fft_workspace, fft_bytes(pair_points, scalar, 4.0))
+            if cross.has_rotated_pv:
+                fft_workspace = max(fft_workspace, fft_bytes(pair_points, bracket, 18.0))
+        near += bor_cross_near_cache_bytes(cross.near_pairs, modes, cross.has_rotated_pv)
         if cross.near_pairs:
             near_workspace = max(near_workspace, 128.0e6, 64.0e6 + 768 * int(cross.near_max_order) ** 2)
 
@@ -3625,7 +3694,8 @@ def estimate_bor_operator_storage_gb(
         crosses.append(BorCrossStorage(
             int(cross.sp.P), int(cross.sq.P), np.dtype(cross.sp._table_dtype).itemsize,
             len(cross.near_pairs), int(cross.near_max_order),
-            samples(cross.k, rho_max, float(cross._far_gap)) if not streaming else None))
+            samples(cross.k, rho_max, float(cross._far_gap)) if not streaming else None,
+            cross.need_p))
     parts = bor_operator_storage_bytes(modes, surfaces, crosses, constraint_size, streaming, compressed)
     retained = parts['tables'] + parts['basis'] + parts['near'] + parts['projection']
     build_workspace = max(parts['fft_workspace'], parts['near_workspace'])
@@ -3716,7 +3786,7 @@ def _plan_multisurface_assembly(
             (
                 int(cross.sp.gen.n_elems),
                 int(cross.sq.gen.n_elems),
-                True,
+                cross.need_p,
                 False,
             )
             for cross in crosses
@@ -3739,8 +3809,10 @@ def _plan_multisurface_assembly(
         )
         # As solve_bor: every stream is built once into memory-mapped files
         # when the budget cannot hold every mode.
+        from ghost_backend.bor.compressed_far import far_compression_selected
         spill, mode_block, resident_gb = plan_stream_spill(
-            mode_block, int(m_max) + 1, combined_stream_mode_gb(m_max, stream_specs))
+            mode_block, int(m_max) + 1, combined_stream_mode_gb(m_max, stream_specs),
+            allow_spill=not any(far_compression_selected(item[0].Nn) for item in merged_requirements))
         if spill is not None:
             held_far_gb = resident_gb
             effective_workers = worker_count
@@ -3862,6 +3934,65 @@ def _validated_bor_aspects(thetas_deg) -> 'np.ndarray':
     return thetas
 
 
+COMPRESSED_FAR_CACHE_MIN_NODES = 256
+# Optional acceleration has a separate allowance from the solve's RAM limit.
+# Large modal systems still need room for near blocks and active factors.
+COMPRESSED_FAR_CACHE_GB = 512 * 1024**2 / 1.e9
+COMPRESSED_FAR_WORK_GB = 256 * 1024**2 / 1.e9
+
+
+def plan_compressed_far_cache(elements, cap, formulation, has_ibc, budget, workers,
+                              rhs_count, auxiliary_gb, near_pairs=None):
+    """Optional exact far retention must never exclude a query-only solve.
+
+    Shrink the retained band against the same full memory gate as execution;
+    when even one mode plus build workspace cannot fit, keep coefficient
+    queries. The fast cache is an optimization, not a new minimum RAM demand.
+    """
+    if int(elements)+1 < COMPRESSED_FAR_CACHE_MIN_NODES:
+        return None
+    from ghost_backend.bor.streaming import (plan_streaming_mode_block,
+        estimate_streaming_block_gb)
+    budget = min(float(budget), COMPRESSED_FAR_CACHE_GB)
+    while True:
+        try:
+            block, held, active = plan_streaming_mode_block(
+                elements, cap, formulation, has_ibc, False, budget, workers)
+        except BorAdmissionError:
+            return None
+        plan = plan_bor_mode_workers(2*(int(elements)+1), rhs_count, active, cap+1,
+            auxiliary_gb+held+COMPRESSED_FAR_WORK_GB, near_pairs=near_pairs,
+            preparation_workers=workers)
+        if plan['fits_memory']:
+            # Preserve the worker alignment used to price this exact band.
+            # The modal gate may lower execution concurrency independently.
+            return block, held, active
+        if block == 1:
+            return None
+        budget = estimate_streaming_block_gb(elements, cap, max(1, block//2),
+                                              formulation, has_ibc, False)
+
+
+def plan_compressed_far_spill(elements, cap, formulation, has_ibc, mode_block):
+    """Disk admission for exact far coefficients; resident windows stay bounded."""
+    from ghost_backend.bor.streaming import (estimate_streaming_block_gb,
+        spill_directory, stream_spill_candidate_gb)
+    per_mode = estimate_streaming_block_gb(elements, cap, 1, formulation, has_ibc, False)
+    candidate = stream_spill_candidate_gb(mode_block, cap+1, per_mode)
+    return (spill_directory(candidate) if candidate else None), candidate
+
+
+def _uses_far_compression(nodes):
+    from ghost_backend.bor.compressed_far import far_compression_selected
+    return far_compression_selected(nodes)
+
+
+def _all_axial_aspects(thetas):
+    """Only exact axial endpoints qualify; a near-axis look has other modes."""
+    values = np.asarray(thetas, dtype=float)
+    return bool(values.size and np.all((values == 0.0) | (values == 180.0)))
+
+
 def _bor_mode_limits(k, rho_max: 'float', thetas,
                      n_modes: 'Optional[int]') -> 'Tuple[int, int]':
     """Return (mode_cap, physical_tail_start) for a BoR sweep.
@@ -3886,6 +4017,8 @@ def _bor_mode_limits(k, rho_max: 'float', thetas,
             raise ValueError("n_modes must be a non-negative integer or None.") from exc
         if mode_cap != n_modes or mode_cap < 0:
             raise ValueError("n_modes must be a non-negative integer or None.")
+    if _all_axial_aspects(theta_array):
+        return min(mode_cap, 1), 1
     return mode_cap, bandwidth
 
 
@@ -3996,7 +4129,7 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
     points = _validate_solve_bor_generatrix(points, 'efie' if form == 'auto' else form)
     if form == 'auto':
         form = ('cfie' if points[0,0] == points[-1,0] == 0 and sheet_zs is None else 'efie')
-    solver = BorPecSolver(points, freq_hz, gauss_order=gauss_order)
+    solver = _prepared_surface(points, freq_hz, gauss_order=gauss_order)
     k = solver.k
     thetas = _validated_bor_aspects(thetas_deg)
     rho_max = float(np.max(solver.gen.nodes[:, 0]))
@@ -4073,7 +4206,19 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
                                        zs_pt is not None, gauss_order, False)
 
 
-    use_streaming = asm == "streaming" or (asm == "auto" and est_double > 2.0)
+    kinds = conductor_operator_kinds(form, zs_pt is not None)
+    from ghost_backend.bor.options import output_reserved_gb
+    cache_plan = (plan_compressed_far_cache(solver.gen.n_elems, m_max, form, zs_pt is not None,
+        stream_budget_gb, workers, 2*len(thetas),
+        estimate_bor_operator_storage_gb(m_max, ((solver, *kinds),), streaming=True)
+        + output_reserved_gb(), solver._near_pair_count) if solver._compressed else None)
+    # Conductors stream by default: the dense-tables path contracts its [P, P,
+    # M] tables per mode at 38x the cost of the streamed read and samples both
+    # triangles of the symmetric Green's function, so streaming measured equal
+    # or faster at every size (0.6 s at 40 elements, 5.0 against 6.1 s at 300)
+    # with 7x less memory; the two paths agree to 3e-15.  'tables' remains an
+    # explicit choice.
+    use_streaming = (cache_plan is not None if solver._compressed else asm in ("streaming", "auto"))
     if use_streaming:
         est_full = estimate_streaming_gb(solver.gen.n_elems, m_max, form,
                                          zs_pt is not None, False)
@@ -4089,8 +4234,9 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
     mode_block = None
     est_held = est
     stream_spill = None
+    stream_workspace_gb = COMPRESSED_FAR_WORK_GB if solver._compressed else BOR_STREAM_TILE_BUDGET_GB
     if use_streaming:
-        mode_block, est_held, solve_workers = plan_streaming_mode_block(
+        mode_block, est_held, solve_workers = cache_plan if cache_plan is not None else plan_streaming_mode_block(
             solver.gen.n_elems,
             m_max,
             form,
@@ -4103,18 +4249,23 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
         # range.  When the temporary directory can hold all modes, the blocks
         # are built once into memory-mapped files; the resident cost is then
         # the modes being read, and the mode workers need no range alignment.
-        stream_spill, mode_block, resident_gb = plan_stream_spill(
-            mode_block, m_max + 1,
-            estimate_streaming_block_gb(solver.gen.n_elems, m_max, 1, form,
-                                        zs_pt is not None, use_single))
-        if stream_spill is not None:
-            est_held = resident_gb
-            solve_workers = max(1, int(workers))
+        if solver._compressed:
+            stream_spill, _ = plan_compressed_far_spill(
+                solver.gen.n_elems, m_max, form, zs_pt is not None, mode_block)
+        else:
+            stream_spill, mode_block, resident_gb = plan_stream_spill(
+                mode_block, m_max + 1,
+                estimate_streaming_block_gb(solver.gen.n_elems, m_max, 1, form,
+                                            zs_pt is not None, use_single),
+                allow_spill=not _uses_far_compression(solver.Nn))
+            if stream_spill is not None:
+                est_held = resident_gb
+                solve_workers = max(1, int(workers))
 
 
     kinds = conductor_operator_kinds(form, zs_pt is not None)
     assembly_peak_gb = (
-        est_held + BOR_STREAM_TILE_BUDGET_GB + estimate_bor_operator_storage_gb(
+        est_held + stream_workspace_gb + estimate_bor_operator_storage_gb(
             m_max, ((solver, *kinds),), streaming=True)
         if use_streaming
         # Tables: the model every material solver already uses (retained tables and
@@ -4126,9 +4277,10 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
                   f"stored in single precision ({est:.1f} GB; double would "
                   f"need {est_full:.1f} GB)."
                   if use_single and tp == "auto" else None)
+    optional_far_cache_failure = None
 
     def prepare(mm):
-        nonlocal sheet_mass
+        nonlocal sheet_mass, optional_far_cache_failure
         if sheet_weights is not None:
             # The sheet mass is tridiagonal: dense solves add its bands in
             # place (no N x N matrix is formed or cached); compressed
@@ -4136,14 +4288,27 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
             sheet_mass = (solver.mass_blocks(weight=sheet_weights) if solver._compressed
                           else solver.mass_bands(weight=sheet_weights))
         if use_streaming and solver._stream is None:
-            solver.enable_streaming(
-                mm, efie=kinds[0], mfie=kinds[1],
-                ibc_zs_pt=zs_pt if kinds[2] else None,
-                single_blocks=use_single, workers=solve_workers,
-                mode_block=mode_block, spill=stream_spill,
-                tile_budget_gb=BOR_STREAM_TILE_BUDGET_GB)
+            from ghost_backend.bor.streaming import StreamingSpillError
+            try:
+                solver.enable_streaming(
+                    mm, efie=kinds[0], mfie=kinds[1],
+                    ibc_zs_pt=zs_pt if kinds[2] else None,
+                    single_blocks=use_single, workers=solve_workers,
+                    mode_block=mode_block, spill=stream_spill,
+                    tile_budget_gb=stream_workspace_gb)
+            except InterruptedError:
+                # Cancellation may use this OSError subclass; never treat it
+                # as a failed optional disk optimization.
+                raise
+            except (OSError, StreamingSpillError) as exc:
+                if not solver._compressed or stream_spill is None:
+                    raise
+                # Optional disk caching failed before publication. Exact
+                # coefficient queries remain available within the admitted RAM.
+                solver.close_streaming()
+                optional_far_cache_failure = str(exc)
         solver.prepare_operators(mm, efie=kinds[0], mfie=kinds[1], ibc=kinds[2],
-                                 workers=solve_workers)
+                                 workers=workers)
 
     def assemble(m):
         if zs_pt is None and sheet_mass is None and not solver._compressed:
@@ -4283,7 +4448,7 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
     try:
         F, modes_used, stats = _mode_sweep(n_dofs, thetas, ("VV", "HH"), m_max,
                                            mode_tol, assemble, rhs, farfield,
-                                           prepare=prepare, workers=solve_workers,
+                                           prepare=prepare, workers=solve_workers, preparation_workers=workers,
                                            progress=progress,
                                            check_abort=check_abort,
                                            monitor_cond=True,
@@ -4293,7 +4458,8 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
                                            assembly_peak_gb=assembly_peak_gb,
                                            memory_context="The PEC/IBC BoR solve",
                                            stream_mode_block=mode_block,
-                                           signed_mode_symmetry=True,
+                                           exact_far_cache=lambda: solver._stream is not None,
+                                           signed_mode_symmetry=True, axial_mode_only=_all_axial_aspects(thetas),
                                            coordinates=lambda m: solver.gen.nodes[
                                                np.flatnonzero(solver.basis_mask(m)) % solver.Nn],
                                            mirror=(mirror_map(solver, (zs_elem, sheet_values))
@@ -4304,9 +4470,10 @@ def solve_bor(points, freq_hz: 'float', thetas_deg, formulation: 'str' = "auto",
             "stream_mode_block": stream.mode_block if stream is not None else None,
             "stream_sweeps": stream.n_sweeps if stream is not None else 0,
             "stream_sampling_backend": (
-                sampling_backend_name(stream) if use_streaming else None
+                sampling_backend_name(stream) if stream is not None else None
             ),
             "stream_spill_gb": stream.spilled_gb() if stream is not None else 0.0,
+            "stream_cache_fallback": optional_far_cache_failure,
             "stream_far_compression": (dict(stream.evidence)
                                        if getattr(stream, "evidence", None) else None),
         }
@@ -4365,8 +4532,8 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
     points = _validate_solve_bor_generatrix(points, "cfie")
 
     _causal_medium(eps_r, mu_r)
-    se = BorPecSolver(points, freq_hz, gauss_order=gauss_order)
-    si = BorPecSolver(points, freq_hz, gauss_order=gauss_order,
+    se = _prepared_surface(points, freq_hz, gauss_order=gauss_order)
+    si = _prepared_surface(points, freq_hz, gauss_order=gauss_order,
                       medium=(eps_r, mu_r))
     k = se.k
     thetas = _validated_bor_aspects(thetas_deg)
@@ -4430,7 +4597,8 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
         # range, and the mode workers need no range alignment.
         stream_spill, mode_block, resident_gb = plan_stream_spill(
             mode_block, m_max + 1,
-            2.0 * estimate_streaming_block_gb(se.gen.n_elems, m_max, 1, "efie", True, use_single))
+            2.0 * estimate_streaming_block_gb(se.gen.n_elems, m_max, 1, "efie", True, use_single),
+            allow_spill=not _uses_far_compression(se.Nn))
         if stream_spill is not None:
             held_blocks_gb = resident_gb
             solve_workers = max(1, int(workers))
@@ -4472,8 +4640,8 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
                     mode_block=mode_block,
                     spill=stream_spill,
                 )
-        se.prepare_operators(mm, efie=True, ibc=True, workers=solve_workers)
-        si.prepare_operators(mm, efie=True, ibc=True, workers=solve_workers)
+        se.prepare_operators(mm, efie=True, ibc=True, workers=workers)
+        si.prepare_operators(mm, efie=True, ibc=True, workers=workers)
 
     def assemble(m):
         if use_streaming and not se._compressed:
@@ -4538,7 +4706,7 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
     try:
         F, modes_used, stats = _mode_sweep(4 * Nn, thetas, ("VV", "HH"), m_max,
                                            mode_tol, assemble, rhs, farfield,
-                                           prepare=prepare, workers=solve_workers,
+                                           prepare=prepare, workers=solve_workers, preparation_workers=workers,
                                            progress=progress,
                                            check_abort=check_abort,
                                            monitor_cond=True,
@@ -4548,7 +4716,7 @@ def solve_bor_dielectric(points, freq_hz: 'float', thetas_deg, eps_r: 'complex',
                                            assembly_peak_gb=operator_storage_gb,
                                            memory_context="The dielectric BoR solve",
                                            stream_mode_block=mode_block,
-                                           signed_mode_symmetry=True,
+                                           signed_mode_symmetry=True, axial_mode_only=_all_axial_aspects(thetas),
                                            coordinates=lambda m: np.tile(se.gen.nodes, (4, 1))[
                                                np.tile(se.basis_mask(m), 2)],
                                            hierarchical_pricing=False)
@@ -4608,7 +4776,7 @@ def _segment_distance(p0, p1, q0, q1) -> 'float':
                pt_seg(q0, p0, p1), pt_seg(q1, p0, p1))
 
 
-def _contract_near_points(gp, e, gq, f, k, m_max, kinds, points, signed=True):
+def _contract_near_points(gp, e, gq, f, k, m_max, kinds, points, signed=True, mode_start=0):
     """Integrate immediately into 2x2 blocks; never retain raw pair kernels.
 
     Point tiles and modal projection tiles bound scratch even for a single
@@ -4619,7 +4787,7 @@ def _contract_near_points(gp, e, gq, f, k, m_max, kinds, points, signed=True):
     contracts the signed half.
     EFIE omits j*k*eta*2pi; bracket blocks include 2pi.
     """
-    return _contract_near_batch([(gp, e, gq, f, points)], k, m_max, kinds, signed)[0]
+    return _contract_near_batch([(gp, e, gq, f, points)], k, m_max, kinds, signed, mode_start)[0]
 
 
 def _near_point_chunks(gp, e, gq, f, points, nm):
@@ -4648,7 +4816,7 @@ def _near_point_chunks(gp, e, gq, f, points, nm):
 NEAR_BATCH_KERNEL_BYTES = 64_000_000
 
 
-def _near_chunk_kernels(chunks, k, m_max, kinds, signed=True):
+def _near_chunk_kernels(chunks, k, m_max, kinds, signed=True, mode_start=0):
     """Kernel values per chunk and kind: one graded-rule call per kind for all chunks."""
     sizes = [len(chunk[12]) for chunk in chunks]
     edges = np.cumsum([0] + sizes)
@@ -4658,18 +4826,19 @@ def _near_chunk_kernels(chunks, k, m_max, kinds, signed=True):
     values = []
     for kind in kinds:
         if kind == 'efie':
-            G = modal_kernels_near(columns['rp'], columns['zp'], columns['rq'], columns['zq'], k, m_max)
+            G = modal_kernels_near(columns['rp'], columns['zp'], columns['rq'], columns['zq'], k, m_max,
+                                  mode_start=max(0, mode_start - 1))
             values.append([G[a:b] for a, b in zip(edges[:-1], edges[1:])])
             continue
         kernel = mfie_kernels_near if kind == 'mfie' else ibc_kernels_near
         brackets = kernel(columns['rp'], columns['zp'], columns['trp'], columns['tzp'],
                           columns['rq'], columns['zq'], columns['trq'], columns['tzq'], k, m_max,
-                          signed=signed)
+                          signed=signed, mode_start=mode_start)
         values.append([tuple(value[a:b] for value in brackets) for a, b in zip(edges[:-1], edges[1:])])
     return [dict(zip(kinds, per_chunk)) for per_chunk in zip(*values)]
 
 
-def _contract_near_chunk(out, chunk, kernels, k, m_max, modes, signed):
+def _contract_near_chunk(out, chunk, kernels, k, m_max, modes, signed, mode_start=0):
     """Add one chunk's contributions: ``[m, i, j] = sum_p left[i,p] K[p,m] right[j,p]``.
 
     Each contraction is one product of the four basis-pair rows with the
@@ -4690,9 +4859,10 @@ def _contract_near_chunk(out, chunk, kernels, k, m_max, modes, signed):
     if 'efie' in out:
         G = kernels['efie']
         am = np.abs(modes)
-        Gn = G[:, am]
-        Gc = 0.5 * (G[:, np.abs(am - 1)] + G[:, am + 1])
-        Gs = (G[:, np.abs(am - 1)] - G[:, am + 1]) / 2j
+        offset = max(0, mode_start - 1)
+        Gn = G[:, am - offset]
+        Gc = 0.5 * (G[:, np.abs(am - 1) - offset] + G[:, am + 1 - offset])
+        Gs = (G[:, np.abs(am - 1) - offset] - G[:, am + 1 - offset]) / 2j
         Gs[:, modes < 0] *= -1
         scalar = w[:, None] * Gn / k**2
         out['efie'][0] += contract(TT, rr * (trp * trq * Gc + tzp * tzq * Gn)) - contract(rows(Dp, Dq), scalar)
@@ -4706,7 +4876,7 @@ def _contract_near_chunk(out, chunk, kernels, k, m_max, modes, signed):
             out[kind][uv] += contract(TT, 2 * np.pi * rr * value)
 
 
-def _contract_near_batch(jobs, k, m_max, kinds, signed=True):
+def _contract_near_batch(jobs, k, m_max, kinds, signed=True, mode_start=0):
     """:func:`_contract_near_points` of every ``(gp, e, gq, f, points)`` job.
 
     Chunks are formed per job exactly as one call would form them; their
@@ -4714,19 +4884,22 @@ def _contract_near_batch(jobs, k, m_max, kinds, signed=True):
     NEAR_BATCH_KERNEL_BYTES and each job's chunks are contracted in order, so
     every job's blocks equal those of its own call, bitwise.
     """
-    modes = np.arange(-m_max, m_max + 1) if signed else np.arange(0, m_max + 1)
+    if mode_start and signed:
+        raise ValueError('Incremental near blocks retain nonnegative modes only.')
+    modes = np.arange(-m_max, m_max + 1) if signed else np.arange(mode_start, m_max + 1)
     nm = len(modes)
     outs = [{kind: np.zeros((4, nm, 2, 2), complex) for kind in kinds} for _ in jobs]
-    per_point = 16 * sum((m_max + 2) if kind == 'efie' else 4 * nm for kind in kinds) + 160
+    per_point = 16 * sum((m_max + 2 - max(0, mode_start - 1)) if kind == 'efie' else 4 * nm for kind in kinds) + 160
     limit = max(256, NEAR_BATCH_KERNEL_BYTES // per_point)
     block, points = [], 0
 
     def flush():
         if not block:
             return
-        kernels = _near_chunk_kernels([chunk for _, chunk in block], k, m_max, kinds, signed=signed)
+        kernels = _near_chunk_kernels([chunk for _, chunk in block], k, m_max, kinds,
+                                      signed=signed, mode_start=mode_start)
         for (index, chunk), values in zip(block, kernels):
-            _contract_near_chunk(outs[index], chunk, values, k, m_max, modes, signed)
+            _contract_near_chunk(outs[index], chunk, values, k, m_max, modes, signed, mode_start)
         block.clear()
 
     for index, (gp, e, gq, f, pts) in enumerate(jobs):
@@ -4779,18 +4952,18 @@ def _gap_graded_points(gp, e, gq, f, order):
 
 
 def _converged_disjoint_blocks(gp, e, gq, f, k, m_max, kinds,
-                               order=12, rtol=2e-5, max_order=192, signed=True):
+                               order=12, rtol=2e-5, max_order=192, signed=True, mode_start=0):
     """Converge actual EFIE/PV blocks independently of angular integration.
 
     ``signed=False`` returns (and checks) only the modes 0..m_max; the
     negative modes are exact parity copies, so the convergence test is the
     same."""
     return _converged_disjoint_batch(gp, gq, [(e, f)], k, m_max, kinds,
-                                     order, rtol, max_order, signed)[0]
+                                     order, rtol, max_order, signed, mode_start)[0]
 
 
 def _converged_disjoint_batch(gp, gq, pairs, k, m_max, kinds,
-                              order=12, rtol=2e-5, max_order=192, signed=True):
+                              order=12, rtol=2e-5, max_order=192, signed=True, mode_start=0):
     """:func:`_converged_disjoint_blocks` of every element pair ``(e, f)``.
 
     Every pair follows its own sequence of meridian orders and its own
@@ -4804,26 +4977,43 @@ def _converged_disjoint_batch(gp, gq, pairs, k, m_max, kinds,
     results = [None] * len(pairs)
     states = []
     for index, (e, f) in enumerate(pairs):
-        if tuple(kinds) == ('mfie',):
+        zero_mfie = False
+        if 'mfie' in kinds:
             nodes = np.vstack((gp.nodes[e:e+2], gq.nodes[f:f+2]))
 
 
             z_tolerance = 8*np.finfo(float).eps*max(float(np.max(np.abs(nodes))), np.finfo(float).tiny)
-            if float(np.ptp(nodes[:, 1])) <= z_tolerance:
-                width = 2*m_max+1 if signed else m_max+1
+            zero_mfie = float(np.ptp(nodes[:, 1])) <= z_tolerance
+            if zero_mfie and tuple(kinds) == ('mfie',):
+                width = 2*m_max+1 if signed else m_max+1-mode_start
                 results[index] = ({'mfie': np.zeros((4, width, 2, 2), complex)}, int(order), 0.)
                 continue
         gap = _segment_distance(gp.nodes[e], gp.nodes[e + 1], gq.nodes[f], gq.nodes[f + 1])
         graded = gap < 0.25 * max(gp.lengths[e], gq.lengths[f])
-        states.append(dict(index=index, e=e, f=f, gap=gap, graded=graded,
+        states.append(dict(index=index, e=e, f=f, gap=gap, graded=graded, zero_mfie=zero_mfie,
                            n=requested_order if graded else max(2, requested_order // 2)))
 
     def evaluate(group):
-        return _contract_near_batch(
-            [(gp, st['e'], gq, st['f'],
-              _gap_graded_points(gp, st['e'], gq, st['f'], st['n']) if st['graded']
-              else _regular_cell_points(st['n'])) for st in group],
-            k, m_max, kinds, signed)
+        output = [None]*len(group)
+        for zero in (False, True):
+            selected = [(i, st) for i, st in enumerate(group) if st['zero_mfie'] == zero]
+            if not selected:
+                continue
+            wanted = tuple(kind for kind in kinds if not (zero and kind == 'mfie'))
+            blocks = _contract_near_batch(
+                [(gp, st['e'], gq, st['f'],
+                  _gap_graded_points(gp, st['e'], gq, st['f'], st['n']) if st['graded']
+                  else _regular_cell_points(st['n'])) for _, st in selected],
+                k, m_max, wanted, signed, mode_start)
+            for (i, _), value in zip(selected, blocks):
+                if zero:
+                    # Preserve the independent-family analytic zero when
+                    # families share traversal. Relative refinement of its
+                    # floating-point cancellation residue cannot converge.
+                    width = 2*m_max+1 if signed else m_max+1-mode_start
+                    value['mfie'] = np.zeros((4,width,2,2),complex)
+                output[i] = value
+        return output
 
     for st, blocks in zip(states, evaluate(states)):
         st['coarse'] = blocks
@@ -4919,6 +5109,8 @@ def _near_quadrature_summary(*operators):
         # lower bound on the self/adjacent quadrature error (not a certificate).
         'efie_near_block_asymmetry_max': float(asymmetry),
         'efie_near_block_asymmetry_warning': EFIE_NEAR_ASYMMETRY_WARNING,
+        'prepared_modal_bands': [band for operator in operators
+                                 for band in getattr(operator, 'near_preparation_bands', ())],
     }
 
 
@@ -4933,15 +5125,22 @@ class BorCrossOperators:
     endpoints (coating-termination junctions): element pairs sharing such a
     point are log-singular in the Galerkin sense and are routed to the same
     graded corner-cell quadrature the same-surface assembly uses for
-    adjacent elements.  Overlapping/crossing interiors remain an error."""
+    adjacent elements.  Overlapping/crossing interiors remain an error.
+
+    ``need_p=False`` omits rotated-PV work only when neither this mapping nor
+    its reciprocal consumer needs P; EFIE retains its own convergence test.
+    """
 
     def __init__(self, sp: 'BorPecSolver', sq: 'BorPecSolver',
                  near_factor: 'float' = 2.0, near_order: 'int' = 12,
-                 near_rtol: 'float' = 2e-5, near_max_order: 'int' = 192):
+                 near_rtol: 'float' = 2e-5, near_max_order: 'int' = 192,
+                 need_p: 'bool' = True):
         if not np.isclose(complex(sp.k), complex(sq.k)):
             raise ValueError("Cross operators need both solvers in the same medium.")
         self.sp, self.sq = sp, sq
         self.k, self.eta = sp.k, sp.eta
+        self.need_p = bool(need_p)
+        self._near_kinds = ('efie', 'ibc') if self.need_p else ('efie',)
         self.near_order = int(near_order)
         self.near_rtol = float(near_rtol)
         self.near_max_order = int(near_max_order)
@@ -5049,8 +5248,8 @@ class BorCrossOperators:
         rho_scale = max(float(np.max(gp.rho)), float(np.max(gq.rho)))
         n_xi_g = n_xi_for_pairs(self.k, rho_scale, m_max, self._far_gap,
                                 bracket=False)
-        n_xi_b = n_xi_for_pairs(self.k, rho_scale, m_max, self._far_gap,
-                                bracket=True)
+        n_xi_b = (n_xi_for_pairs(self.k, rho_scale, m_max, self._far_gap,
+                                bracket=True) if self.need_p else None)
         near_mask = np.zeros((Pp, Pq), dtype=bool)
         for (e, f) in self.near_pairs:
             near_mask[np.ix_(gp.elem == e, gq.elem == f)] = True
@@ -5067,8 +5266,8 @@ class BorCrossOperators:
                 lambda r0, r1: nonnegative_bracket_tables(
                     'ibc', tuple(a[r0:r1] for a in args[:4]) + args[4:], self.k, m_max,
                     n_xi_b, near_mask[r0:r1], threads=physical_cpu_count()),
-                Pp, Pq, 4 * 16.0 * Pq * (m_max + 1), table_dtype, near_mask)
-            self._G, self._B = G, tuple(B)
+                Pp, Pq, 4 * 16.0 * Pq * (m_max + 1), table_dtype, near_mask) if self.need_p else None
+            self._G, self._B = G, None if B is None else tuple(B)
             return self._G, self._B
         G = modal_kernels_fft(gp.rho[:, None], gp.z[:, None],
                               gq.rho[None, :], gq.z[None, :],
@@ -5076,50 +5275,53 @@ class BorCrossOperators:
                               threads=physical_cpu_count())
         args = tuple(getattr(gp,name)[:,None] for name in ('rho','z','trho','tz'))
         args += tuple(getattr(gq,name)[None,:] for name in ('rho','z','trho','tz'))
-        B = nonnegative_bracket_tables('ibc', args, self.k, m_max, n_xi_b, near_mask,
-                                       threads=physical_cpu_count())
+        B = (nonnegative_bracket_tables('ibc', args, self.k, m_max, n_xi_b, near_mask,
+                                       threads=physical_cpu_count()) if self.need_p else None)
         if self.near_pairs:
-            near_mask = np.zeros((Pp, Pq), dtype=bool)
-            for (e, f) in self.near_pairs:
-                near_mask[np.ix_(gp.elem == e, gq.elem == f)] = True
             G[near_mask, :] = 0.0
-            B = list(B)
-            for i in range(4):
-                B[i][near_mask, :] = 0.0
-            B = tuple(B)
+            if B is not None:
+                for value in B:
+                    value[near_mask, :] = 0.0
         table_dtype = self.sp._table_dtype
         self._G = G.astype(table_dtype, copy=False)
-        self._B = tuple(value.astype(table_dtype, copy=False) for value in B)
+        self._B = None if B is None else tuple(value.astype(table_dtype, copy=False) for value in B)
         return self._G, self._B
 
-    def _integrate_near(self, e, f, m_max, signed=True):
+    def _integrate_near(self, e, f, m_max, signed=True, mode_start=0):
         """Return (blocks, (order, error) or None) without touching state.
 
         Production callers pass ``signed=False`` (modes 0..m_max only)."""
         kind = self.pair_kind.get((e, f))
         if kind is not None:
             return _contract_near_points(self.sp.gen, e, self.sq.gen, f,
-                self.k, m_max, ('efie', 'ibc'), _junction_cell_points(kind), signed=signed), None
+                self.k, m_max, self._near_kinds, _junction_cell_points(kind), signed=signed,
+                mode_start=mode_start), None
         blocks, order, error = _converged_disjoint_blocks(
             self.sp.gen, e, self.sq.gen, f, self.k, m_max,
-            ('efie', 'ibc'), self.near_order, self.near_rtol, self.near_max_order,
-            signed=signed)
+            self._near_kinds, self.near_order, self.near_rtol, self.near_max_order,
+            signed=signed, mode_start=mode_start)
         return blocks, (order, error)
 
-    def _store_near(self, e, f, m_max, blocks, refinement):
+    def _store_near(self, e, f, m_max, blocks, refinement, mode_start=0):
         if refinement is not None:
             order, error = refinement
             self.near_quadrature_order_max = max(self.near_quadrature_order_max, order)
             self.near_quadrature_error_max = max(self.near_quadrature_error_max, error)
         # Keep an owned copy of the nonnegative half; a slice alone would keep
         # both signs alive when the caller integrated the signed modes.
-        self._cache.setdefault(m_max, {})[(e, f)] = {
-            kind: (value if value.shape[1] == m_max + 1 else value[:, m_max:]).copy()
-            for kind, value in blocks.items()
-        }
+        from ghost_backend.bor.near_storage import ModalBands
+        retained = {kind: (value if value.shape[1] == m_max + 1 - mode_start
+                           else value[:, m_max:]).copy() for kind, value in blocks.items()}
+        if mode_start:
+            previous = self._cache[mode_start - 1][(e, f)]
+            retained = {kind: ModalBands(previous[kind], value) for kind, value in retained.items()}
+        self._cache.setdefault(m_max, {})[(e, f)] = retained
 
     def _near_data(self, e, f, m_max):
         """Cache only converged 2x2 EFIE and rotated-PV mode blocks."""
+        for cap, data in self._cache.items():
+            if cap >= m_max and (e, f) in data:
+                return data[(e, f)]
         cache = self._cache.setdefault(m_max, {})
         if (e, f) not in cache:
             self._store_near(e, f, m_max, *self._integrate_near(e, f, m_max, signed=False))
@@ -5161,6 +5363,8 @@ class BorCrossOperators:
 
     def assemble_P(self, m: 'int', m_max: 'int', out=None) -> 'np.ndarray':
         """Cross rotated-PV operator [2Np, 2Nq] (see assemble_pmchwt_P)."""
+        if not self.need_p:
+            raise ValueError('This cross operator was prepared for EFIE only.')
         if self.sp._compressed:
             if out is not None:
                 raise ValueError('Compressed cross assembly cannot write in place.')
@@ -5190,24 +5394,31 @@ class BorCrossOperators:
         return P
 
     def prepare(self, m_max: 'int', workers: 'int' = 1) -> 'None':
-        """Warm every table/near cache (see BorPecSolver.prepare_operators)."""
+        """Warm requested table/near families (see BorPecSolver.prepare_operators)."""
         if self._stream is None and not self.sp._compressed:
             self._tables(m_max)
         cached = self._cache.get(m_max, {})
+        previous = max((cap for cap, data in self._cache.items()
+                        if all(pair in data for pair in self.near_pairs)), default=-1)
+        if previous >= m_max:
+            return
+        mode_start = previous + 1
         pending = [pair for pair in self.near_pairs if pair not in cached]
 
         def integrate(pair):
             if self.sp._checkpoint is not None:
                 self.sp._checkpoint()
-            return self._integrate_near(pair[0], pair[1], m_max, signed=False)
+            return self._integrate_near(pair[0], pair[1], m_max, signed=False, mode_start=mode_start)
 
         from ghost_backend.bor.near_parallel import NearTask
-        task = NearTask(self.sp.gen, self.sq.gen, self.k, m_max, ('efie', 'ibc'),
+        task = NearTask(self.sp.gen, self.sq.gen, self.k, m_max, self._near_kinds,
             pair_kind=self.pair_kind, near_order=self.near_order,
-            near_rtol=self.near_rtol, near_max_order=self.near_max_order)
+            near_rtol=self.near_rtol, near_max_order=self.near_max_order, mode_start=mode_start)
         with contextlib.closing(_iter_near_pairs(integrate, pending, workers, task, self.sp._checkpoint)) as results:
             for (e, f), result in zip(pending, results):
-                self._store_near(e, f, m_max, *result)
+                self._store_near(e, f, m_max, *result, mode_start=mode_start)
+        for cap in [cap for cap in self._cache if cap != m_max]:
+            del self._cache[cap]
 
 
 class _ReverseCrossOperators:
@@ -5232,6 +5443,7 @@ class _ReverseCrossOperators:
         self.forward = forward
         self.sp, self.sq = forward.sq, forward.sp
         self.k, self.eta = forward.k, forward.eta
+        self.need_p = forward.need_p
         self._stream = None
         # Lets _cross_block keep the forward block of a mode for this reverse.
         forward._has_derived_reverse = True
@@ -5294,7 +5506,8 @@ def _reverse_cross(forward: 'BorCrossOperators', **kwargs):
     """Derived reverse operators, or independently built ones when the
     forward assembly is symbolic (compressed tiles cannot be transposed)."""
     if forward.sp._compressed:
-        return BorCrossOperators(forward.sq, forward.sp, **kwargs)
+        kwargs.setdefault('need_p', forward.need_p)
+        return _prepared_cross(forward.sq, forward.sp, **kwargs)
     return _ReverseCrossOperators(forward)
 
 
@@ -5379,12 +5592,12 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
     from ghost_backend.bor.geometry import require_containment
     require_containment(points_outer, points_core)
     _causal_medium(eps_r, mu_r)
-    se = BorPecSolver(points_outer, freq_hz, gauss_order=gauss_order)
-    sLo = BorPecSolver(points_outer, freq_hz, gauss_order=gauss_order,
+    se = _prepared_surface(points_outer, freq_hz, gauss_order=gauss_order)
+    sLo = _prepared_surface(points_outer, freq_hz, gauss_order=gauss_order,
                        medium=(eps_r, mu_r))
-    sLc = BorPecSolver(points_core, freq_hz, gauss_order=gauss_order,
+    sLc = _prepared_surface(points_core, freq_hz, gauss_order=gauss_order,
                        medium=(eps_r, mu_r))
-    Xoc = BorCrossOperators(sLo, sLc, near_factor=near_factor, near_order=near_order,
+    Xoc = _prepared_cross(sLo, sLc, near_factor=near_factor, near_order=near_order,
                             near_rtol=near_rtol, near_max_order=near_max_order)
     # Core-to-outer operators follow exactly from outer-to-core ones.
     Xco = _reverse_cross(Xoc, near_factor=near_factor, near_order=near_order,
@@ -5467,7 +5680,8 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
         # As solve_bor: every stream is built once into memory-mapped files
         # when the budget cannot hold every mode.
         stream_spill, mode_block, resident_gb = plan_stream_spill(
-            mode_block, m_max + 1, combined_stream_mode_gb(m_max, stream_specs))
+            mode_block, m_max + 1, combined_stream_mode_gb(m_max, stream_specs),
+            allow_spill=not any(_uses_far_compression(item.Nn) for item in (se, sLo, sLc)))
         if stream_spill is not None:
             held_blocks_gb = resident_gb
             solve_workers = max(1, int(workers))
@@ -5542,11 +5756,11 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
                     workers=solve_workers, mode_block=mode_block,
                     spill=stream_spill,
                 )
-        se.prepare_operators(mm, efie=True, ibc=True, workers=solve_workers)
-        sLo.prepare_operators(mm, efie=True, ibc=True, workers=solve_workers)
-        sLc.prepare_operators(mm, efie=True, mfie=True, workers=solve_workers)
-        Xoc.prepare(mm, workers=solve_workers)
-        Xco.prepare(mm, workers=solve_workers)
+        se.prepare_operators(mm, efie=True, ibc=True, workers=workers)
+        sLo.prepare_operators(mm, efie=True, ibc=True, workers=workers)
+        sLc.prepare_operators(mm, efie=True, mfie=True, workers=workers)
+        Xoc.prepare(mm, workers=workers)
+        Xco.prepare(mm, workers=workers)
 
     def assemble(m):
         memo = {}
@@ -5624,7 +5838,7 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
     try:
         F, modes_used, stats = _mode_sweep(ntot, thetas, ("VV", "HH"), m_max,
                                            mode_tol, assemble, rhs, farfield,
-                                           prepare=prepare, workers=solve_workers,
+                                           prepare=prepare, workers=solve_workers, preparation_workers=workers,
                                            progress=progress,
                                            check_abort=check_abort,
                                            monitor_cond=True,
@@ -5634,7 +5848,7 @@ def solve_bor_coated_pec(points_outer, points_core, freq_hz: 'float', thetas_deg
                                            assembly_peak_gb=operator_storage_gb,
                                            memory_context="The coated-PEC BoR solve",
                                            stream_mode_block=mode_block,
-                                           signed_mode_symmetry=True,
+                                           signed_mode_symmetry=True, axial_mode_only=_all_axial_aspects(thetas),
                                            coordinates=lambda m: np.vstack((np.tile(se.gen.nodes, (4, 1)),
                                                np.tile(sLc.gen.nodes, (2, 1))))[
                                                    np.r_[np.tile(se.basis_mask(m), 2), sLc.basis_mask(m)]],
@@ -5757,12 +5971,12 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
         for piece in bare_pieces
     ]
     _causal_medium(eps_r, mu_r)
-    sd_e = BorPecSolver(points_interface, freq_hz, gauss_order=gauss_order)
-    sd_L = BorPecSolver(points_interface, freq_hz, gauss_order=gauss_order,
+    sd_e = _prepared_surface(points_interface, freq_hz, gauss_order=gauss_order)
+    sd_L = _prepared_surface(points_interface, freq_hz, gauss_order=gauss_order,
                         medium=(eps_r, mu_r))
-    s2_L = BorPecSolver(points_covered, freq_hz, gauss_order=gauss_order,
+    s2_L = _prepared_surface(points_covered, freq_hz, gauss_order=gauss_order,
                         medium=(eps_r, mu_r))
-    bares = [BorPecSolver(p, freq_hz, gauss_order=gauss_order)
+    bares = [_prepared_surface(p, freq_hz, gauss_order=gauss_order)
              for p in bare_pieces]
 
 
@@ -5891,14 +6105,16 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
     # Every reverse mapping follows exactly from its forward one
     # (_ReverseCrossOperators), so only one direction per surface pair is
     # integrated.
-    X_d2 = BorCrossOperators(sd_L, s2_L, **xkw)
+    X_d2 = _prepared_cross(sd_L, s2_L, **xkw)
     X_2d = _reverse_cross(X_d2, **xkw)
-    X_d1 = [BorCrossOperators(sd_e, b, **xkw) for b in bares]
+    X_d1 = [_prepared_cross(sd_e, b, **xkw) for b in bares]
     X_1d = [_reverse_cross(X, **xkw) for X in X_d1]
     X_11 = {}
     for i in range(len(bares)):
         for j in range(i + 1, len(bares)):
-            X_11[(i, j)] = BorCrossOperators(bares[i], bares[j], **xkw)
+            # Either direction can consume P through its source impedance.
+            need_p = S_maps[i] is not None or S_maps[j] is not None
+            X_11[(i, j)] = _prepared_cross(bares[i], bares[j], need_p=need_p, **xkw)
             X_11[(j, i)] = _reverse_cross(X_11[(i, j)], **xkw)
 
     k = sd_e.k
@@ -5944,14 +6160,14 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
                 )
             for cross in all_crosses:
                 cross.enable_streaming(mm, **common)
-        sd_e.prepare_operators(mm, efie=True, ibc=True, workers=planned_workers)
-        sd_L.prepare_operators(mm, efie=True, ibc=True, workers=planned_workers)
-        s2_L.prepare_operators(mm, efie=True, workers=planned_workers)
+        sd_e.prepare_operators(mm, efie=True, ibc=True, workers=workers)
+        sd_L.prepare_operators(mm, efie=True, ibc=True, workers=workers)
+        s2_L.prepare_operators(mm, efie=True, workers=workers)
         for bi, b in enumerate(bares):
             b.prepare_operators(mm, efie=True, ibc=zs_elems[bi] is not None,
-                                workers=planned_workers)
+                                workers=workers)
         for X in all_crosses:
-            X.prepare(mm, workers=planned_workers)
+            X.prepare(mm, workers=workers)
 
 
         # Signed-mode symmetry assembles only m >= 0, so the m = -1 category
@@ -6189,7 +6405,7 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
     try:
         F, modes_used, stats = _mode_sweep(n_full, thetas, ("VV", "HH"), m_max,
                                            mode_tol, assemble, rhs, farfield,
-                                           prepare=prepare, workers=plan["workers"],
+                                           prepare=prepare, workers=plan["workers"], preparation_workers=workers,
                                            progress=progress,
                                            check_abort=check_abort,
                                            monitor_cond=True,
@@ -6199,7 +6415,7 @@ def solve_bor_partial_coating(points_interface, points_covered, bare_pieces,
                                            assembly_peak_gb=plan["assembly_peak_gb"],
                                            memory_context="The partial-coating BoR solve",
                                            stream_mode_block=plan["mode_block"],
-                                           signed_mode_symmetry=True,
+                                           signed_mode_symmetry=True, axial_mode_only=_all_axial_aspects(thetas),
                                            coordinates=lambda m: _constraint_coordinates(
                                                np.vstack((np.tile(sd_e.gen.nodes, (4, 1)),
                                                           np.tile(s2_L.gen.nodes, (2, 1)),
@@ -6319,7 +6535,7 @@ class _MultiRegionBor:
         self.solv: 'Dict[Tuple[int, int], BorPecSolver]' = {}
         for si, (pts, _) in enumerate(surfaces):
             for ri in self.adj[si]:
-                self.solv[(si, ri)] = BorPecSolver(
+                self.solv[(si, ri)] = _prepared_surface(
                     pts, freq_hz, gauss_order=gauss_order,
                     medium=regions[ri]["medium"])
 
@@ -6332,9 +6548,11 @@ class _MultiRegionBor:
                         continue
                     # One integrated direction per surface pair; the reverse
                     # follows exactly (_ReverseCrossOperators).
-                    forward = BorCrossOperators(
+                    forward = _prepared_cross(
                         self.solv[(si, ri)], self.solv[(sj, ri)],
-                        near_factor=near_factor, near_order=near_order)
+                        near_factor=near_factor, near_order=near_order,
+                        need_p=(not self.is_cond[si] or not self.is_cond[sj]
+                                or self.core_cfie[si] or self.core_cfie[sj]))
                     self.X[(ri, si, sj)] = forward
                     self.X[(ri, sj, si)] = _reverse_cross(
                         forward, near_factor=near_factor, near_order=near_order)
@@ -6548,8 +6766,9 @@ class _MultiRegionBor:
                         P = self.solv[(si, ri)].assemble_pmchwt_P(m, m_max) \
                             if not self.is_cond[si] else None
                     else:
-                        T = _cross_block(self.X[(ri, si, sj)], 'T', m, m_max, memo)
-                        P = _cross_block(self.X[(ri, si, sj)], 'P', m, m_max, memo)
+                        cross = self.X[(ri, si, sj)]
+                        T = _cross_block(cross, 'T', m, m_max, memo)
+                        P = _cross_block(cross, 'P', m, m_max, memo) if cross.need_p else None
                     slJ_i = slice(self.off_J[si], self.off_J[si] + 2 * self.Nn[si])
                     slJ_j = slice(self.off_J[sj], self.off_J[sj] + 2 * self.Nn[sj])
                     A[slJ_i, slJ_j] += ss * T
@@ -6659,21 +6878,21 @@ def _solve_multiregion(sys_: '_MultiRegionBor', freq_hz, thetas_deg, n_modes,
             solver._stream is None for solver in sys_.solv.values()
         ):
             sys_.enable_streaming(mm, plan)
-        sys_.prepare(mm, workers=plan["workers"])
+        sys_.prepare(mm, workers=workers)
 
     try:
         F, modes_used, stats = _mode_sweep(
             sys_.n_full, thetas, ("VV", "HH"), m_max, mode_tol,
             lambda m: sys_.assemble(m, m_max), sys_.rhs, sys_.farfield,
             prepare=prepare,
-            workers=plan["workers"], progress=progress, check_abort=check_abort,
+            workers=plan["workers"], preparation_workers=workers, progress=progress, check_abort=check_abort,
             monitor_cond=True, rhs_batch=sys_.rhs_batch,
             farfield_batch=sys_.farfield_batch,
             min_mode_before_tail=mode_tail_start,
             assembly_peak_gb=plan["assembly_peak_gb"],
             memory_context=f"The {formulation} BoR solve",
             stream_mode_block=plan["mode_block"],
-            signed_mode_symmetry=True,
+            signed_mode_symmetry=True, axial_mode_only=_all_axial_aspects(thetas),
             coordinates=lambda m: _constraint_coordinates(np.vstack([
                 np.tile(sys_.solv[(si, sys_.adj[si][0])].gen.nodes, (2 if sys_.is_cond[si] else 4, 1))
                 for si in range(sys_.n_surf)]), sys_.build_Q(m)),

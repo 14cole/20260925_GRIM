@@ -33,12 +33,14 @@ class CrashingPairedOracle(PairedOracle):
         return super().get_with_error(rows, cols)
 
 
-def paired_operators(oracle_class, workers, flag=None):
-    mesh, te, _ = prepared('mixed', 'TE', 160)
-    _, tm, _ = prepared('mixed', 'TM', 160)
+def paired_operators(oracle_class, workers, flag=None, degree=1, count=160, details=False):
+    options = dict(automatic_options(), basis_order=degree)
+    with execution_scope(options):
+        mesh, te, _ = prepared('mixed', 'TE', count)
+        _, tm, _ = prepared('mixed', 'TM', count)
     with mock.patch.dict(os.environ, {'GHOST_TILE_PROCESSES': str(workers)}), \
             mock.patch.object(tile_processes, 'MIN_TILES', 1), \
-            execution_scope(automatic_options()), execution._STATE.override(execution.CPUState()), \
+            execution_scope(options), execution._STATE.override(execution.CPUState()), \
             tempfile.TemporaryDirectory() as directory:
         oracle = oracle_class(mesh, te, tm, cut=32)
         oracle.flag = flag
@@ -48,8 +50,9 @@ def paired_operators(oracle_class, workers, flag=None):
         operators = build_pair(oracle, coordinates, tile=16, budget=2**30, spool_directory=directory)
         operators[1].load()
         identity = np.eye(operators[0].n, dtype=complex)
-        return ([op.matmul(identity) for op in operators] + [op.row_error.copy() for op in operators],
-                [(source.calls, source.entries) for source in oracle.oracles])
+        result = ([op.matmul(identity) for op in operators] + [op.row_error.copy() for op in operators],
+                  [(source.calls, source.entries) for source in oracle.oracles])
+        return result + ([op.evidence for op in operators],) if details else result
 
 
 class TileProcessTests(unittest.TestCase):
@@ -61,13 +64,26 @@ class TileProcessTests(unittest.TestCase):
         self.assertEqual(parallel_counts, serial_counts)
 
     def test_lost_worker_hands_remaining_tiles_to_this_process(self):
-        serial, _ = paired_operators(PairedOracle, 0)
+        # Keep identical query semantics: custom oracle subclasses deliberately
+        # retain their overridden query instead of the standard reciprocal API.
+        serial, _ = paired_operators(CrashingPairedOracle, 0)
         with tempfile.TemporaryDirectory() as directory:
             flag = str(Path(directory) / 'crash-once')
             recovered, _ = paired_operators(CrashingPairedOracle, 2, flag)
             self.assertFalse(Path(flag).exists())
         for expected, actual in zip(serial, recovered):
             np.testing.assert_array_equal(actual, expected)
+
+    def test_polynomial_workers_publish_shared_bounded_cache_evidence(self):
+        serial, _ = paired_operators(PairedOracle, 0, degree=2, count=24)
+        parallel, _, evidence = paired_operators(PairedOracle, 2, degree=2, count=24, details=True)
+        for expected, actual in zip(serial, parallel):
+            np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=1e-15)
+        first, second = (item['worker_moment_cache'] for item in evidence)
+        self.assertIs(first, second)  # Each polarization shares the same traversal, not twice the work.
+        self.assertGreater(first['stores'], 0)
+        self.assertLessEqual(first['peak_accounted_retained_bytes'],
+                             first['workers']*first['budget_bytes_per_worker'])
 
     def test_small_daemon_or_unmarked_work_stays_in_process(self):
         class Operator:

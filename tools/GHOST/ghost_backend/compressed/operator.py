@@ -8,12 +8,14 @@ from ghost_backend.twod.assembly.compact import CompactOperator
 import scipy.linalg as la
 from ghost_backend.linalg.sweep import _qr_basis
 from ghost_backend.linalg.hierarchical import spatial_order
+from ghost_backend.execution.metrics import timed_stage
 
 # A ceiling, resolved against the active allocation at each operation.
 MATMUL_WORKERS=4
 MATMUL_THREADED_COLUMNS=8
 
 
+@timed_stage('compressed_coefficients')
 def tile_values(oracle, rows, cols, missing=None):
     """Query only missing polarizations, optionally proposing a verified basis."""
     from ghost_backend.execution.options import option
@@ -35,6 +37,43 @@ def tile_values(oracle, rows, cols, missing=None):
         proposed = source.propose_fast_far(rows, cols) if experimental and hasattr(source, 'propose_fast_far') else None
         result[i] = (*source.get_with_error(rows, cols), proposed)
     return result
+
+
+def reciprocal_enabled(oracle):
+    from ghost_backend.execution.options import environment_value,option
+    setting=environment_value('GHOST_COMPRESSED_RECIPROCAL','auto').strip().lower()
+    if setting not in ('auto','off'):
+        raise ValueError('GHOST_COMPRESSED_RECIPROCAL must be auto or off.')
+    if setting=='off' or option('compressed_far_method','full')!='full':return False
+    from ghost_backend.compressed.regional_coefficients import PreparedOracle,PairedOracle
+    # An overridden query can have additional semantics (including cancellation
+    # or specialized coefficients); never bypass a subclass's public method.
+    return (type(oracle) is PreparedOracle or
+            type(oracle) is PairedOracle and all(type(source) is PreparedOracle for source in oracle.oracles))
+
+
+def assembly_tasks(oracle,operators):
+    """At most two reciprocal tiles per task, with no deferred opposite grid."""
+    paired=reciprocal_enabled(oracle)
+    groups=operators[0].groups
+    for j in range(len(groups)):
+        for i in range(j if paired else 0,len(groups)):
+            positions=((i,j),(j,i)) if paired and i!=j else ((i,j),)
+            yield tuple((r,c,[index for index,op in enumerate(operators) if (r,c) not in op.pilot_tiles])
+                        for r,c in positions)
+
+
+@timed_stage('compressed_coefficients')
+def _reciprocal_values(oracle,requests):
+    from ghost_backend.compressed.regional_coefficients import reciprocal_values
+    return reciprocal_values(oracle,requests)
+
+
+def tile_batch_values(oracle,groups,task):
+    if len(task)>1:
+        return _reciprocal_values(oracle,[(groups[i],groups[j],missing) for i,j,missing in task])
+    i,j,missing=task[0]
+    return [tile_values(oracle,groups[i],groups[j],missing) if missing else {}]
 
 
 def take_pilot(operator, i, j):
@@ -239,17 +278,15 @@ class StreamedOperator:
             self.finalize(oracle)
             return
         with TileWriter() as writer:
-            for j,cols in enumerate(self.groups):
-                if hasattr(oracle,'prepare_columns'):oracle.prepare_columns(cols)
-                for i,rows in enumerate(self.groups):
+            for task in assembly_tasks(oracle,[self]):
+                if hasattr(oracle,'prepare_columns'):oracle.prepare_columns(self.groups[task[0][1]])
+                values=tile_batch_values(oracle,self.groups,task)
+                for (i,j,_),value in zip(task,values):
                     self.checkpoint()
-                    previous = take_pilot(self, i, j)
-                    if previous is not None:
-                        writer.submit_prepared(previous,self.store_tile)
-                        continue
-                    raw,tail,proposal=tile_values(oracle,rows,cols)[0]
-                    writer.submit(self.compress_tile,self.store_tile,i,j,raw,tail,proposal)
-                    raw=tail=None
+                    previous=take_pilot(self,i,j)
+                    if previous is not None:writer.submit_prepared(previous,self.store_tile)
+                    else:writer.submit(self.compress_tile,self.store_tile,i,j,*value[0])
+                values=None
         self.finalize(oracle)
 
     def separated(self, i, j):
@@ -262,6 +299,7 @@ class StreamedOperator:
     def add_tile(self,i,j,raw,tail):
         self.store_tile(self.compress_tile(i,j,raw,tail))
 
+    @timed_stage('compressed_tile_compression')
     def compress_tile(self,i,j,raw,tail,proposal=None):
         """Validate and compress one tile without touching shared operator state."""
         self.checkpoint()
@@ -301,11 +339,18 @@ class StreamedOperator:
         if len(self.tiles)!=len(self.groups)**2:raise ValueError('Operator has missing tiles.')
         if not all(np.all(np.isfinite(a)) for a in (self.row_norm,self.row_error,self.column_norm,self.column_error,self.row_max)):
             raise ValueError('Operator norms or coefficient error bounds overflowed.')
+        # Reciprocal tasks finish both directions together. Keep every later
+        # multiplication and equilibration in canonical column-major tile order.
+        self.tiles=dict(sorted(self.tiles.items(),key=lambda item:(item[0][1],item[0][0])))
         self.evidence=dict(unknowns=self.n,tiles=len(self.tiles),compressed_tiles=self.compressed,
             retained_bytes=self.bytes,max_query_bytes=self.peak_tile,geometry_queries=oracle.calls,
             geometry_coefficients=oracle.entries,dropped_routes=oracle.dropped_routes,
             row_error_bound=float(self.row_error.max()),storage_budget=self.budget,compression=self.compression)
         self.evidence['reused_admission_tiles'] = self.pilot_reuses
+        if hasattr(self, 'worker_moment_cache'):
+            self.evidence['worker_moment_cache'] = self.worker_moment_cache
+        if hasattr(self, 'assembly_components'):
+            self.evidence['assembly_components'] = self.assembly_components
 
     def __len__(self):return self.n
     def __matmul__(self,value):return self.matmul(value)
@@ -374,10 +419,31 @@ class StreamedOperator:
                     result[np.ix_(ri,ci)]=value
         return result
 
-    def block_matmul(self,rows,cols,x,row_plan=None,col_plan=None):
-        """A[rows][:,cols] @ x without forming the block (x has len(cols) rows)."""
+    def block_matmul(self,rows,cols,x,row_plan=None,col_plan=None,trans=0):
+        """Apply a subblock or its transpose/adjoint without reconstructing it.
+
+        The inverse builder supplies validated unique tree subsets and reuses
+        their plans. Products retain the tile factors; workspace is bounded by
+        a tile times the number of probe columns, rather than the whole block.
+        """
+        if trans not in (0,1,2):raise ValueError('Invalid transpose mode')
+        x=np.asarray(x)
+        expected=len(cols) if trans==0 else len(rows)
+        if x.ndim!=2 or x.shape[0]!=expected or not x.shape[1]:
+            raise ValueError('Block RHS does not match the requested operation.')
         row_plan=self.plan(rows) if row_plan is None else row_plan
         col_plan=self.plan(cols) if col_plan is None else col_plan
+        if trans:
+            result=np.zeros((len(cols),x.shape[1]),complex)
+            def adj(a):return a.T if trans==1 else a.conj().T
+            for i,ri,local_r in row_plan:
+                self.checkpoint()
+                local=np.zeros((len(self.groups[i]),x.shape[1]),complex);local[local_r]=x[ri]
+                for j,ci,local_c in col_plan:
+                    left,right=self.tiles[i,j]
+                    value=adj(left) @ local
+                    result[ci]+=value[local_c] if right is None else adj(right[:,local_c]) @ value
+            return result
         result=np.zeros((len(rows),x.shape[1]),complex)
         for j,ci,local_c in col_plan:
             self.checkpoint()
@@ -385,6 +451,41 @@ class StreamedOperator:
             for i,ri,local_r in row_plan:
                 left,right=self.tiles[i,j]
                 result[ri]+=left[local_r] @ (local if right is None else right @ local)
+        return result
+
+    def projection_plan(self,mapping):
+        mapping=mapping.tocsr()
+        active=np.flatnonzero(np.diff(mapping.indptr))
+        result=[]
+        for group in np.unique(self.group_id[active]):
+            part=mapping[self.groups[int(group)]]
+            columns=np.unique(part.indices)
+            result.append((int(group),columns,part[:,columns]))
+        return result
+
+    def project_sparse(self,left_map,right_map,left_plan=None,right_plan=None):
+        """left_map.T A right_map, contracting sparse supports into tile factors.
+
+        In particular, polynomial embeddings have only a few nonzeros per
+        fine row. Densifying them into hundreds of RHS columns would discard
+        that structure and repeat mostly-zero matrix products.
+        """
+        self.iter_tiles().close()
+        if left_map.shape[0]!=self.n or right_map.shape[0]!=self.n:
+            raise ValueError('Sparse projection maps must match the operator.')
+        left_plan=self.projection_plan(left_map) if left_plan is None else left_plan
+        right_plan=self.projection_plan(right_map) if right_plan is None else right_plan
+        result=np.zeros((left_map.shape[1],right_map.shape[1]),complex)
+        for i,ri,p in left_plan:
+            self.checkpoint()
+            for j,ci,q in right_plan:
+                u,v=self.tiles[i,j]
+                projected=np.asarray(p.T @ u)
+                if v is None:
+                    value=np.asarray(q.T @ projected.T).T
+                else:
+                    value=projected @ np.asarray(q.T @ v.T).T
+                result[np.ix_(ri,ci)]+=value
         return result
 
     def matmul(self,b,trans=0):

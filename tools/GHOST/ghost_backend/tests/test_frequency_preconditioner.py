@@ -46,6 +46,23 @@ def test_borrowed_inverse_solves_new_operator_and_old_operator_is_released(enabl
     for trans,matrix in ((0,new),(1,new.T),(2,new.conj().T)):
         np.testing.assert_allclose(g.inverse(b,trans=trans),np.linalg.solve(matrix,b),rtol=1e-12,atol=1e-12)
     assert g.event['max_backward_error']<=1e-12
+    evidence=g.event['frequency_preconditioner']
+    assert evidence['original_wavenumber']==evidence['original_frequency_coordinate']==10.
+    assert evidence['current_frequency_coordinate']==10.05
+    assert evidence['coordinate_units']=='rad/m'
+
+
+def test_hertz_recycling_evidence_does_not_mislabel_wavenumber(enabled):
+    f=factor(np.eye(16),frequency=10e9,recycling_coordinate_units='Hz')
+    f.solve(np.ones(16));f.retain_preconditioner()
+    g=factor(np.eye(16),frequency=10.05e9,recycling_coordinate_units='Hz')
+    assert g.recycled
+    evidence=g.event['frequency_preconditioner']
+    assert evidence['original_frequency_coordinate']==evidence['original_frequency_hz']==10e9
+    assert evidence['current_frequency_coordinate']==10.05e9
+    assert evidence['coordinate_units']=='Hz'
+    assert 'original_wavenumber' not in evidence
+    np.testing.assert_allclose(g.solve(np.ones(16)),1.,atol=1e-13,rtol=1e-13)
 
 
 def test_failed_reuse_rebuilds_fresh_without_looser_error_gate(enabled):
@@ -168,3 +185,22 @@ def test_tight_storage_cap_drops_optional_cache_before_building(enabled):
     new=operator(np.eye(16));g=CompressedFactor(new,storage_budget_bytes=new.bytes+6000)
     assert recycling.live_bytes()==0
     assert g.event['factorizations']==1
+
+
+def test_concurrent_modes_transfer_each_cached_tree_to_only_one_owner():
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    owner=recycling.InverseCache(2**20)
+    tree=SimpleNamespace(inverse_only=True,bytes=1024,root=SimpleNamespace(leaf=True))
+    assert owner.put(b'mode',10.,tree)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results=list(pool.map(lambda _:owner.take(b'mode',10.01,2**20),range(32)))
+    assert sum(result is not None for result in results)==1
+    assert owner.bytes==0 and not owner.entries
+
+
+def test_larger_opt_in_capacity_still_obeys_five_percent_reservation():
+    with execution_scope(validate_options(dict(frequency_preconditioner='reuse',ram_budget_gib=12.))),preparation_scope():
+        assert recycling.capacity_bytes()==512*1024**2
+    with execution_scope(validate_options(dict(frequency_preconditioner='reuse',ram_budget_gib=2.))),preparation_scope():
+        assert recycling.capacity_bytes()==int(.05*2*1024**3)

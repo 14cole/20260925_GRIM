@@ -78,7 +78,12 @@ FAR_COMPRESSION_PROCESS_PAIRS = 400_000
 def far_compression_selected(n_nodes: 'int') -> 'bool':
     """Whether streamed far blocks of a surface with ``n_nodes`` nodes are compressed."""
     from ghost_backend.bor.options import current_options
-    setting = current_options().get('far_compression', 'auto')
+    options = current_options()
+    # Full compressed solves require their original accurate coefficients.
+    # The sampled-ACA far approximation is a separate dense assembly route.
+    if options['factorization'] == 'compressed':
+        return False
+    setting = options.get('far_compression', 'auto')
     if setting == 'off':
         return False
     return setting == 'on' or int(n_nodes) >= FAR_COMPRESSION_MIN_NODES
@@ -208,6 +213,18 @@ class _Geometry:
         self.native_threads = 1
         self.work_bytes = _streaming.modal_kernels.FFT_BUILD_BUDGET
 
+    def for_modes(self, lo, hi):
+        """Share geometry/weights while selecting a retained modal band.
+
+        m_max stays unchanged: it controls the angular sampling rule, while
+        modes/orders only select its Fourier projections.
+        """
+        from copy import copy
+        result = copy(self)
+        result.modes = np.arange(int(lo), int(hi) + 1)
+        result.orders = np.arange(max(0, int(lo) - 1), int(hi) + 2)
+        return result
+
     def stream(self):
         """The attributes :func:`streaming._banded_stream` reads of a stream."""
         solver = SimpleNamespace(g=self.points, gauss_order=self.go, P=self.P,
@@ -236,7 +253,7 @@ class _Tiles:
             Gn = _streaming._banded_stream(self.stream, rows, "g", geo.orders, (f0, f1),
                                            near_free=near_free)
             left = geo.left_all[:, :, rows].reshape(2 * len(_streaming._LEFT_KINDS), re, go)
-            return _streaming._efie_band(Gn, left, geo.right_groups, geo.modes, 0, geo.k,
+            return _streaming._efie_band(Gn, left, geo.right_groups, geo.modes, int(geo.orders[0]), geo.k,
                                          f0, f1, re, go)
         Fs = _streaming._banded_stream(self.stream, rows, family, geo.modes, (f0, f1),
                                        near_free=near_free)
@@ -471,6 +488,7 @@ class _Executor:
 
     def __init__(self, geometry, workers, pairs):
         self.geometry = geometry
+        self.total_work_bytes = geometry.work_bytes
         self.pool = None
         self.threads = 1
         self.pinned = False
@@ -479,7 +497,7 @@ class _Executor:
             from concurrent.futures import ProcessPoolExecutor
             import multiprocessing
             from ghost_backend.execution.runtime import pin_worker_environment
-            geometry.work_bytes = _streaming.modal_kernels.FFT_BUILD_BUDGET / processes
+            geometry.work_bytes = self.total_work_bytes / processes
             pin_worker_environment()
             self.pinned = True
             self.pool = ProcessPoolExecutor(max_workers=processes,
@@ -490,7 +508,7 @@ class _Executor:
         else:
             self.threads = max(1, int(workers))
             self.workers = self.threads
-            geometry.work_bytes = _streaming.modal_kernels.FFT_BUILD_BUDGET / self.threads
+            geometry.work_bytes = self.total_work_bytes / self.threads
             self.backend = "threads" if self.threads > 1 else "serial"
         self.local = threading.local()
         self.pairs = 0
@@ -563,7 +581,7 @@ class _Executor:
             pool.shutdown(wait=False, cancel_futures=True)
         self.threads = self.workers
         self.backend = "threads (process pool failed)"
-        self.geometry.work_bytes = _streaming.modal_kernels.FFT_BUILD_BUDGET / self.threads
+        self.geometry.work_bytes = self.total_work_bytes / self.threads
 
     def close(self):
         pool, self.pool = self.pool, None
@@ -595,9 +613,9 @@ class CompressedFarBlocks:
     The read interface of :class:`streaming.StreamingFarBlocks` (EFIE blocks
     without the ``C = jk eta 2 pi`` factor, MFIE and rotated-PV/IBC bracket
     blocks with the 2 pi Galerkin factor, signed modes by
-    :func:`near_storage.mode_sign`).  Every mode is built at once and kept
-    in RAM; ``mode_block``, ``spill``, ``tile_budget_gb`` and ``tile_threads``
-    of the streamed store are accepted and have no use here.
+    :func:`near_storage.mode_sign`). A bounded band is retained in RAM.
+    Geometry, quadrature rules and the block partition are reused when the
+    sweep advances. Compressed factors are never expanded into a dense spill.
     """
 
     def __init__(self, solver, m_max: 'int', efie: 'bool' = True,
@@ -605,7 +623,7 @@ class CompressedFarBlocks:
                  dtype=np.complex128, tile_budget_gb=None, workers: 'int' = 1,
                  mode_block=None, spill=None, tile_threads=None,
                  tolerance: 'float' = FAR_COMPRESSION_TOLERANCE):
-        del tile_budget_gb, mode_block, spill, tile_threads
+        del spill, tile_threads
         from ghost_backend.bor.options import current_checkpoint
         self.solver = solver
         self.m_max = int(m_max)
@@ -624,12 +642,15 @@ class CompressedFarBlocks:
         # complex64, like the streamed blocks; they are built in double.
         self.dtype = np.dtype(dtype)
         self.n_sweeps = 0
-        self.lo, self.hi = 0, self.m_max
-        self.mode_block = self.m_max + 1
+        self.lo, self.hi = 1, 0
+        self.mode_block = _streaming._aligned_stream_mode_block(self.m_max, mode_block, workers)
         self._closed = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._workers = max(1, int(workers))
         self._native = _streaming._NATIVE if abs(self.k.imag) == 0.0 else None
-        geometry = _Geometry(solver, self.m_max, families, ibc_zs_pt, pmchwt)
+        self._geometry = _Geometry(solver, self.m_max, families, ibc_zs_pt, pmchwt)
+        if tile_budget_gb is not None:
+            self._geometry.work_bytes = min(self._geometry.work_bytes, float(tile_budget_gb) * 1e9)
         self.clusters = cluster_tree(self.Nn)
         self.admissible, self.dense = block_partition(
             self.clusters, solver.gen.nodes, solver._near_sources_by_element)
@@ -637,8 +658,29 @@ class CompressedFarBlocks:
         self.evidence = dict(tolerance=self.tolerance, leaf=FAR_COMPRESSION_LEAF,
                              eta=FAR_COMPRESSION_ETA, admissible_blocks=len(self.admissible),
                              dense_blocks=len(self.dense))
-        checkpoint = current_checkpoint() or (lambda: None)
-        self._build(geometry, max(1, int(workers)), checkpoint)
+        self._checkpoint = current_checkpoint() or (lambda: None)
+        self._ensure(0)
+
+    def _ensure(self, mode):
+        with self._lock:
+            if self._closed:
+                raise _closed_error()
+            if not 0 <= int(mode) <= self.m_max:
+                raise ValueError('Requested mode exceeds the compressed far-store cap.')
+            if self.lo <= mode <= self.hi:
+                return
+            lo = int(mode) // self.mode_block * self.mode_block
+            hi = min(lo + self.mode_block - 1, self.m_max)
+            self._blocks = {family: {} for family in self.families}
+            self._build(self._geometry.for_modes(lo, hi), self._workers, self._checkpoint)
+            self.lo, self.hi = lo, hi
+            self.evidence.update(mode_range=[lo, hi], mode_block=self.mode_block,
+                                 mode_cap=self.m_max, sweeps=self.n_sweeps)
+
+    def _mode_store(self, family, mode):
+        with self._lock:
+            self._ensure(abs(int(mode)))
+            return self._store(family), abs(int(mode)) - self.lo
 
     # -- build ---------------------------------------------------------
     def _span(self, index):
@@ -673,7 +715,7 @@ class CompressedFarBlocks:
             # Each family's scale per mode: the root sum of squares of its
             # near-diagonal leaves (an off-diagonal EFIE leaf stands for two).
             scales = {}
-            nm = self.m_max + 1
+            nm = len(geometry.modes)
             for family in self.families:
                 total = np.zeros(nm)
                 for (fam, I, J), entry in entries.items():
@@ -706,7 +748,7 @@ class CompressedFarBlocks:
             lowrank_blocks=len(ranks), max_rank=max(ranks, default=0),
             mean_rank=float(np.mean(ranks)) if ranks else 0.0,
             stored_gb=self.memory_gb(), build_seconds=time.perf_counter() - start)
-        self.n_sweeps = 1
+        self.n_sweeps += 1
 
     # -- reads ---------------------------------------------------------
     def _store(self, family):
@@ -736,8 +778,7 @@ class CompressedFarBlocks:
         first; lower blocks are the upper blocks' (negated, for tf/ft)
         transposes, as the streamed build completes them.
         """
-        store = self._store("efie")
-        mi = abs(int(m))
+        store, mi = self._mode_store("efie", m)
         factors = [scale * mode_sign(uv, m) for uv in range(4)]
         for (I, J), entry in store.items():
             values = self._values(entry, mi)
@@ -755,8 +796,7 @@ class CompressedFarBlocks:
         ('mfie') or rotated-PV/IBC ('ibc') blocks of one signed mode."""
         if scale == 0:
             return
-        store = self._store(family)
-        mi = abs(int(m))
+        store, mi = self._mode_store(family, m)
         factors = [scale * mode_sign(uv, m) for uv in range(4)]
         for (I, J), entry in store.items():
             values = self._values(entry, mi)
@@ -815,4 +855,5 @@ class CompressedFarBlocks:
     def close(self) -> 'None':
         self._closed = True
         self._blocks = {}
+        self._geometry = None
         self.Z = self.K = self.B = None

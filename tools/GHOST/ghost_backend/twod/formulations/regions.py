@@ -472,6 +472,10 @@ def assemble_system(mesh, infos, pol, obs_order=8, src_order=8):
     from ghost_backend.twod.formulations.combined_regions import couplings
     from ghost_backend.compressed.runtime import enabled, regional
     if enabled():return regional(mesh,infos,pol,obs_order,src_order)
+    from ghost_backend.twod.assembly.polynomial_pair import dense_system
+    projected = dense_system(mesh, infos, pol, obs_order, src_order)
+    if projected is not None:
+        return projected
     from ghost_backend.twod.assembly.session import current_session, system_key
     session = current_session()
     key = system_key(mesh, infos, 'multi_region', obs_order, src_order) if session is not None else None

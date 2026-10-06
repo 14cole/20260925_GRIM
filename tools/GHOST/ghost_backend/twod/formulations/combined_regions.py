@@ -214,12 +214,13 @@ def fused_outputs(matrix, mesh, layout, rows=None, columns=None):
 
 
 def exterior_double_density(mesh, layout):
-    coefficients = couplings(mesh,layout)
+    coefficients = {key: gamma for key, gamma in couplings(mesh,layout).items()
+                    if layout['region_props'][key[1]]['has_incident']}
+    if not coefficients:
+        return None
     def density(solution):
         result = np.zeros((len(mesh.nodes),solution.shape[1]),complex)
         for (mi,rid), gamma in coefficients.items():
-            if not layout['region_props'][rid]['has_incident']:
-                continue
             interface = layout['ifaces'][mi]
             offset,count = layout['dof_map'][mi,'minus' if interface['r_m']==rid else 'plus']
             result[interface['nodes']] += gamma*solution[offset:offset+count]

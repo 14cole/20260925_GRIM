@@ -1,0 +1,3531 @@
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/bor/dispatch.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/dispatch.py
+--- backup_before_fixes/ghost_backend/bor/dispatch.py	2026-10-05 20:23:41.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/dispatch.py	2026-10-06 08:14:29.066148800 -0700
+@@ -498,9 +498,9 @@
+ 
+     ``assembly`` is None unless the chooser replaces the caller's ``'auto'``:
+     when the dense plan of the solvers' own assembly decision cannot fit
+-    (they choose tables below a fixed 2 GB whatever the limit is), dense
+-    streaming is priced next and compression is selected only when neither
+-    fits. Snapshot entries choose once for the whole sweep, so an imposed
++    (conductors stream; the material solvers choose tables below a fixed 2 GB
++    whatever the limit is), dense streaming is priced next and compression is
++    selected only when neither fits. Snapshot entries choose once for the whole sweep, so an imposed
+     streamed assembly applies to every frequency; it costs about what tables
+     cost, and compression several times more.
+     """
+@@ -719,7 +719,9 @@
+               and supplied.get('points_core') is not None and 'eps_r' in supplied)
+     if len(layout) == 1:
+         decision = sides * estimate_bor_table_gb(elements, modes, formulation, has_ibc, order, False)
+-        streaming = assembly == 'streaming' or (assembly == 'auto' and decision > 2.0)
++        # solve_bor streams every automatic conductor solve (October 2026); the
++        # dielectric solver keeps its 2 GB table threshold.
++        streaming = assembly == 'streaming' or (assembly == 'auto' and (conductor or decision > 2.0))
+         if streaming:
+             block, held, planned = plan_streaming_mode_block(elements, modes, formulation, has_ibc,
+                                                              False, budget / sides, workers)
+@@ -945,10 +947,9 @@
+         table_double = estimate_bor_table_gb(
+             element_count, mode_cap, formulation, has_ibc, FAR_GAUSS_ORDER, False
+         )
+-        use_streaming = (
+-            assembly_key == "streaming"
+-            or (assembly_key == "auto" and table_double > 2.0)
+-        )
++        # Conductors and sheets stream whenever the caller leaves the assembly
++        # automatic (solve_bor, October 2026); tables are an explicit request.
++        use_streaming = assembly_key in ("streaming", "auto")
+         full_double = (
+             estimate_streaming_gb(
+                 element_count, mode_cap, formulation, has_ibc, False
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/bor/kernels.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/kernels.py
+--- backup_before_fixes/ghost_backend/bor/kernels.py	2026-10-05 19:17:27.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/kernels.py	2026-10-06 08:08:36.797179400 -0700
+@@ -437,6 +437,17 @@
+ _FAR_TABLES = OrderedDict()
+ _FAR_TABLE_BYTES = [0]
+ _FAR_TABLE_LOCK = threading.Lock()
++# Each tile thread keeps references to the few tables it uses, so the shared
++# store's lock (taken once per pair group per tile: 8-12% of the far build's
++# thread time at eight threads) is only reached on a miss.
++_FAR_TABLE_LOCAL = threading.local()
++_FAR_TABLE_LOCAL_ENTRIES = 16
++
++
++def _remember_local_table(local, key, entry):
++    if len(local) >= _FAR_TABLE_LOCAL_ENTRIES:
++        local.clear()
++    local[key] = entry
+ 
+ 
+ def _far_sample_counts(bracket, rp, rq, gap, k, top_order, pts_per_peak=8.0):
+@@ -524,11 +535,19 @@
+     shared across threads; the cache is bounded by FAR_TABLE_CACHE_BYTES.
+     """
+     key = (int(size), modes.tobytes(), bool(want_sine), projection)
++    local = getattr(_FAR_TABLE_LOCAL, 'tables', None)
++    if local is None:
++        local = _FAR_TABLE_LOCAL.tables = {}
++    entry = local.get(key)
++    if entry is not None:
++        return entry
+     with _FAR_TABLE_LOCK:
+         entry = _FAR_TABLES.get(key)
+         if entry is not None:
+             _FAR_TABLES.move_to_end(key)
+-            return entry
++    if entry is not None:
++        _remember_local_table(local, key, entry)
++        return entry
+     size = int(size)
+     half = size // 2 + 1
+     xi = 2 * np.pi * np.arange(half) / size - np.pi
+@@ -562,6 +581,9 @@
+                 while _FAR_TABLE_BYTES[0] > FAR_TABLE_CACHE_BYTES and len(_FAR_TABLES) > 1:
+                     _, old = _FAR_TABLES.popitem(last=False)
+                     _FAR_TABLE_BYTES[0] -= sum(v.nbytes for v in old if v is not None)
++            else:
++                entry = _FAR_TABLES[key]
++        _remember_local_table(local, key, entry)
+     return entry
+ 
+ 
+@@ -1792,29 +1814,64 @@
+             fine = np.ceil(orders * NEAR_LEVEL_GROWTH).astype(np.int64)
+             if int(fine.max()) > NEAR_ANGULAR_MAX_ORDER:
+                 raise ValueError("BoR near angular quadrature exceeds its accuracy limit; refine the mesh or reduce modal bandwidth.")
+-            keys = np.column_stack([J, stable[index].astype(np.int64), orders])
+-            _, group, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+-            inverse = np.asarray(inverse).ravel()
+-            order = np.argsort(inverse, kind='stable')
+-            bounds = np.searchsorted(inverse[order], np.arange(len(group) + 1))
++            order, bounds = _layout_groups(np.column_stack([J + 1, stable[index].astype(np.int64), orders]))
+             delta = d / np.where(a > 0, a, 1.0)
+-            for g in range(len(group)):
+-                members = index[order[bounds[g]:bounds[g + 1]]]
+-                first = int(group[g])
++            for g in range(len(bounds) - 1):
++                local = order[bounds[g]:bounds[g + 1]]
++                members = index[local]
++                first = int(local[0])
+                 layout = int(J[first])
+                 base = orders[first, :layout + 2] if layout >= 0 else orders[first, :1]
+                 _run_near_group(kind, arrays, k, count, members, layout, base,
+                                 bool(stable[index[first]]), delta, out, mode_start)
+     if not bracket:
+         return out
+-    if mode_start:
++    if mode_start or not signed:
++        # Nonnegative orders only: the parity moments are the outputs themselves
++        # (tt/ff = C[m], tf/ft = -j S[m], the m = 0 sine moments vanishing).
+         even = out[0][:, :2] + 1j * out[0][:, 2:]
+         odd = -1j * (out[1][:, :2] + 1j * out[1][:, 2:])
++        if not mode_start:
++            odd[:, :, 0] = 0.0
+         return even[:, 0], odd[:, 0], odd[:, 1], even[:, 1]
+-    m = np.arange(-m_max, m_max + 1) if signed else np.arange(0, m_max + 1)
++    m = np.arange(-m_max, m_max + 1)
+     return tuple(_parity_outputs(out[0], out[1], m))
+ 
+ 
++_LAYOUT_KEY_BITS = 13      # orders are at most NEAR_ANGULAR_MAX_ORDER = 4096
++_LAYOUT_KEY_FIELDS = 64 // _LAYOUT_KEY_BITS
++
++
++def _layout_groups(keys):
++    """``(order, bounds)``: point indices sorted by layout key (stable), and the
++    group boundaries in that order, for nonnegative integer key rows below
++    2**_LAYOUT_KEY_BITS.  Rows are packed into a few int64 words and sorted
++    lexicographically, which replaces ``np.unique(axis=0)`` plus a second
++    stable argsort (8% of a serial near preparation) by one sort of the
++    packed words; the groups and their member order are identical."""
++    keys = np.asarray(keys, dtype=np.int64)
++    n, fields = keys.shape
++    words = []
++    for start in range(0, fields, _LAYOUT_KEY_FIELDS):
++        word = np.zeros(n, dtype=np.int64)
++        for column in range(start, min(start + _LAYOUT_KEY_FIELDS, fields)):
++            word = (word << _LAYOUT_KEY_BITS) | keys[:, column]
++        words.append(word)
++    if len(words) == 1:
++        order = np.argsort(words[0], kind='stable')
++    else:
++        order = np.lexsort(words[::-1])
++    change = np.empty(n, dtype=bool)
++    change[0] = True
++    if n > 1:
++        change[1:] = False
++        for word in words:
++            sorted_word = word[order]
++            change[1:] |= sorted_word[1:] != sorted_word[:-1]
++    bounds = np.r_[np.flatnonzero(change), n]
++    return order, bounds
++
++
+ def _near_check(kind, fine, coarse):
+     """Per point (largest |fine - coarse|, largest |fine|) over every kernel
+     and order: the magnitudes of the complex values the outputs are made of
+@@ -1839,17 +1896,27 @@
+ 
+ def _run_near_group(kind, arrays, k, count, members, layout, base_orders, stable, delta, out,
+                     start_order=0):
+-    """Coarse/fine refinement of one layout group (see _graded_near_kernels)."""
++    """Coarse/fine refinement of one layout group (see _graded_near_kernels).
++
++    A modal band (``start_order > 0``) is evaluated over every order from 0,
++    by the native rule, and sliced when it is stored: the acceptance check
++    then keeps the full-range scale.  Checked against the band's own orders
++    alone, near-axis points never converged (their high orders are rounding
++    noise of the dominant low ones), so the automatic cap-expansion retry
++    raised on closed bodies; the band path was also slower per point than a
++    full native evaluation.
++    """
+     bracket = kind != 'g'
+     growth = NEAR_LEVEL_GROWTH
+-    native = not start_order and _native_entry('near_green_rule' if kind == 'g' else 'near_brackets_rule') is not None
++    native = _native_entry('near_green_rule' if kind == 'g' else 'near_brackets_rule') is not None
+     per_sample = _NEAR_BYTES_PER_SAMPLE['native' if native else 'numpy']
++    full = int(count) + int(start_order)
+ 
+     def evaluate(ids, orders, use_stable):
+         # Angular scratch stays within NEAR_KERNEL_WORK_BYTES at every level.
+         block = max(1, int(NEAR_KERNEL_WORK_BYTES // (per_sample * max(int(np.sum(orders)), 1))))
+         parts = [_near_rule_moments(kind, use_stable, tuple(v[ids[i:i + block]] for v in arrays),
+-                                    delta[ids[i:i + block]], k, layout, orders, count, start_order)
++                                    delta[ids[i:i + block]], k, layout, orders, full, 0)
+                  for i in range(0, len(ids), block)]
+         if len(parts) == 1:
+             return parts[0]
+@@ -1863,14 +1930,17 @@
+ 
+     # The coarse and fine moments of a chunk ([n, 2 or 8, count] each) stay
+     # within the scratch budget as well.
+-    chunk = max(1, int(NEAR_KERNEL_WORK_BYTES // (2 * 8 * (8 if bracket else 2) * count)))
++    chunk = max(1, int(NEAR_KERNEL_WORK_BYTES // (2 * 8 * (8 if bracket else 2) * full)))
+     for start in range(0, len(members), chunk):
+         _refine_near_chunk(kind, arrays, np.asarray(members[start:start + chunk]), stable,
+-                           base_orders, evaluate, next_orders, out)
++                           base_orders, evaluate, next_orders, out, int(start_order))
++
+ 
++def _refine_near_chunk(kind, arrays, ids, stable, base_orders, evaluate, next_orders, out, offset=0):
++    """Coarse/fine levels of one chunk of a layout group (_run_near_group).
+ 
+-def _refine_near_chunk(kind, arrays, ids, stable, base_orders, evaluate, next_orders, out):
+-    """Coarse/fine levels of one chunk of a layout group (_run_near_group)."""
++    ``offset`` is the first order kept: the evaluated moments cover every
++    order from 0 and only ``[offset:]`` is stored."""
+     bracket = kind != 'g'
+     use_stable = stable
+     coarse_orders = np.asarray(base_orders, dtype=np.int64)
+@@ -1884,10 +1954,10 @@
+         converged = np.isfinite(error) & (error <= NEAR_ANGULAR_RTOL * np.maximum(scale, 1e-280))
+         accepted = ids[converged]
+         if bracket:
+-            out[0][accepted] = fine[0][converged]
+-            out[1][accepted] = fine[1][converged]
++            out[0][accepted] = fine[0][converged][:, :, offset:]
++            out[1][accepted] = fine[1][converged][:, :, offset:]
+         else:
+-            out[accepted] = 2.0 * (fine[:, 0][converged] + 1j * fine[:, 1][converged])
++            out[accepted] = 2.0 * (fine[:, 0][converged][:, offset:] + 1j * fine[:, 1][converged][:, offset:])
+         if np.all(converged):
+             return
+         pending = ~converged
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/bor/near_parallel.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/near_parallel.py
+--- backup_before_fixes/ghost_backend/bor/near_parallel.py	2026-10-05 19:17:27.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/near_parallel.py	2026-10-06 08:05:02.315049500 -0700
+@@ -70,13 +70,14 @@
+             and process_capable())
+ 
+ 
+-def processes_selected(pair_count=None, mode_tasks=None):
++def processes_selected(pair_count=None, mode_tasks=None, workers=None):
+     """The one workload policy shared by memory planning and the executor.
+ 
+-    ``mode_tasks`` is the number of prepared modes (cap + 1). An unknown
+-    workload is not selected in advance: the planner then keeps the thread
+-    reservation and records the process pool size that was verified to fit,
+-    which bounds the executor if it meets a large job later.
++    ``mode_tasks`` is the number of prepared modes (cap + 1); ``workers`` is
++    accepted for interface compatibility and does not change the policy. An
++    unknown workload is not selected in advance: the planner then keeps the
++    thread reservation and records the process pool size that was verified
++    to fit, which bounds the executor if it meets a large job later.
+     """
+     from ghost_backend.bor.options import current_options
+     backend = current_options()['near_backend']
+@@ -112,7 +113,7 @@
+     if state['executor'] is None:
+         if (state['process_workers'] <= 1
+                 or not process_backend_possible(state['process_workers'])
+-                or not processes_selected(pair_count, mode_cap+1)):
++                or not processes_selected(pair_count, mode_cap+1, state['process_workers'])):
+             return None
+         # The pool spawns its workers on demand while this scope lasts; they
+         # must start with one BLAS thread (see SINGLE_THREAD_WORKER_ENVIRONMENT).
+@@ -142,9 +143,9 @@
+         self.gp, self.gq, self.k = gp, gq, k
+         self.m_max, self.kinds, self.depth = m_max, kinds, depth
+         self.mode_start, self.return_families = int(mode_start), bool(return_families)
+-        self.pair_kind = pair_kind
+-        from ghost_backend.bor.options import current_options
+-        self.junction_refinement = current_options()['near_refinement']
++        self.pair_kind = pair_kind
++        from ghost_backend.bor.options import current_options
++        self.junction_refinement = current_options()['near_refinement']
+         self.near_order, self.near_rtol, self.near_max_order = near_order, near_rtol, near_max_order
+ 
+     def __call__(self, pair):
+@@ -174,7 +175,7 @@
+             # Cross-surface pairs (pair_kind given) touch at a junction and use
+             # the refined junction rule, exactly as the in-process path does.
+             points = (_same_surface_points(self.gp, e, f, self.kinds, self.depth)
+-                      if self.pair_kind is None else _junction_cell_points(cell, self.junction_refinement))
++                      if self.pair_kind is None else _junction_cell_points(cell, self.junction_refinement))
+             touching.append((index, (self.gp, e, self.gq, f, points)))
+         pick = ((lambda blocks: blocks[self.kinds[0]])
+                 if self.pair_kind is None and not self.return_families else (lambda blocks: blocks))
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/bor/solver.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/solver.py
+--- backup_before_fixes/ghost_backend/bor/solver.py	2026-10-05 20:24:31.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/solver.py	2026-10-06 07:56:11.439492000 -0700
+@@ -557,7 +557,7 @@
+         process_workers = fit(_NEAR_TASK_SCRATCH_BYTES + PROCESS_OVERHEAD_BYTES)
+         if process_workers <= 1:
+             process_workers = 0  # Serial preparation runs in the owning interpreter.
+-    if process_workers and processes_selected(near_pairs, mode_tasks):
++    if process_workers and processes_selected(near_pairs, mode_tasks, process_workers):
+         process_bytes = PROCESS_OVERHEAD_BYTES
+         count, worker_bytes = process_workers, _NEAR_TASK_SCRATCH_BYTES + PROCESS_OVERHEAD_BYTES
+     return dict(workers=count, scratch_gb=count * worker_bytes / 1.e9,
+@@ -587,10 +587,18 @@
+     the caller's separate near-phase ceiling when a short modal cache band
+     limits simultaneous mode systems; its full scratch is admitted separately.
+     """
+-    from ghost_backend.execution.options import allocated_cpu_budget
++    from ghost_backend.execution.options import allocated_cpu_budget, physical_core_count
+     requested = max(1, int(workers))
+     preparation_requested = requested if preparation_workers is None else max(1, int(preparation_workers))
+     cpu_budget = allocated_cpu_budget()
++    if preparation_requested > 1:
++        # The near phase is 64-86% of a conductor solve and its workers are
++        # independent of the mode workers: a parallel request uses the CPU
++        # allocation (the physical cores of a lone solve, the unit's share
++        # under a driver), not the mode-worker count (8 instead of 4 workers
++        # cut near preparation 20-24% on an 8-core host).  A serial request
++        # (workers=1) stays serial.
++        preparation_requested = max(preparation_requested, min(cpu_budget, physical_core_count()))
+     limit = _solve_memory_limit_gb() if memory_limit_gb is None else float(memory_limit_gb)
+     for count in range(min(requested, cpu_budget, max(1, int(mode_tasks))), 0, -1):
+         linear_peak = estimate_bor_dense_peak_gb(n_dofs, n_rhs, count, mode_tasks,
+@@ -4204,8 +4212,13 @@
+         stream_budget_gb, workers, 2*len(thetas),
+         estimate_bor_operator_storage_gb(m_max, ((solver, *kinds),), streaming=True)
+         + output_reserved_gb(), solver._near_pair_count) if solver._compressed else None)
+-    use_streaming = (cache_plan is not None if solver._compressed else
+-                     asm == "streaming" or (asm == "auto" and est_double > 2.0))
++    # Conductors stream by default: the dense-tables path contracts its [P, P,
++    # M] tables per mode at 38x the cost of the streamed read and samples both
++    # triangles of the symmetric Green's function, so streaming measured equal
++    # or faster at every size (0.6 s at 40 elements, 5.0 against 6.1 s at 300)
++    # with 7x less memory; the two paths agree to 3e-15.  'tables' remains an
++    # explicit choice.
++    use_streaming = (cache_plan is not None if solver._compressed else asm in ("streaming", "auto"))
+     if use_streaming:
+         est_full = estimate_streaming_gb(solver.gen.n_elems, m_max, form,
+                                          zs_pt is not None, False)
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/bor/streaming.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/streaming.py
+--- backup_before_fixes/ghost_backend/bor/streaming.py	2026-10-05 19:59:31.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/bor/streaming.py	2026-10-06 08:14:29.067149300 -0700
+@@ -367,14 +367,22 @@
+             band[:, first - f0:stop - f0, i, :].transpose(0, 2, 1))
+ 
+ 
++# Row chunks of blocks up to this many nodes keep the (row, column) index pair
++# of their strict-upper positions (16 bytes per position) beside the mask.
++UNPACK_INDEX_MAX_NODES = 3072
++
++
+ def _unpack_upper_into(packed, out, factor, offsets, rows=None, mask=None) -> 'None':
+     """``out = factor * U`` for the packed strict-upper ``U``; the rest of ``out`` is zeroed
+     (the node rows ``rows = (lo, hi)`` only, when given).
+ 
+     The upper positions of a row chunk, in row-major order, are exactly its
+-    packed segment, so one masked assignment fills them (the per-row copies
+-    it replaces were two Python-level calls per row, serialized on the GIL
+-    across mode workers).  ``mask`` is ``_upper_mask(n, lo, hi)`` when cached.
++    packed segment, so one assignment fills them (the per-row copies it
++    replaces were two Python-level calls per row, serialized on the GIL
++    across mode workers).  ``mask`` is ``_upper_mask(n, lo, hi)`` when cached,
++    or ``(mask, (row_index, column_index))`` with the mask's nonzero positions
++    precomputed: a boolean assignment scans the whole mask on every mode,
++    an indexed one only writes.
+     """
+     n = out.shape[0]
+     lo, hi = (0, n) if rows is None else rows
+@@ -385,7 +393,13 @@
+     block = out[lo:hi]
+     block[...] = 0.0
+     if stop > start:
+-        block[_upper_mask(n, lo, hi) if mask is None else mask] = packed[start:stop] * factor
++        indices = None
++        if isinstance(mask, tuple):
++            mask, indices = mask
++        if indices is not None:
++            block[indices[0], indices[1]] = packed[start:stop] * factor
++        else:
++            block[_upper_mask(n, lo, hi) if mask is None else mask] = packed[start:stop] * factor
+ 
+ 
+ def _upper_mask(n: 'int', lo: 'int', hi: 'int') -> 'np.ndarray':
+@@ -861,6 +875,12 @@
+     return low
+ 
+ 
++# A banded tile has at least this many test-element rows when the source
++# elements can be split to afford them (see _plan_banded_tiles).
++STREAM_TILE_MIN_ROWS = 16
++STREAM_TILE_MIN_SOURCES = 8
++
++
+ def _plan_banded_tiles(ne_p, go_p, ne_q, go_q, n_orders, n_modes, efie, brackets,
+                        tile_budget_gb, threads, n_xi=0):
+     """``(threads, test elements, source elements, sampler bytes)`` of a banded tile plan.
+@@ -887,6 +907,16 @@
+ 
+         if cost(1, ne_q) <= per_tile:
+             rows = _largest_fitting(lambda te: cost(te, ne_q) <= per_tile, ne_p)
++            if rows < STREAM_TILE_MIN_ROWS < ne_p:
++                # Taller, narrower tiles at the same live set: the test-side
++                # contraction's inner dimension is rows x Gauss points, so a
++                # one-row full-width tile runs its products at a few percent
++                # of GEMM speed (measured 1.9x on a 3,000-element mesh and
++                # 12-14% at 800 elements, bitwise-equivalent blocks).
++                sources = _largest_fitting(
++                    lambda fe: cost(STREAM_TILE_MIN_ROWS, fe) <= per_tile, ne_q)
++                if sources >= min(ne_q, STREAM_TILE_MIN_SOURCES):
++                    return count, STREAM_TILE_MIN_ROWS, sources, work
+             return count, rows, ne_q, work
+         sources = _largest_fitting(lambda fe: cost(1, fe) <= per_tile, ne_q)
+         if sources >= 1:
+@@ -1826,7 +1856,9 @@
+                 if s0 < f1:
+                     Gn = self._sample_G(rows, k, self._nx_e, ph_e, ord_lo, hi,
+                                         (s0, f1), symmetric)
+-                    self._zero_near(Gn, e0, e1, s0, f1, symmetric)
++                    if not modal_kernels.BANDED_FFT:
++                        # The banded sampler never samples a masked pair.
++                        self._zero_near(Gn, e0, e1, s0, f1, symmetric)
+                     left = self._left_all[:, :, rows].reshape(2 * len(_LEFT_KINDS), re, go)
+                     band = _efie_band(Gn, left, self._right_groups, self._positive_modes,
+                                       ord_lo, k, s0, f1, re, go)
+@@ -1840,7 +1872,8 @@
+                                            (f0, f1))
+                 band = _bracket_band(
+                     Fs, self._lv["1"][:, rows].reshape(2, re, go), right, f0, f1, re, go,
+-                    lambda kernel: self._zero_near(kernel, e0, e1, f0, f1))
++                    None if modal_kernels.BANDED_FFT else
++                    (lambda kernel: self._zero_near(kernel, e0, e1, f0, f1)))
+                 Fs = None
+                 self._add_band(which, getattr(self, attribute), band, e0, f0)
+                 band = None
+@@ -2055,9 +2088,17 @@
+         key = tuple(chunks)
+         cached = getattr(self, "_mask_cache", None)
+         if cached is None or cached[0] != key:
+-            masks = [_upper_mask(self.Nn, lo, hi) for lo, hi in chunks]
+-            for mask in masks:
++            masks = []
++            for lo, hi in chunks:
++                mask = _upper_mask(self.Nn, lo, hi)
+                 mask.setflags(write=False)
++                if self.Nn <= UNPACK_INDEX_MAX_NODES:
++                    rows_index, cols_index = np.nonzero(mask)
++                    rows_index.setflags(write=False)
++                    cols_index.setflags(write=False)
++                    masks.append((mask, (rows_index, cols_index)))
++                else:
++                    masks.append(mask)
+             cached = self._mask_cache = (key, masks)
+         return cached[1]
+ 
+@@ -2343,7 +2384,8 @@
+             rows = slice(e0 * go_p, e1 * go_p)
+             re = e1 - e0
+             Gn = self._sample_G(rows, phase_e, ord_lo, hi, (f0, f1))
+-            self._zero_near(Gn, e0, e1, f0, f1)
++            if not modal_kernels.BANDED_FFT:
++                self._zero_near(Gn, e0, e1, f0, f1)
+             left = self._left_all[:, :, rows].reshape(2 * len(_LEFT_KINDS), re, go_p)
+             band = _efie_band(Gn, left, self._right_groups, self._positive_modes,
+                               ord_lo, self.k, f0, f1, re, go_p)
+@@ -2354,7 +2396,8 @@
+                 brackets = self._sample_brackets(rows, re, bins_b, phase_b, (f0, f1))
+                 band = _bracket_band(
+                     brackets, self._lv["1"][:, rows].reshape(2, re, go_p), self._right_one,
+-                    f0, f1, re, go_p, lambda kernel: self._zero_near(kernel, e0, e1, f0, f1))
++                    f0, f1, re, go_p, None if modal_kernels.BANDED_FFT else
++                    (lambda kernel: self._zero_near(kernel, e0, e1, f0, f1)))
+                 brackets = None
+                 self._add_band("ibc", self.B, band, e0, f0)
+             if release is not None:
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/execution/options.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/execution/options.py
+--- backup_before_fixes/ghost_backend/execution/options.py	2026-10-05 19:33:21.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/execution/options.py	2026-10-06 07:56:11.422980900 -0700
+@@ -533,6 +533,12 @@
+                 base=from_environment()
+                 if not os.environ.get('GHOST_CPU_FACTORIZATION','').strip():
+                     base['factorization']='adaptive'
++                if requested is None and not os.environ.get('GHOST_ASSEMBLY_THREADS','').strip():
++                    # A bare automatic request runs on the host's physical cores,
++                    # as the GUI and batch profiles do (the former one-thread
++                    # default made a direct API solve 4x slower than the GUI's).
++                    base['assembly_threads']='auto'
++                    base['blas_threads']='auto'
+                 if requested is None or 'mesh_strategy' not in requested:
+                     base['mesh_strategy']='adaptive'
+                 requested=dict(base,**(requested or {}))
+@@ -601,14 +607,19 @@
+         def invoke():
+             nonlocal value,selection
+             from ghost_backend.execution.errors import BackendNumericalError
++            from ghost_backend.execution.selection import request_selection_scope
+             from numpy.linalg import LinAlgError
+             failures=[]
+             modes=[value['factorization']]+(selection.get('retry_order',[]) if selection else [])
++            # The forecast of this request (its candidate meshes, priced and
++            # admitted) is visible to the adaptive controller, which would
++            # otherwise rebuild and re-price the same meshes per candidate step.
++            forecast=selection if selection is not None and selection.get('meshes') else None
+             for index,mode in enumerate(modes):
+                 value=dict(value,factorization=mode)
+                 attempt_start=time.perf_counter()
+                 try:
+-                    with execution_scope(value):
++                    with execution_scope(value), request_selection_scope(forecast):
+                         result=function(*args,**kwargs)
+                 except (MemoryError,BackendNumericalError,LinAlgError) as exc:
+                     if selection is None or index == len(modes)-1:
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/execution/provenance.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/execution/provenance.py
+--- backup_before_fixes/ghost_backend/execution/provenance.py	2026-10-03 16:05:30.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/execution/provenance.py	2026-10-06 08:08:36.799179600 -0700
+@@ -9,6 +9,7 @@
+ import posixpath
+ import sys
+ import tempfile
++import threading
+ from typing import Any, Dict, List, Sequence
+ 
+ 
+@@ -55,13 +56,44 @@
+     return digest.hexdigest()
+ 
+ 
++_SOURCE_DIGESTS = {}
++_SOURCE_DIGEST_LOCK = threading.Lock()
++
++
++def source_file_digest(path: 'str') -> 'str':
++    """``sha256_file`` of a backend source file, memoized on (path, size, mtime_ns).
++
++    The source bundle (178 files, 4.4 MB) is hashed by the provenance
++    manifest, the timing-history key and the checkpoint identity of every
++    public call; one process re-reads it only when a file's stat changes.
++    Output artifacts are never memoized (``sha256_file``).
++    """
++
++    path = os.path.abspath(path)
++    try:
++        status = os.stat(path)
++    except OSError:
++        return sha256_file(path)
++    key = (path, int(status.st_size), int(status.st_mtime_ns))
++    with _SOURCE_DIGEST_LOCK:
++        cached = _SOURCE_DIGESTS.get(key)
++    if cached is not None:
++        return cached
++    digest = sha256_file(path)
++    with _SOURCE_DIGEST_LOCK:
++        if len(_SOURCE_DIGESTS) >= 4096:
++            _SOURCE_DIGESTS.clear()
++        _SOURCE_DIGESTS[key] = digest
++    return digest
++
++
+ def source_bundle_fingerprint(records: 'Dict[str, str]') -> 'str':
+     """Hash logical source names and exact bytes, independent of location."""
+ 
+     payload = [
+         {
+             "path": str(logical_name),
+-            "sha256": sha256_file(os.path.abspath(path)),
++            "sha256": source_file_digest(path),
+         }
+         for logical_name, path in sorted(records.items())
+     ]
+@@ -103,7 +135,7 @@
+     """
+ 
+     return {
+-        name: sha256_file(os.path.abspath(path))
++        name: source_file_digest(path)
+         for name, path in sorted(backend_source_records(
+             backend_dir, extra_records
+         ).items())
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/execution/selection.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/execution/selection.py
+--- backup_before_fixes/ghost_backend/execution/selection.py	2026-10-02 19:29:18.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/execution/selection.py	2026-10-06 07:56:11.422980900 -0700
+@@ -1,13 +1,24 @@
+ """Shared, capability-aware planning before allocating solver operators."""
+ import math
+ import copy
+-import json
+-import hashlib
++import json
++import hashlib
+ from ghost_backend.execution.options import execution_scope, validate_options
+ from ghost_backend.execution.runtime import ScopedValue
+-from ghost_backend.execution.policy import MODEL, BACKENDS, relative_cost, rank_candidates, work_threads
++from ghost_backend.execution.policy import MODEL, BACKENDS, relative_cost, rank_candidates, work_threads
+ 
+ _BATCH_SELECTION = ScopedValue('ghost_batch_backend_selection', default=None)
++_REQUEST_SELECTION = ScopedValue('ghost_request_backend_selection', default=None)
++
++
++def request_selection_scope(value):
++    """The forecast made at the public boundary of the running request (or None)."""
++    return _REQUEST_SELECTION.override(value)
++
++
++def current_request_selection():
++    value = _REQUEST_SELECTION.get()
++    return dict(value) if value is not None else None
+ 
+ 
+ def batch_selection_scope(value):
+@@ -22,15 +33,15 @@
+     return dict(value) if value is not None else None
+ 
+ 
+-def select_backend(arguments, options, certified=False, checkpoint=None):
+-    from ghost_backend.twod.preparation import sweep_mesh_scope
+-    with sweep_mesh_scope(arguments['frequencies_ghz']):
+-        return _select_backend(arguments, options, certified, checkpoint)
+-
+-
+-def _select_backend(arguments, options, certified=False, checkpoint=None):
++def select_backend(arguments, options, certified=False, checkpoint=None):
++    from ghost_backend.twod.preparation import sweep_mesh_scope
++    with sweep_mesh_scope(arguments['frequencies_ghz']):
++        return _select_backend(arguments, options, certified, checkpoint)
++
++
++def _select_backend(arguments, options, certified=False, checkpoint=None):
+     """Reuse immutable run forecasts, but make every admission against live RAM."""
+-    from ghost_backend.twod.preparation import forecast_cache, mesh_frequencies
++    from ghost_backend.twod.preparation import forecast_cache, mesh_frequencies
+     from ghost_backend.twod import solver as s
+     from ghost_backend.runs.quality import validate_mesh_convergence_policy
+     cache = forecast_cache()
+@@ -41,13 +52,13 @@
+         raise InterruptedError('Backend planning canceled.')
+     fields = ('geometry_snapshot', 'frequencies_ghz', 'elevations_deg', 'polarization')
+     inputs = {key: arguments[key] for key in fields if key in arguments}
+-    inputs.update(geometry_units=arguments.get('geometry_units', 'inches'),
++    inputs.update(geometry_units=arguments.get('geometry_units', 'inches'),
+                   material_base_dir=arguments.get('material_base_dir'),
+                   max_panels=arguments.get('max_panels', s.MAX_PANELS_DEFAULT),
+                   mesh_reference_ghz=arguments.get('mesh_reference_ghz'),
+-                  fine_factor=validate_mesh_convergence_policy(arguments.get('mesh_convergence_policy'))['fine_factor'] if certified else 1.)
+-    if arguments.get('mesh_reference_ghz') is not None:
+-        inputs['mesh_frequencies_ghz'] = mesh_frequencies(arguments['frequencies_ghz'])
++                  fine_factor=validate_mesh_convergence_policy(arguments.get('mesh_convergence_policy'))['fine_factor'] if certified else 1.)
++    if arguments.get('mesh_reference_ghz') is not None:
++        inputs['mesh_frequencies_ghz'] = mesh_frequencies(arguments['frequencies_ghz'])
+     normalized = validate_options(options)
+     from ghost_backend.execution.options import (
+         effective_assembly_threads, blas_thread_reservation, allocated_memory_budget,
+@@ -56,9 +67,9 @@
+     with execution_scope(dict(normalized, factorization='dense')):
+         allocation = (effective_assembly_threads(), blas_thread_reservation(),
+                       allocated_memory_budget(), requested_precision())
+-    # Retain only a digest: large geometry snapshots and angle grids must not be
+-    # repeated in every frequency's cache key.
+-    key = hashlib.sha256(json.dumps([inputs, normalized, allocation], sort_keys=True).encode('utf-8')).digest() if cache is not None else None
++    # Retain only a digest: large geometry snapshots and angle grids must not be
++    # repeated in every frequency's cache key.
++    key = hashlib.sha256(json.dumps([inputs, normalized, allocation], sort_keys=True).encode('utf-8')).digest() if cache is not None else None
+     if cache is not None and key in cache:
+         cached, resource_records = cache[key]
+         result = copy.deepcopy(cached)
+@@ -90,7 +101,7 @@
+     resource_records = []
+     result = _forecast_backend(arguments, normalized, certified, checkpoint, resource_records)
+     if cache is not None:
+-        cache[key] = (copy.deepcopy(result), resource_records)
++        cache[key] = (copy.deepcopy(result), resource_records)
+     return result
+ 
+ 
+@@ -135,7 +146,7 @@
+     Explicit backend choices never call this function.
+     """
+     from ghost_backend.twod import solver as s
+-    from ghost_backend.twod.preparation import prepare_geometry, mesh_frequencies as sizing_frequencies
++    from ghost_backend.twod.preparation import prepare_geometry, mesh_frequencies as sizing_frequencies
+     from ghost_backend.runs.quality import validate_mesh_convergence_policy, scale_snapshot_panel_density
+     snapshot = arguments['geometry_snapshot']
+     frequencies = list(arguments['frequencies_ghz'])
+@@ -162,10 +173,10 @@
+             if event is not None and event.is_set():
+                 raise InterruptedError('Backend planning canceled.')
+             ref = arguments.get('mesh_reference_ghz') or freq
+-            # Fixed-reference requests use the whole sweep for conservative
+-            # material sizing, even though operators remain frequency-local.
+-            mesh_frequencies = (sizing_frequencies(frequencies) if arguments.get('mesh_reference_ghz') is not None
+-                                else frequencies if 'polarization' in arguments else [freq])
++            # Fixed-reference requests use the whole sweep for conservative
++            # material sizing, even though operators remain frequency-local.
++            mesh_frequencies = (sizing_frequencies(frequencies) if arguments.get('mesh_reference_ghz') is not None
++                                else frequencies if 'polarization' in arguments else [freq])
+             geometries = candidate_meshes(snapshot, materials, factor, options['mesh_strategy']=='adaptive',
+                                          mesh_frequencies, scale, arguments.get('mesh_reference_ghz'))
+             if options['mesh_strategy']!='adaptive':
+@@ -198,12 +209,12 @@
+                                     n_regions=resources['n_regions'], system_dofs=resources['system_dofs'],
+                                     operator_matrices=resources['operator_matrices'], dense_resources=measured,
+                                     n_rhs=len(arguments['elevations_deg']), solver_method='experimental_cpu')
+-                            threads=work_threads(resources['system_dofs'],mesh_options)
+-                            candidates[mode]['cost']+=relative_cost(resources,len(arguments['elevations_deg']),mode,*threads)
++                            threads=work_threads(resources['system_dofs'],mesh_options)
++                            candidates[mode]['cost']+=relative_cost(resources,len(arguments['elevations_deg']),mode,*threads)
+                             candidates[mode]['peak_gb']=max(candidates[mode]['peak_gb'],peaks[mode])
+-                        records.append(dict(frequency_ghz=float(freq), phase=phase, polarization=pol,
+-                            polynomial_degree=degree, panels=len(panels), unknowns=resources['system_dofs'], dense_peak_gib=peaks['dense'],
+-                            formulation=resources['formulation'],backend_peak_gib=peaks, resources=dict(resources)))
++                        records.append(dict(frequency_ghz=float(freq), phase=phase, polarization=pol,
++                            polynomial_degree=degree, panels=len(panels), unknowns=resources['system_dofs'], dense_peak_gib=peaks['dense'],
++                            formulation=resources['formulation'],backend_peak_gib=peaks, resources=dict(resources)))
+     peak = max(r['dense_peak_gib'] for r in records)
+     candidates={m:c for m,c in candidates.items() if m not in exclusions}
+     try:
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/linalg/hierarchical.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/linalg/hierarchical.py
+--- backup_before_fixes/ghost_backend/linalg/hierarchical.py	2026-10-05 19:19:20.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/linalg/hierarchical.py	2026-10-06 08:38:05.972295100 -0700
+@@ -165,6 +165,67 @@
+         return np.sqrt(error/max(total, 1e-300)), pivot
+ 
+ 
++class OrderedBlock:
++    """A block of the spatially ordered copy of the matrix: contiguous slices, no gathers.
++
++    Same interface as :class:`Block` for the sampled compression (``shape``,
++    ``dense``, ``matmul``, ``project``, ``checkpoint``); the products act on
++    strided views (BLAS takes the leading dimension), so no panel copies.
++    """
++    def __init__(self, ordered, rows, cols, checkpoint):
++        self.a, self.rows, self.cols, self.checkpoint = ordered, rows, cols, checkpoint
++        self.shape = rows.stop - rows.start, cols.stop - cols.start
++
++    def dense(self):
++        return np.array(self.a[self.rows, self.cols], order='C')
++
++    def matmul(self, rhs):
++        self.checkpoint()
++        return self.a[self.rows, self.cols] @ rhs
++
++    def project(self, basis):
++        self.checkpoint()
++        return basis.conj().T @ self.a[self.rows, self.cols]
++
++
++# A build copies the matrix into spatial order when the copy is at most this
++# large and the host has twice its size (plus 1 GiB) available: interleaved
++# unknown layouts fragment every block into runs of one or two entries, and
++# gathering them was 47% of a build (4.2 N^2 entries at ~1.4 GB/s).  The copy
++# is one threaded N^2 gather, released after the build.
++ORDERED_COPY_MAX_BYTES = 8 << 30
++
++
++def ordered_copy(matrix, permutation, checkpoint):
++    """``matrix[perm][:, perm]`` as a contiguous array, or None when RAM does not allow it."""
++    from ghost_backend.execution.options import _optional_psutil, blas_core_budget
++    psutil = _optional_psutil()
++    if psutil is None or matrix.nbytes > ORDERED_COPY_MAX_BYTES:
++        return None
++    try:
++        available = int(psutil.virtual_memory().available)
++    except Exception:
++        return None
++    if available < 2 * matrix.nbytes + (1 << 30):
++        return None
++    checkpoint()
++    n = len(permutation)
++    out = np.empty((n, n), dtype=matrix.dtype)
++    threads = min(blas_core_budget(), max(1, n * n // GATHER_ENTRIES_PER_THREAD))
++    step = -(-n // (4 * threads)) if threads > 1 else n
++
++    def gather(start):
++        out[start:start+step] = matrix[np.ix_(permutation[start:start+step], permutation)]
++    if threads <= 1:
++        gather(0)
++    else:
++        from concurrent.futures import ThreadPoolExecutor
++        with ThreadPoolExecutor(max_workers=threads) as pool:
++            for _ in pool.map(gather, range(0, n, step)):
++                pass
++    return out
++
++
+ def compress(block, tolerance=2e-10, maximum_rank=256):
+     m, n = block.shape
+     limit = min(maximum_rank, min(m, n)//2)
+@@ -341,6 +402,10 @@
+         self.evidence = dict(backend='hodlr', compression='randomized', builds=0, tighter_rebuilds=0)
+         coordinates = np.arange(self.n)[:, None] if coordinates is None else np.asarray(coordinates)
+         self.permutation = spatial_order(coordinates, np.arange(self.n))
++        self._position = np.empty(self.n, dtype=np.intp)
++        self._position[self.permutation] = np.arange(self.n)
++        self.ordered = ordered_copy(matrix, self.permutation, self.checkpoint)
++        self.evidence['ordered_copy'] = self.ordered is not None
+         # The transposed norm is only needed by transposed solves (condition estimates).
+         self.norms = [matrix_inf_norm(matrix) if matrix_norm is None else matrix_norm, None]
+         self.scale = float(self.norms[0])
+@@ -354,6 +419,15 @@
+ 
+ 
+             self._rebuild(self.TIGHT_TOLERANCE)
++        self.ordered = None
++
++    def _block(self, rows, cols):
++        """The block of ``rows`` x ``cols`` (contiguous runs of the permutation) for the build."""
++        if self.ordered is not None:
++            row_start, col_start = int(self._position[rows[0]]), int(self._position[cols[0]])
++            return OrderedBlock(self.ordered, slice(row_start, row_start + len(rows)),
++                                slice(col_start, col_start + len(cols)), self.checkpoint)
++        return Block(self.a, rows, cols, self.checkpoint)
+ 
+     def _rebuild(self, tolerance):
+ 
+@@ -391,7 +465,7 @@
+         node.checkpoint = self.checkpoint
+         node.n, node.leaf = len(ids), len(ids) <= LEAF_SIZE
+         if node.leaf:
+-            node.lu = self._lu(Block(self.a, ids, ids, self.checkpoint).dense())
++            node.lu = self._lu(self._block(ids, ids).dense())
+             self.evidence['leaves'] += 1
+             return node
+         mid = len(ids)//2
+@@ -400,10 +474,10 @@
+ 
+ 
+         try:
+-            u12, node.v12, err1 = compress_sampled(Block(self.a, left, right, self.checkpoint),
++            u12, node.v12, err1 = compress_sampled(self._block(left, right),
+                                                    threshold, self.MAXIMUM_RANK, self.rng)
+             # The transposed block has about the same rank: sample that many at once.
+-            u21, node.v21, err2 = compress_sampled(Block(self.a, right, left, self.checkpoint),
++            u21, node.v21, err2 = compress_sampled(self._block(right, left),
+                                                    threshold, self.MAXIMUM_RANK, self.rng,
+                                                    start=max(SAMPLE_COLUMNS, u12.shape[1] + 8))
+         except HierarchicalRejected:
+@@ -415,7 +489,7 @@
+ 
+             u12 = None
+             node.v12 = node.v21 = None
+-            node.lu = self._lu(Block(self.a, ids, ids, self.checkpoint).dense())
++            node.lu = self._lu(self._block(ids, ids).dense())
+             self.evidence['leaves'] += 1
+             return node
+         r, s = u12.shape[1], u21.shape[1]
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/linalg/sweep.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/linalg/sweep.py
+--- backup_before_fixes/ghost_backend/linalg/sweep.py	2026-09-28 15:58:06.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/linalg/sweep.py	2026-10-06 07:56:11.422980900 -0700
+@@ -34,6 +34,24 @@
+ # even a rank-one batch could save.
+ AUTO_QR_FLOP_RATIO = 3.0
+ AUTO_MAX_RANK_FRACTION = 0.5
++# LU-backed factors (dense LU, mirror halves) of at least LU_DIRECT_MIN_UNKNOWNS
++# unknowns solve batches directly in 'auto' unless the system is very large
++# for the batch: a LAPACK solve of r columns streams the whole factor once
++# (about 60 ms for a 1.2 GB factor) whatever r is, and the pivoted QR costs
++# about 2.4x its flop model, so at 8,608 unknowns a 256-column batch measured
++# 0.563 s reconstructed against 0.533 s direct.  Reconstruction pays again once
++# the factor is large against the batch (n above LU_DIRECT_RATIO columns), and
++# always for compressed and hierarchical factors, whose solves scale with the
++# column count.
++LU_DIRECT_MIN_UNKNOWNS = 4096
++LU_DIRECT_RATIO = 60
++
++
++def _lu_backed(factor):
++    """True for a factor whose solve is a LAPACK triangular solve of the whole LU."""
++    if getattr(factor, 'hierarchical', None) is not None or getattr(factor, 'mixed', None) is not None:
++        return False
++    return getattr(factor, 'lu', None) is not None or getattr(factor, 'mirror', None) is not None
+ 
+ 
+ def _auto_qr_cannot_pay(n, count):
+@@ -226,6 +244,10 @@
+     if auto:
+         if evidence.get('auto_suspended'):
+             return _direct(factor, rhs, evidence, count, 'suspended_batches')
++        retained = (basis_state is not None and basis_state.q is not None and basis_state.q.shape[1] > 0
++                    and basis_state.owner is not None and basis_state.owner() is factor)
++        if not retained and LU_DIRECT_MIN_UNKNOWNS <= n < LU_DIRECT_RATIO * count and _lu_backed(factor):
++            return _direct(factor, rhs, evidence, count, 'lu_direct_batches')
+         if hint is not None and 'hint_probe' not in evidence:
+             evidence['hint_probe'] = hint.begin_factor()
+             if not evidence['hint_probe']:
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/run_local_bor.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/run_local_bor.py
+--- backup_before_fixes/ghost_backend/run_local_bor.py	2026-10-05 18:11:04.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/run_local_bor.py	2026-10-06 08:08:36.800179400 -0700
+@@ -1,934 +1,935 @@
+-#!/usr/bin/env python3
+-"""Local BoR monostatic RCS sweep -- run_hpc_bor_monostatic.py without SLURM.
+-
+-Each physical solve is a true 3-D (dBsm) body-of-revolution solve over the ASPECT angles
+-(degrees from the +z rotation axis: 0 = nose-on, 90 = broadside, 180 = tail-on).
+-Geometries are .geo half-profiles: x = rho (>= 0), y = z (rotation axis), drawn
+-from the +z axis end to the -z axis end (see bor_dispatch.py).
+-
+-The user specifies frequencies, radar azimuths, and radar elevations.  The
+-driver derives the exact body-aspect RHS columns needed by those looks, solves
+-VV and HH together, and publishes one self-contained monostatic GRIM per
+-geometry in results/.  That same file opens in GRIM and contains the compact
+-body model/profile needed for later coherent door or cavity placement.
+-
+-Scheduling matches the HPC path. VV and HH are co-solved; separate visible
+-per-frequency files serve only as verified intermediate/restart records. A
+-BoR solve's cost grows roughly as the fourth
+-power of frequency (elements^3 x modes), so a frequency sweep is badly
+-lopsided; units are costed and run dearest-first, and concurrent solves are
+-admitted against a memory budget instead of filling every core.
+-
+-Each frequency writes its solver-frame VV and HH restart records immediately
+-under results/by_frequency/. The user-facing, feature-ready product is the
+-combined monostatic body in results/. Certification remains a user-selected
+-solve option and does not gate publication or downstream use.
+-
+-Edit the CONFIG block and run:
+-
+-    python run_local_bor.py
+-"""
+-if not __package__:
+-    import sys
+-    from pathlib import Path
+-    if Path(__file__).resolve().parent.name == "ghost_backend":
+-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+-from ghost_backend.execution.paths import backend_root as _backend_root
+-
+-import json
+-import math
+-import os
+-import sys
+-import time
+-import traceback
+-from datetime import datetime
+-from multiprocessing import Pool  # noqa: F401 -- HPC driver parity; the local run uses _ExecutorPool
+-from pathlib import Path
+-from typing import Any, Dict, List, Optional, Tuple
+-
+-import ghost_backend.hpc.scheduler as hpc_scheduler
+-from ghost_backend.runs.quality import accuracy_target_policy, validate_mesh_convergence_policy
+-import ghost_backend.execution.provenance as _workflow_provenance
+-from ghost_backend.execution.provenance import (
+-    backend_source_fingerprint,
+-    backend_source_inventory,
+-    describe_source_mismatch,
+-    embed_output_attestation,
+-    manifest_solve_spec_fingerprint,
+-    runtime_environment_fingerprint,
+-    stable_json_fingerprint,
+-    unit_solve_spec_fingerprint,
+-    verify_embedded_attestation,
+-)
+-
+-# Compatibility imports retain the established module entrypoints.
+-from ghost_backend.runs.inputs import verify_local_unit_input as _verify_unit_input
+-from ghost_backend.runs.inputs import load_geometry_snapshot
+-from ghost_backend.twod.preparation import preparation_scope
+-
+-
+-# ===============================================================================
+-# CONFIG
+-# ===============================================================================
+-
+-GEOMETRY_DIRS = ["ghost_backend/geometry/geometries/BOR"]      # every *.geo under these, recursively
+-
+-FREQUENCIES_GHZ = [1.0, 2.0, 4.0]
+-AZIMUTHS_DEG    = [float(a) for a in range(0, 360, 5)]
+-ELEVATIONS_DEG  = [float(e) for e in range(-60, 61, 5)]
+-
+-# Body-axis attitude in the radar/earth frame.  The default is horizontal,
+-# nose toward azimuth 0.  Roll changes feature orientation about the BoR axis.
+-BODY_AXIS_AZ_DEG = 0.0
+-BODY_AXIS_EL_DEG = 0.0
+-BODY_ROLL_DEG    = 0.0
+-
+-OUTPUT_DIR = "ghost_backend/results/rcs_runs_bor"
+-
+-# Hard ceiling on units in flight. None -> cores // WORKERS_PER_UNIT, since
+-# each unit already runs WORKERS_PER_UNIT threads for its mode sweep and
+-# streaming tiles. The memory budget below is usually the binding constraint.
+-WORKERS = None
+-
+-# --- Solver knobs (mirror bor_dispatch.solve_monostatic_rcs_bor) -----------
+-GEOMETRY_UNITS   = "inches"       # "inches" or "meters"
+-CFIE_ALPHA       = 0.5            # closed PEC bodies -> CFIE
+-N_MODES          = None           # None = auto (adaptive truncation)
+-MODE_TOL         = 1e-6
+-MAX_ELEMENTS     = 50_000
+-ASSEMBLY         = "auto"         # "auto" | "tables" | "streaming"
+-TABLE_PRECISION  = "auto"         # "auto" | "single" | "double"
+-ACCURACY_TARGET  = "standard"     # "standard" | "tight"; mesh comparison limits
+-STREAM_BUDGET_GB = 8.0            # maximum held streaming-block budget; the
+-                                  # scheduler predicts total peak separately
+-MESH_CERTIFICATION = True         # recommended: compare base/fine meshes;
+-                                  # False solves the base mesh only
+-WORKERS_PER_UNIT = 4              # threads inside one BoR solve
+-BLAS_THREADS_PER_WORKER = 1
+-
+-# --- Memory admission ------------------------------------------------------
+-# A local machine has far less RAM than a compute node and is usually running
+-# other things, so the same guard the cluster path uses matters more here, not
+-# less. One unit is always admitted, so a solve larger than the whole budget
+-# still runs (and fails loudly) instead of hanging.
+-MEMORY_HEADROOM = 0.75            # fraction of detected RAM the scheduler may
+-                                  # reserve for concurrent solves. Lower than
+-                                  # the cluster default of 0.85: a workstation
+-                                  # has a desktop and a page cache to leave
+-                                  # room for.
+-
+-# Pool worker lifetime, in units. Lower than the 2-D default because a BoR
+-# unit's streaming blocks are large and worth returning to the OS promptly.
+-TASKS_PER_CHILD = 2
+-
+-# ===============================================================================
+-
+-from ghost_backend.runs.config import (
+-    load_driver_configuration,
+-    configuration_source_records,
+-    copy_configuration,
+-)
+-from ghost_backend.bor.options import validate_options as validate_bor_options
+-BOR_EXECUTION_OPTIONS = validate_bor_options({})
+-
+-_CONFIG_KIND = 'bor'
+-_CONFIG_KEYS = (
+-    'BOR_EXECUTION_OPTIONS',
+-    'GEOMETRY_DIRS',
+-    'FREQUENCIES_GHZ',
+-    'AZIMUTHS_DEG',
+-    'ELEVATIONS_DEG',
+-    'BODY_AXIS_AZ_DEG',
+-    'BODY_AXIS_EL_DEG',
+-    'BODY_ROLL_DEG',
+-    'OUTPUT_DIR',
+-    'WORKERS',
+-    'GEOMETRY_UNITS',
+-    'CFIE_ALPHA',
+-    'N_MODES',
+-    'MODE_TOL',
+-    'MAX_ELEMENTS',
+-    'ASSEMBLY',
+-    'TABLE_PRECISION',
+-    'ACCURACY_TARGET',
+-    'STREAM_BUDGET_GB',
+-    'MESH_CERTIFICATION',
+-    'WORKERS_PER_UNIT',
+-    'BLAS_THREADS_PER_WORKER',
+-    'MEMORY_HEADROOM',
+-    'TASKS_PER_CHILD',
+-)
+-_ACTIVE_CONFIG_PATH = load_driver_configuration(globals(), __file__, _CONFIG_KIND, _CONFIG_KEYS)
+-BOR_EXECUTION_OPTIONS = validate_bor_options(BOR_EXECUTION_OPTIONS)
+-
+-
+-MANIFEST_SCHEMA = "ghost.local.bor-run.v2"
+-
+-# Parsed geometry snapshots, filled in the parent before the pool forks so
+-# workers inherit them instead of unpickling one per unit.
+-_SNAPSHOT_CACHE = {}  # type: Dict[str, Tuple[Dict[str, Any], str]]
+-
+-
+-def _solver_source_records() -> 'Tuple[str, Dict[str, str]]':
+-    backend_dir = str(_backend_root())
+-    return backend_dir, configuration_source_records(__file__, _ACTIVE_CONFIG_PATH)
+-
+-
+-def _solver_source_fingerprint() -> 'str':
+-    backend_dir, extra = _solver_source_records()
+-    return backend_source_fingerprint(backend_dir, extra)
+-
+-
+-def _solver_source_inventory() -> 'Dict[str, str]':
+-    backend_dir, extra = _solver_source_records()
+-    return backend_source_inventory(backend_dir, extra)
+-
+-
+-def _write_json_atomic(path: 'Path', payload: 'Dict[str, Any]') -> 'None':
+-    temporary = Path(str(path) + f".tmp.{os.getpid()}")
+-    temporary.write_text(
+-        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
+-        + "\n",
+-        encoding="utf-8",
+-    )
+-    os.replace(str(temporary), str(path))
+-
+-
+-def _verify_run_provenance(context: 'Dict[str, Any]') -> 'None':
+-    """Re-check that the solver source and numerical runtime still match the run.
+-
+-    The file hashes underneath come from `hpc_scheduler.install_fingerprint_cache`,
+-    so a repeat check is a stat per backend file rather than a full re-read, and
+-    the cache expires on a timer so full re-reads keep happening inside
+-    long-lived workers.
+-    """
+-
+-    if _solver_source_fingerprint() != context.get("solver_source_sha256"):
+-        detail = describe_source_mismatch(
+-            context.get("solver_source_inventory") or {},
+-            _solver_source_inventory(),
+-        )
+-        raise RuntimeError(
+-            "Local-run solver source/native artifacts changed; no mixed-state "
+-            f"field will be written or reused. ({detail})"
+-        )
+-    if runtime_environment_fingerprint() != context.get(
+-        "runtime_environment_sha256"
+-    ):
+-        raise RuntimeError(
+-            "Local-run Python/platform/NumPy/SciPy/BLAS runtime changed."
+-        )
+-
+-
+-def _unit_attestation_fields(
+-    context: 'Dict[str, Any]',
+-    unit: 'Dict[str, Any]',
+-) -> 'Dict[str, Any]':
+-    return {
+-        "run_id": str(context["run_id"]),
+-        "solver_source_sha256": str(context["solver_source_sha256"]),
+-        "runtime_environment_sha256":
+-            str(context["runtime_environment_sha256"]),
+-        "geometry_input_sha256": str(unit["geometry_input_sha256"]),
+-        "run_solve_spec_sha256": str(context["run_solve_spec_sha256"]),
+-        "unit_solve_spec_sha256": unit_solve_spec_fingerprint(unit),
+-        "solver_config_sha256": str(context["solver_config_sha256"]),
+-        "angular_grid_kind": "aspects_deg",
+-        # The grid is a run-level property, so it is bound by hash here and
+-        # stored once in the manifest instead of being repeated in every unit
+-        # record and every attestation.
+-        "angular_grid_sha256": str(context["angular_grid_sha256"]),
+-        "polarization": str(unit["polarization"]),
+-        "frequency_ghz": float(unit["frequency_ghz"]),
+-    }
+-
+-
+-def _discover_geometries() -> 'List[Path]':
+-    found: 'List[Path]' = []
+-    seen: 'set' = set()
+-    for d in GEOMETRY_DIRS:
+-        root = Path(d)
+-        if not root.is_dir():
+-            print(f"  [warn] dir not found: {root}", file=sys.stderr)
+-            continue
+-        for p in sorted(root.rglob("*.geo")):
+-            rp = p.resolve()
+-            if rp not in seen:
+-                seen.add(rp)
+-                found.append(p)
+-    return found
+-
+-
+-def _unit_name(unit: 'Dict[str, Any]') -> 'str':
+-    return (f"{unit['polarization']}_{float(unit['frequency_ghz']):.3f}GHz_"
+-            f"{unit['geometry_stem']}.grim")
+-
+-
+-def _unit_output_path(results_dir: 'Path', unit: 'Dict[str, Any]') -> 'Path':
+-    return results_dir / _unit_name(unit)
+-
+-
+-def _paired_solve_units(
+-    output_units: 'List[Dict[str, Any]]',
+-) -> 'List[Dict[str, Any]]':
+-    """Group compatible VV/HH outputs into one physical BoR solve.
+-
+-    The manifest deliberately remains one record per output file for backward
+-    compatibility.  Only the internal dispatch list is paired, because the
+-    BoR matrix factorization already produces both channels together.
+-    """
+-
+-    pairs: 'Dict[Tuple[str, float], Dict[str, Any]]' = {}
+-    for unit in output_units:
+-        key = (str(unit["geometry"]), float(unit["frequency_ghz"]))
+-        pair = pairs.setdefault(key, {
+-            "geometry": unit["geometry"],
+-            "geometry_stem": unit["geometry_stem"],
+-            "geometry_input_sha256": unit["geometry_input_sha256"],
+-            "frequency_ghz": float(unit["frequency_ghz"]),
+-            "channel_units": [],
+-        })
+-        pair["channel_units"].append(unit)
+-    return list(pairs.values())
+-
+-
+-def _pair_name(pair: 'Dict[str, Any]') -> 'str':
+-    channels = "+".join(
+-        str(unit["polarization"]) for unit in pair["channel_units"]
+-    )
+-    return (f"{channels}_{float(pair['frequency_ghz']):.3f}GHz_"
+-            f"{pair['geometry_stem']}")
+-
+-
+-def _channel_result(
+-    result: 'Dict[str, Any]', polarization: 'str'
+-) -> 'Dict[str, Any]':
+-    samples = (result.get("co_solved_samples", {}) or {}).get(polarization, [])
+-    if not samples:
+-        raise RuntimeError(
+-            f"BoR solve did not return its co-solved {polarization} channel."
+-        )
+-    channel = dict(result)
+-    channel["samples"] = samples
+-    channel["polarization"] = polarization
+-    channel["polarization_export"] = polarization
+-    channel.pop("polarizations", None)
+-    channel.pop("polarization_mapping", None)
+-    channel.pop("co_solved_samples", None)
+-    channel["metadata"] = dict(result.get("metadata", {}) or {})
+-    return channel
+-
+-
+-def _load_snapshot(geometry_path: 'str') -> 'Tuple[Dict[str, Any], str]':
+-    """Load through the shared reader using this driver's process-local cache."""
+-    return load_geometry_snapshot(geometry_path, _SNAPSHOT_CACHE)
+-
+-
+-def _pool_initializer(blas_threads: 'int') -> 'None':
+-    hpc_scheduler.pin_blas_threads(blas_threads)
+-    hpc_scheduler.install_fingerprint_cache()
+-    import ghost_backend.bor.dispatch as bor_dispatch
+-
+-
+-# Units run in concurrent.futures process workers, which may start the
+-# near-preparation processes a unit's memory plan admits; multiprocessing.Pool
+-# workers are daemonic and could not (see hpc.common.ExecutorPool).
+-from ghost_backend.hpc.common import ExecutorPool as _ExecutorPool
+-
+-
+-def _solve_and_export(
+-    pair: 'Dict[str, Any]',
+-    context: 'Dict[str, Any]',
+-    results_dir_str: 'str',
+-) -> 'Tuple[str, str]':
+-    """Solve one geometry/frequency pair and export its requested channels."""
+-
+-    results_dir = Path(results_dir_str)
+-    channel_units = list(pair["channel_units"])
+-    _verify_run_provenance(context)
+-    _verify_channel_inputs(channel_units, context)
+-    missing = []
+-    paths = []
+-    for unit in channel_units:
+-        out_path = _unit_output_path(results_dir, unit)
+-        paths.append(out_path)
+-        if out_path.exists():
+-            verify_embedded_attestation(
+-                str(out_path), _unit_attestation_fields(context, unit)
+-            )
+-        else:
+-            missing.append(unit)
+-    if not missing:
+-        return ("skipped", ", ".join(str(path) for path in paths))
+-
+-    snapshot, material_base = _load_snapshot(str(pair["geometry"]))
+-
+-    from ghost_backend.bor.dispatch import (
+-        solve_monostatic_rcs_bor_certified,
+-        solve_monostatic_rcs_bor_survey,
+-    )
+-    solve = (solve_monostatic_rcs_bor_certified if context["mesh_certification"]
+-             else solve_monostatic_rcs_bor_survey)
+-    from ghost_backend.twod.samples import compact_samples
+-    solve = compact_samples()(solve)
+-    quality_kwargs = ({"mesh_convergence_policy": validate_mesh_convergence_policy(
+-        context.get("mesh_convergence_policy")
+-    )} if context["mesh_certification"] else {})
+-    result = solve(
+-        geometry_snapshot=snapshot,
+-        frequencies_ghz=[float(pair["frequency_ghz"])],
+-        elevations_deg=[float(a) for a in context["aspects_deg"]],
+-        geometry_units=context["geometry_units"],
+-        material_base_dir=material_base,
+-        cfie_alpha=context["cfie_alpha"],
+-        n_modes=context["n_modes"],
+-        mode_tol=context["mode_tol"],
+-        max_elements=context["max_elements"],
+-        workers=context["workers_per_unit"],
+-        table_precision=context["table_precision"],
+-        assembly=context["assembly"],
+-        stream_budget_gb=context["stream_budget_gb"],
+-        bor_options=context.get("bor_execution_options", {}),
+-        expand_to_360=context["expand_to_360"],
+-        **quality_kwargs,
+-    )
+-    for warning in result.get("metadata", {}).get("warnings", []) or []:
+-        print(f"      [warn] {pair['geometry_stem']}: {warning}", flush=True)
+-    _verify_run_provenance(context)
+-    _verify_channel_inputs(channel_units, context)
+-
+-    from ghost_backend.io.grim import export_result_to_grim
+-    actual_paths = []
+-    for unit in missing:
+-        out_path = _unit_output_path(results_dir, unit)
+-        channel_result = _channel_result(result, str(unit["polarization"]))
+-        embed_output_attestation(
+-            channel_result, _unit_attestation_fields(context, unit)
+-        )
+-        written = export_result_to_grim(
+-            channel_result, str(out_path),
+-            source_path=str(snapshot.get("source_path", "") or ""),
+-            history=(f"run_local_bor.py pol={unit['polarization']} "
+-                     f"freq={unit['frequency_ghz']}GHz"),
+-        )
+-        actual_paths.append(str(written[0]) if written else str(out_path))
+-    _verify_run_provenance(context)
+-    _verify_channel_inputs(channel_units, context)
+-    return ("written", ", ".join(actual_paths))
+-
+-
+-def _verify_channel_inputs(channel_units, context):
+-    """Read an identical channel input once at each verification boundary.
+-
+-    A different expected digest is never deduplicated. Nothing persists across
+-    the solve or export boundary, so edits during either stage are still caught.
+-    """
+-    seen = set()
+-    for unit in channel_units:
+-        key = (str(unit['geometry']), unit.get('geometry_input_sha256'))
+-        if key not in seen:
+-            _verify_unit_input(unit, context)
+-            seen.add(key)
+-
+-
+-def _solve_and_export_star(args: 'tuple') -> 'tuple':
+-    """Pool entry point: unpack args and catch exceptions in-band.
+-
+-    The optional fourth argument is the unit's CPU reservation.  Units run
+-    side by side in separate processes, and each would otherwise size its
+-    native thread teams, near-preparation workers and BLAS limits to the
+-    whole host (``execution.options.allocated_cpu_budget``).
+-    """
+-
+-    unit, context, results_dir_str = args[:3]
+-    cpus = args[3] if len(args) > 3 else None
+-    try:
+-        with hpc_scheduler.cpu_allocation_scope(cpus):
+-            status, path = _solve_and_export(unit, context, results_dir_str)
+-        return ("ok", status, path)
+-    except Exception:
+-        return ("err", traceback.format_exc(), "")
+-
+-
+-def _spill_reservation_gib(
+-    resource_estimate: 'Dict[str, Any]', free_gib: 'Optional[float]'
+-) -> 'float':
+-    """Scratch disk (GiB) to reserve for a unit's far-block spill.
+-
+-    The preview records the spill the solve's streamed plan would write
+-    (``stream_spill_candidate_gb``, decimal GB).  At run time the solve
+-    spills only when the temporary directory holds that size with its safety
+-    margin, so the reservation carries the same margin: an admitted unit then
+-    always finds the room it planned for.  A spill that could never fit the
+-    free space leaves the solve on its in-memory plan and reserves nothing.
+-    """
+-
+-    candidate = float(
+-        resource_estimate.get("stream_spill_candidate_gb")
+-        or resource_estimate.get("stream_spill_gb_estimate")
+-        or 0.0
+-    )
+-    if not math.isfinite(candidate) or candidate <= 0.0:
+-        return 0.0
+-    try:
+-        from ghost_backend.bor.streaming import STREAM_SPILL_SAFETY_FACTOR as margin
+-    except ImportError:
+-        margin = 1.25
+-    request = hpc_scheduler.decimal_gb_to_gib(candidate * float(margin))
+-    if free_gib is not None and request > free_gib:
+-        return 0.0
+-    return request
+-
+-
+-def _spill_directory(estimates: 'List[Dict[str, Any]]') -> 'str':
+-    """Temporary directory the units' far-block spill goes to."""
+-
+-    for estimate in estimates:
+-        directory = estimate.get("stream_spill_directory")
+-        if directory:
+-            return str(directory)
+-    try:
+-        from ghost_backend.execution.options import temporary_directory
+-        return temporary_directory()
+-    except Exception:
+-        import tempfile
+-        return tempfile.gettempdir()
+-
+-
+-@preparation_scope()
+-def _plan(
+-    units: 'List[Dict[str, Any]]',
+-    aspects_deg: 'List[float]',
+-) -> 'Dict[str, float]':
+-    """Relative cost of every unit, read off the .geo profile.
+-
+-    Deliberately coarser than the 2-D model: there is no equally cheap way to
+-    predict a BoR discretization exactly, and an approximate order plus
+-    dearest-first dispatch beats an exact plan that costs a solve to compute.
+-    """
+-
+-    extents: 'Dict[str, Tuple[float, float]]' = {}
+-    costs: 'Dict[str, float]' = {}
+-    from ghost_backend.bor.dispatch import estimate_bor_resources
+-    from ghost_backend.assembly.fields import bor_output_profile
+-    checked_profiles = set()
+-    for unit in units:
+-        path = str(unit["geometry"])
+-        if path not in extents:
+-            extents[path] = hpc_scheduler.predict_bor_extent(
+-                path, GEOMETRY_UNITS
+-            )
+-        arc, radius = extents[path]
+-        costs[_pair_name(unit)] = hpc_scheduler.bor_unit_cost(
+-            arc, radius, float(unit["frequency_ghz"]), len(aspects_deg)
+-        )
+-        snapshot, material_base = _load_snapshot(path)
+-        if path not in checked_profiles:
+-            bor_output_profile(snapshot, GEOMETRY_UNITS)
+-            checked_profiles.add(path)
+-        unit["resource_estimate"] = estimate_bor_resources(
+-            snapshot,
+-            float(unit["frequency_ghz"]),
+-            aspects_deg,
+-            geometry_units=GEOMETRY_UNITS,
+-            material_base_dir=material_base,
+-            n_modes=N_MODES,
+-            max_elements=MAX_ELEMENTS,
+-            workers=WORKERS_PER_UNIT,
+-            table_precision=TABLE_PRECISION,
+-            assembly=ASSEMBLY,
+-            stream_budget_gb=STREAM_BUDGET_GB,
+-            bor_options=BOR_EXECUTION_OPTIONS,
+-            mesh_certification=bool(MESH_CERTIFICATION),
+-            fine_factor=float(accuracy_target_policy(ACCURACY_TARGET)["fine_factor"]),
+-        )
+-    return costs
+-
+-
+-def _validate_config() -> 'List[float]':
+-    if ACCURACY_TARGET not in ("standard", "tight"):
+-        sys.exit("ERROR: ACCURACY_TARGET must be 'standard' or 'tight'.")
+-    if not FREQUENCIES_GHZ: sys.exit("ERROR: FREQUENCIES_GHZ is empty.")
+-    try:
+-        from ghost_backend.assembly.fields import radar_grid_aspects, validate_radar_grid
+-        validate_radar_grid(AZIMUTHS_DEG, ELEVATIONS_DEG)
+-        aspects = radar_grid_aspects(
+-            AZIMUTHS_DEG,
+-            ELEVATIONS_DEG,
+-            BODY_AXIS_AZ_DEG,
+-            BODY_AXIS_EL_DEG,
+-        )
+-    except ValueError as exc:
+-        sys.exit(f"ERROR: radar grid is invalid -- {exc}")
+-    frequencies = [float(value) for value in FREQUENCIES_GHZ]
+-    if (
+-        not all(math.isfinite(value) and value > 0.0 for value in frequencies)
+-        or len(set(frequencies)) != len(frequencies)
+-        or len({f"{value:.3f}" for value in frequencies}) != len(frequencies)
+-    ):
+-        sys.exit(
+-            "ERROR: frequencies must be finite, positive, unique, and "
+-            "distinct at the 0.001 GHz output-name precision."
+-        )
+-    if not all(math.isfinite(float(value)) for value in (
+-        BODY_AXIS_AZ_DEG, BODY_AXIS_EL_DEG, BODY_ROLL_DEG
+-    )):
+-        sys.exit("ERROR: body-axis attitude angles must be finite.")
+-    if str(ASSEMBLY).strip().lower() not in {"auto", "tables", "streaming"}:
+-        sys.exit("ERROR: ASSEMBLY must be auto, tables, or streaming.")
+-    if str(TABLE_PRECISION).strip().lower() not in {"auto", "single", "double"}:
+-        sys.exit("ERROR: TABLE_PRECISION must be auto, single, or double.")
+-    if (
+-        not math.isfinite(float(CFIE_ALPHA))
+-        or not 0.0 < float(CFIE_ALPHA) < 1.0
+-    ):
+-        sys.exit(
+-            "ERROR: CFIE_ALPHA must be finite and lie strictly between 0 and 1."
+-        )
+-    if float(STREAM_BUDGET_GB) <= 0.0:
+-        sys.exit("ERROR: STREAM_BUDGET_GB must be positive.")
+-    if not 0.0 < float(MEMORY_HEADROOM) <= 1.0:
+-        sys.exit("ERROR: MEMORY_HEADROOM must be in (0, 1].")
+-    if int(WORKERS_PER_UNIT) < 1:
+-        sys.exit("ERROR: WORKERS_PER_UNIT must be >= 1.")
+-    if int(TASKS_PER_CHILD) < 1:
+-        sys.exit("ERROR: TASKS_PER_CHILD must be >= 1.")
+-    if WORKERS is not None and int(WORKERS) < 1:
+-        sys.exit("ERROR: WORKERS must be a positive integer or None.")
+-    return [float(value) for value in aspects]
+-
+-
+-def main() -> 'None':
+-    aspects = _validate_config()
+-    mesh_policy = accuracy_target_policy(ACCURACY_TARGET)
+-    pols = ["VV", "HH"]
+-    hpc_scheduler.pin_blas_threads(int(BLAS_THREADS_PER_WORKER))
+-    hpc_scheduler.install_fingerprint_cache()
+-    # Spill left by a killed earlier solve would otherwise shrink the space
+-    # the previews below see (and keep tens of GB of disk occupied).
+-    hpc_scheduler.sweep_stale_bor_spill()
+-
+-    geometries = _discover_geometries()
+-    if not geometries:
+-        sys.exit("ERROR: no geometry files (*.geo) found under GEOMETRY_DIRS.")
+-    stems = [geometry.stem for geometry in geometries]
+-    if len(stems) != len(set(stems)):
+-        sys.exit(
+-            "ERROR: geometry stems must be unique; output names would "
+-            "otherwise collide."
+-        )
+-
+-    units: 'List[Dict[str, Any]]' = []
+-    from ghost_backend.assembly.fields import geometry_input_fingerprint
+-    for geom in geometries:
+-        input_fingerprint = geometry_input_fingerprint(
+-            str(geom), GEOMETRY_UNITS
+-        )
+-        for pol in pols:
+-            for f in FREQUENCIES_GHZ:
+-                # The aspect grid is deliberately NOT repeated per unit: it is
+-                # identical for every unit in the run, and carrying it here made
+-                # the manifest grow with (units x aspects) instead of with the
+-                # sweep. It lives once at manifest level and is bound into each
+-                # attestation by hash.
+-                units.append({
+-                    "geometry":      str(geom.resolve()),
+-                    "geometry_stem": geom.stem,
+-                    "geometry_input_sha256": input_fingerprint,
+-                    "polarization":  pol,
+-                    "frequency_ghz": float(f),
+-                })
+-
+-    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
+-    run_dir = Path(OUTPUT_DIR).resolve() / run_id
+-    results_dir = run_dir / "results"
+-    unit_dir = results_dir / "by_frequency"
+-    run_dir.mkdir(parents=True, exist_ok=False)
+-    results_dir.mkdir()
+-    unit_dir.mkdir()
+-    solver_config = {
+-        "geometry_units": GEOMETRY_UNITS,
+-        "cfie_alpha": float(CFIE_ALPHA),
+-        "n_modes": N_MODES,
+-        "mode_tol": float(MODE_TOL),
+-        "max_elements": int(MAX_ELEMENTS),
+-        "assembly": ASSEMBLY,
+-        "table_precision": TABLE_PRECISION,
+-        "stream_budget_gb": float(STREAM_BUDGET_GB),
+-        "bor_execution_options": dict(BOR_EXECUTION_OPTIONS),
+-        "expand_to_360": False,
+-        "mesh_certification": bool(MESH_CERTIFICATION),
+-        "accuracy_target": ACCURACY_TARGET,
+-        "mesh_convergence_policy": mesh_policy,
+-        "workers_per_unit": int(WORKERS_PER_UNIT),
+-        "blas_threads_per_worker": int(BLAS_THREADS_PER_WORKER),
+-    }
+-    manifest: 'Dict[str, Any]' = {
+-        "schema": MANIFEST_SCHEMA,
+-        "status": "running",
+-        "run_id": run_id,
+-        "created": datetime.now().isoformat(),
+-        "solver": "bor_mom_rcs",
+-        "frequencies_ghz": [float(f) for f in FREQUENCIES_GHZ],
+-        "aspects_deg": aspects,
+-        "polarizations": pols,
+-        "unit_output_dir": "results/by_frequency",
+-        "radar_grid": {
+-            "azimuths_deg": [float(value) for value in AZIMUTHS_DEG],
+-            "elevations_deg": [float(value) for value in ELEVATIONS_DEG],
+-            "axis_az_deg": float(BODY_AXIS_AZ_DEG),
+-            "axis_el_deg": float(BODY_AXIS_EL_DEG),
+-            "roll_deg": float(BODY_ROLL_DEG),
+-        },
+-        "n_units": len(units),
+-        "solver_source_sha256": _solver_source_fingerprint(),
+-        # Per-file hashes behind that fingerprint, so a later mismatch can say
+-        # which file moved instead of only that one did.
+-        "solver_source_inventory": _solver_source_inventory(),
+-        "runtime_environment_sha256": runtime_environment_fingerprint(),
+-        "solver_config": solver_config,
+-        "units": units,
+-    }
+-    manifest_path = run_dir / "manifest.json"
+-    _write_json_atomic(manifest_path, manifest)
+-
+-    # Everything a unit needs from the manifest, resolved once in the parent
+-    # instead of re-read and re-parsed inside every unit.
+-    context = {
+-        "run_id": run_id,
+-        "solver_source_sha256": manifest["solver_source_sha256"],
+-        "solver_source_inventory": manifest["solver_source_inventory"],
+-        "runtime_environment_sha256": manifest["runtime_environment_sha256"],
+-        "run_solve_spec_sha256": manifest_solve_spec_fingerprint(manifest),
+-        "solver_config_sha256": stable_json_fingerprint(solver_config),
+-        "geometry_units": GEOMETRY_UNITS,
+-        "cfie_alpha": float(CFIE_ALPHA),
+-        "n_modes": N_MODES,
+-        "mode_tol": float(MODE_TOL),
+-        "max_elements": int(MAX_ELEMENTS),
+-        "assembly": ASSEMBLY,
+-        "table_precision": TABLE_PRECISION,
+-        "stream_budget_gb": float(STREAM_BUDGET_GB),
+-        "bor_execution_options": dict(BOR_EXECUTION_OPTIONS),
+-        "expand_to_360": False,
+-        "mesh_certification": bool(MESH_CERTIFICATION),
+-        "mesh_convergence_policy": mesh_policy,
+-        "workers_per_unit": int(WORKERS_PER_UNIT),
+-        "aspects_deg": aspects,
+-        "angular_grid_sha256": stable_json_fingerprint(
+-            aspects
+-        ),
+-    }
+-
+-    # Dearest-first. Sorted into a new list, never in place: `units` is the
+-    # same object the manifest holds, and reordering it after the run
+-    # fingerprint was taken would make the manifest on disk hash differently
+-    # from what every attestation recorded.
+-    solve_units = _paired_solve_units(units)
+-    costs = _plan(solve_units, aspects)
+-    ordered = sorted(
+-        solve_units,
+-        key=lambda u: (-costs.get(_pair_name(u), 1.0), _pair_name(u)),
+-    )
+-
+-    # Unit concurrency stays sized on logical CPUs: four 1.5 GHz ogive units
+-    # took 38-44 s at 4 units x 4 threads on 16 logical CPUs and 67-69 s at
+-    # 2 x 4 on the 8 physical cores (September 2026 A/B), because concurrent
+-    # units overlap each other's serial phases.  Each unit's CPU reservation
+-    # below bounds its thread teams so units share the CPUs instead of each
+-    # sizing itself to the whole host.
+-    cores = hpc_scheduler.detect_cores()
+-    budget_gb, memory_gb, available_gb = hpc_scheduler.local_memory_budget_gb(
+-        float(MEMORY_HEADROOM)
+-    )
+-    by_threads = max(1, cores // max(1, int(WORKERS_PER_UNIT)))
+-    worker_cap = by_threads if WORKERS is None else int(WORKERS)
+-    pool_size = max(1, min(by_threads, worker_cap, len(ordered)))
+-    # The planner prices decimal GB; the scheduler budgets GiB.
+-    reservations_gib = {
+-        _pair_name(unit): hpc_scheduler.decimal_gb_to_gib(
+-            float(unit["resource_estimate"]["estimated_peak_gb"])
+-        )
+-        for unit in ordered
+-    }
+-    unit_cpus = {
+-        name: hpc_scheduler.assembly_threads_for_unit(
+-            cores, pool_size, budget_gb, peak_gib
+-        )
+-        for name, peak_gib in reservations_gib.items()
+-    }
+-    spill_dir = _spill_directory(
+-        [unit["resource_estimate"] for unit in ordered]
+-    )
+-    spill_free_gib = hpc_scheduler.free_disk_gib(spill_dir)
+-    spill_gib = {
+-        _pair_name(unit): _spill_reservation_gib(
+-            unit["resource_estimate"], spill_free_gib
+-        )
+-        for unit in ordered
+-    }
+-
+-    print("=" * 70)
+-    print("Local BoR monostatic RCS sweep")
+-    print("=" * 70)
+-    print(f"  Run dir       : {run_dir}")
+-    print(f"  Geometries    : {len(geometries)}")
+-    print(f"  Polarizations : {', '.join(pols)}")
+-    print(f"  Frequencies   : {len(FREQUENCIES_GHZ)}  "
+-          f"({min(FREQUENCIES_GHZ):g}-{max(FREQUENCIES_GHZ):g} GHz)")
+-    print(f"  Radar grid    : {len(AZIMUTHS_DEG)} az x "
+-          f"{len(ELEVATIONS_DEG)} el")
+-    print(f"  Solver aspects: {len(aspects)} exact body-aspect RHS columns")
+-    print(f"  Deliverables  : {len(geometries)} monostatic GRIM(s)")
+-    print(f"  Physical solves: {len(ordered)}  (VV/HH co-solved)")
+-    print(f"  Mesh check    : {'base + fine comparison' if MESH_CERTIFICATION else 'base only (no mesh comparison)'}")
+-    cpu_counts = sorted(set(unit_cpus.values()))
+-    cpu_label = (str(cpu_counts[0]) if len(cpu_counts) == 1
+-                 else f"{cpu_counts[0]}-{cpu_counts[-1]}")
+-    print(f"  Workers       : {pool_size} procs x {WORKERS_PER_UNIT} threads "
+-          f"of {cores} cpus; {cpu_label} cpus reserved per solve  "
+-          f"(BLAS threads/worker: {BLAS_THREADS_PER_WORKER})")
+-    reservations = list(reservations_gib.values())
+-    available_text = (f", {available_gb:.1f} GiB available"
+-                      if available_gb is not None else "")
+-    print(f"  Memory        : {memory_gb:.1f} GiB installed{available_text}, "
+-          f"{budget_gb:.1f} GiB schedulable; per-solve reservations "
+-          f"{min(reservations):.2f}-{max(reservations):.2f} GiB")
+-    spill_total = sum(spill_gib.values())
+-    if spill_total > 0.0:
+-        free_text = (f"{spill_free_gib:.1f} GiB free"
+-                     if spill_free_gib is not None else "free space unknown")
+-        print(f"  Spill disk    : up to {max(spill_gib.values()):.1f} GiB per "
+-              f"solve in {spill_dir} ({free_text}); concurrent spills are "
+-              "admitted against that space")
+-    print("=" * 70, flush=True)
+-
+-    # Parse each distinct geometry once, and import the solver, before the pool
+-    # forks: workers then inherit both instead of repeating the work per unit.
+-    for unit in ordered:
+-        _load_snapshot(str(unit["geometry"]))
+-    import ghost_backend.bor.dispatch as bor_dispatch
+-    import ghost_backend.io.grim as grim_io
+-
+-    counters = {"written": 0, "skipped": 0, "failed": 0}
+-    started = time.time()
+-    total = len(ordered)
+-
+-    def _resources(unit):
+-        name = _pair_name(unit)
+-        return reservations_gib[name], unit_cpus[name], spill_gib[name]
+-
+-    def _prepare(unit):
+-        name = _pair_name(unit)
+-        return (
+-            name,
+-            reservations_gib[name],
+-            (_solve_and_export_star,
+-             ((unit, context, str(unit_dir), unit_cpus[name]),)),
+-        )
+-
+-    def _finished():
+-        return counters["written"] + counters["skipped"] + counters["failed"]
+-
+-    def _on_result(name, payload):
+-        kind, first, _second = payload
+-        if kind == "ok":
+-            counters["skipped" if first == "skipped" else "written"] += 1
+-            print(f"  [{_finished():4d}/{total}] {first:7s}  {name}", flush=True)
+-        else:
+-            counters["failed"] += 1
+-            print(f"  [{_finished():4d}/{total}] FAILED   {name}", flush=True)
+-            for line in str(first).rstrip().splitlines():
+-                print(f"      {line}", flush=True)
+-
+-    def _on_error(name, exc):
+-        counters["failed"] += 1
+-        print(f"  [{_finished():4d}/{total}] FAILED (dispatch) {name}: {exc!r}",
+-              flush=True)
+-
+-    dispatcher = None
+-    try:
+-        with _ExecutorPool(
+-            processes=pool_size,
+-            initializer=_pool_initializer,
+-            initargs=(int(BLAS_THREADS_PER_WORKER),),
+-            max_tasks_per_child=int(TASKS_PER_CHILD),
+-        ) as pool:
+-            dispatcher = hpc_scheduler.MemoryAwareDispatcher(
+-                pool, budget_gb=budget_gb, max_concurrent=pool_size,
+-                cpu_budget=cores,
+-                disk_budget_gb=lambda: hpc_scheduler.free_disk_gib(spill_dir),
+-            )
+-            dispatcher.run(ordered, _prepare, _on_result, _on_error, _resources)
+-    except BaseException as exc:
+-        # Whatever stopped the sweep, the manifest must not claim it is
+-        # still running; completed units stay valid for inspection.
+-        manifest["status"] = (
+-            "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+-        )
+-        _write_json_atomic(manifest_path, manifest)
+-        if isinstance(exc, hpc_scheduler.WorkerPoolFailure):
+-            print(f"\n  STOPPED: {exc}", flush=True)
+-            print(f"  wrote={counters['written']}, "
+-                  f"skipped={counters['skipped']}, "
+-                  f"failed={counters['failed']}, "
+-                  f"not started={total - _finished()}.", flush=True)
+-            raise SystemExit(1)
+-        raise
+-
+-    elapsed = time.time() - started
+-    rebuilt = dispatcher.pool_rebuilds if dispatcher is not None else 0
+-    print(f"\n  Done. wrote={counters['written']}, "
+-          f"skipped={counters['skipped']}, failed={counters['failed']}.  "
+-          f"{elapsed:.1f} s elapsed."
+-          + (f"  Worker pool rebuilt {rebuilt}x after crashes." if rebuilt else ""))
+-    manifest["status"] = "failed" if counters["failed"] else "complete"
+-    _write_json_atomic(manifest_path, manifest)
+-    if counters["failed"]:
+-        raise SystemExit(1)
+-    from ghost_backend.hpc.common import (
+-        bodies_from_units,
+-        bor_solver_diagnostics_from_units,
+-        read_unit_grims,
+-    )
+-    from ghost_backend.assembly.fields import (
+-        bor_output_profile, bor_output_profile_metadata, save_monostatic_grim,
+-    )
+-
+-    records = read_unit_grims(unit_dir)
+-    for stem in sorted({str(unit["geometry_stem"]) for unit in units}):
+-        matching = [unit for unit in units if unit["geometry_stem"] == stem]
+-        solver_diagnostics = bor_solver_diagnostics_from_units(
+-            records, stem=stem
+-        )
+-        snapshot, _material_base = _load_snapshot(str(matching[0]["geometry"]))
+-        profile = bor_output_profile(snapshot, GEOMETRY_UNITS)
+-        save_monostatic_grim(
+-            bodies_from_units(records, stem=stem),
+-            profile,
+-            str(results_dir / f"{stem}.grim"),
+-            azimuths_deg=AZIMUTHS_DEG,
+-            elevations_deg=ELEVATIONS_DEG,
+-            axis_az_deg=BODY_AXIS_AZ_DEG,
+-            axis_el_deg=BODY_AXIS_EL_DEG,
+-            roll_deg=BODY_ROLL_DEG,
+-            history="run_local_bor.py monostatic response",
+-            source_path=str(matching[0]["geometry"]),
+-            solver_diagnostics=solver_diagnostics,
+-            artifact_metadata={
+-                **bor_output_profile_metadata(snapshot),
+-                "geometry_input_sha256": str(
+-                    matching[0].get("geometry_input_sha256", "")
+-                ),
+-                "solver_source_sha256": str(manifest["solver_source_sha256"]),
+-                "runtime_environment_sha256": str(
+-                    manifest["runtime_environment_sha256"]
+-                ),
+-                "run_solve_spec_sha256": manifest_solve_spec_fingerprint(manifest),
+-            },
+-        )
+-    print(f"  Monostatic outputs: {results_dir}/")
+-
+-
+-if __name__ == "__main__":
+-    main()
++#!/usr/bin/env python3
++"""Local BoR monostatic RCS sweep -- run_hpc_bor_monostatic.py without SLURM.
++
++Each physical solve is a true 3-D (dBsm) body-of-revolution solve over the ASPECT angles
++(degrees from the +z rotation axis: 0 = nose-on, 90 = broadside, 180 = tail-on).
++Geometries are .geo half-profiles: x = rho (>= 0), y = z (rotation axis), drawn
++from the +z axis end to the -z axis end (see bor_dispatch.py).
++
++The user specifies frequencies, radar azimuths, and radar elevations.  The
++driver derives the exact body-aspect RHS columns needed by those looks, solves
++VV and HH together, and publishes one self-contained monostatic GRIM per
++geometry in results/.  That same file opens in GRIM and contains the compact
++body model/profile needed for later coherent door or cavity placement.
++
++Scheduling matches the HPC path. VV and HH are co-solved; separate visible
++per-frequency files serve only as verified intermediate/restart records. A
++BoR solve's cost grows roughly as the fourth
++power of frequency (elements^3 x modes), so a frequency sweep is badly
++lopsided; units are costed and run dearest-first, and concurrent solves are
++admitted against a memory budget instead of filling every core.
++
++Each frequency writes its solver-frame VV and HH restart records immediately
++under results/by_frequency/. The user-facing, feature-ready product is the
++combined monostatic body in results/. Certification remains a user-selected
++solve option and does not gate publication or downstream use.
++
++Edit the CONFIG block and run:
++
++    python run_local_bor.py
++"""
++if not __package__:
++    import sys
++    from pathlib import Path
++    if Path(__file__).resolve().parent.name == "ghost_backend":
++        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++from ghost_backend.execution.paths import backend_root as _backend_root
++
++import json
++import math
++import os
++import sys
++import time
++import traceback
++from datetime import datetime
++from multiprocessing import Pool  # noqa: F401 -- HPC driver parity; the local run uses _ExecutorPool
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++import ghost_backend.hpc.scheduler as hpc_scheduler
++from ghost_backend.runs.quality import accuracy_target_policy, validate_mesh_convergence_policy
++import ghost_backend.execution.provenance as _workflow_provenance
++from ghost_backend.execution.provenance import (
++    backend_source_fingerprint,
++    backend_source_inventory,
++    describe_source_mismatch,
++    embed_output_attestation,
++    manifest_solve_spec_fingerprint,
++    runtime_environment_fingerprint,
++    stable_json_fingerprint,
++    unit_solve_spec_fingerprint,
++    verify_embedded_attestation,
++)
++
++# Compatibility imports retain the established module entrypoints.
++from ghost_backend.runs.inputs import verify_local_unit_input as _verify_unit_input
++from ghost_backend.runs.inputs import load_geometry_snapshot
++from ghost_backend.twod.preparation import preparation_scope
++
++
++# ===============================================================================
++# CONFIG
++# ===============================================================================
++
++GEOMETRY_DIRS = ["ghost_backend/geometry/geometries/BOR"]      # every *.geo under these, recursively
++
++FREQUENCIES_GHZ = [1.0, 2.0, 4.0]
++AZIMUTHS_DEG    = [float(a) for a in range(0, 360, 5)]
++ELEVATIONS_DEG  = [float(e) for e in range(-60, 61, 5)]
++
++# Body-axis attitude in the radar/earth frame.  The default is horizontal,
++# nose toward azimuth 0.  Roll changes feature orientation about the BoR axis.
++BODY_AXIS_AZ_DEG = 0.0
++BODY_AXIS_EL_DEG = 0.0
++BODY_ROLL_DEG    = 0.0
++
++OUTPUT_DIR = "ghost_backend/results/rcs_runs_bor"
++
++# Hard ceiling on units in flight. None -> cores // WORKERS_PER_UNIT, since
++# each unit already runs WORKERS_PER_UNIT threads for its mode sweep and
++# streaming tiles. The memory budget below is usually the binding constraint.
++WORKERS = None
++
++# --- Solver knobs (mirror bor_dispatch.solve_monostatic_rcs_bor) -----------
++GEOMETRY_UNITS   = "inches"       # "inches" or "meters"
++CFIE_ALPHA       = 0.5            # closed PEC bodies -> CFIE
++N_MODES          = None           # None = auto (adaptive truncation)
++MODE_TOL         = 1e-6
++MAX_ELEMENTS     = 50_000
++ASSEMBLY         = "auto"         # "auto" | "tables" | "streaming"
++TABLE_PRECISION  = "auto"         # "auto" | "single" | "double"
++ACCURACY_TARGET  = "standard"     # "standard" | "tight"; mesh comparison limits
++STREAM_BUDGET_GB = 8.0            # maximum held streaming-block budget; the
++                                  # scheduler predicts total peak separately
++MESH_CERTIFICATION = True         # recommended: compare base/fine meshes;
++                                  # False solves the base mesh only
++WORKERS_PER_UNIT = 4              # threads inside one BoR solve
++BLAS_THREADS_PER_WORKER = 1
++
++# --- Memory admission ------------------------------------------------------
++# A local machine has far less RAM than a compute node and is usually running
++# other things, so the same guard the cluster path uses matters more here, not
++# less. One unit is always admitted, so a solve larger than the whole budget
++# still runs (and fails loudly) instead of hanging.
++MEMORY_HEADROOM = 0.75            # fraction of detected RAM the scheduler may
++                                  # reserve for concurrent solves. Lower than
++                                  # the cluster default of 0.85: a workstation
++                                  # has a desktop and a page cache to leave
++                                  # room for.
++
++# Pool worker lifetime, in units. Lower than the 2-D default because a BoR
++# unit's streaming blocks are large and worth returning to the OS promptly
++# (a respawn costs about half a second: 130 ms per pair at this interval).
++TASKS_PER_CHILD = 4
++
++# ===============================================================================
++
++from ghost_backend.runs.config import (
++    load_driver_configuration,
++    configuration_source_records,
++    copy_configuration,
++)
++from ghost_backend.bor.options import validate_options as validate_bor_options
++BOR_EXECUTION_OPTIONS = validate_bor_options({})
++
++_CONFIG_KIND = 'bor'
++_CONFIG_KEYS = (
++    'BOR_EXECUTION_OPTIONS',
++    'GEOMETRY_DIRS',
++    'FREQUENCIES_GHZ',
++    'AZIMUTHS_DEG',
++    'ELEVATIONS_DEG',
++    'BODY_AXIS_AZ_DEG',
++    'BODY_AXIS_EL_DEG',
++    'BODY_ROLL_DEG',
++    'OUTPUT_DIR',
++    'WORKERS',
++    'GEOMETRY_UNITS',
++    'CFIE_ALPHA',
++    'N_MODES',
++    'MODE_TOL',
++    'MAX_ELEMENTS',
++    'ASSEMBLY',
++    'TABLE_PRECISION',
++    'ACCURACY_TARGET',
++    'STREAM_BUDGET_GB',
++    'MESH_CERTIFICATION',
++    'WORKERS_PER_UNIT',
++    'BLAS_THREADS_PER_WORKER',
++    'MEMORY_HEADROOM',
++    'TASKS_PER_CHILD',
++)
++_ACTIVE_CONFIG_PATH = load_driver_configuration(globals(), __file__, _CONFIG_KIND, _CONFIG_KEYS)
++BOR_EXECUTION_OPTIONS = validate_bor_options(BOR_EXECUTION_OPTIONS)
++
++
++MANIFEST_SCHEMA = "ghost.local.bor-run.v2"
++
++# Parsed geometry snapshots, filled in the parent before the pool forks so
++# workers inherit them instead of unpickling one per unit.
++_SNAPSHOT_CACHE = {}  # type: Dict[str, Tuple[Dict[str, Any], str]]
++
++
++def _solver_source_records() -> 'Tuple[str, Dict[str, str]]':
++    backend_dir = str(_backend_root())
++    return backend_dir, configuration_source_records(__file__, _ACTIVE_CONFIG_PATH)
++
++
++def _solver_source_fingerprint() -> 'str':
++    backend_dir, extra = _solver_source_records()
++    return backend_source_fingerprint(backend_dir, extra)
++
++
++def _solver_source_inventory() -> 'Dict[str, str]':
++    backend_dir, extra = _solver_source_records()
++    return backend_source_inventory(backend_dir, extra)
++
++
++def _write_json_atomic(path: 'Path', payload: 'Dict[str, Any]') -> 'None':
++    temporary = Path(str(path) + f".tmp.{os.getpid()}")
++    temporary.write_text(
++        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
++        + "\n",
++        encoding="utf-8",
++    )
++    os.replace(str(temporary), str(path))
++
++
++def _verify_run_provenance(context: 'Dict[str, Any]') -> 'None':
++    """Re-check that the solver source and numerical runtime still match the run.
++
++    The file hashes underneath come from `hpc_scheduler.install_fingerprint_cache`,
++    so a repeat check is a stat per backend file rather than a full re-read, and
++    the cache expires on a timer so full re-reads keep happening inside
++    long-lived workers.
++    """
++
++    if _solver_source_fingerprint() != context.get("solver_source_sha256"):
++        detail = describe_source_mismatch(
++            context.get("solver_source_inventory") or {},
++            _solver_source_inventory(),
++        )
++        raise RuntimeError(
++            "Local-run solver source/native artifacts changed; no mixed-state "
++            f"field will be written or reused. ({detail})"
++        )
++    if runtime_environment_fingerprint() != context.get(
++        "runtime_environment_sha256"
++    ):
++        raise RuntimeError(
++            "Local-run Python/platform/NumPy/SciPy/BLAS runtime changed."
++        )
++
++
++def _unit_attestation_fields(
++    context: 'Dict[str, Any]',
++    unit: 'Dict[str, Any]',
++) -> 'Dict[str, Any]':
++    return {
++        "run_id": str(context["run_id"]),
++        "solver_source_sha256": str(context["solver_source_sha256"]),
++        "runtime_environment_sha256":
++            str(context["runtime_environment_sha256"]),
++        "geometry_input_sha256": str(unit["geometry_input_sha256"]),
++        "run_solve_spec_sha256": str(context["run_solve_spec_sha256"]),
++        "unit_solve_spec_sha256": unit_solve_spec_fingerprint(unit),
++        "solver_config_sha256": str(context["solver_config_sha256"]),
++        "angular_grid_kind": "aspects_deg",
++        # The grid is a run-level property, so it is bound by hash here and
++        # stored once in the manifest instead of being repeated in every unit
++        # record and every attestation.
++        "angular_grid_sha256": str(context["angular_grid_sha256"]),
++        "polarization": str(unit["polarization"]),
++        "frequency_ghz": float(unit["frequency_ghz"]),
++    }
++
++
++def _discover_geometries() -> 'List[Path]':
++    found: 'List[Path]' = []
++    seen: 'set' = set()
++    for d in GEOMETRY_DIRS:
++        root = Path(d)
++        if not root.is_dir():
++            print(f"  [warn] dir not found: {root}", file=sys.stderr)
++            continue
++        for p in sorted(root.rglob("*.geo")):
++            rp = p.resolve()
++            if rp not in seen:
++                seen.add(rp)
++                found.append(p)
++    return found
++
++
++def _unit_name(unit: 'Dict[str, Any]') -> 'str':
++    return (f"{unit['polarization']}_{float(unit['frequency_ghz']):.3f}GHz_"
++            f"{unit['geometry_stem']}.grim")
++
++
++def _unit_output_path(results_dir: 'Path', unit: 'Dict[str, Any]') -> 'Path':
++    return results_dir / _unit_name(unit)
++
++
++def _paired_solve_units(
++    output_units: 'List[Dict[str, Any]]',
++) -> 'List[Dict[str, Any]]':
++    """Group compatible VV/HH outputs into one physical BoR solve.
++
++    The manifest deliberately remains one record per output file for backward
++    compatibility.  Only the internal dispatch list is paired, because the
++    BoR matrix factorization already produces both channels together.
++    """
++
++    pairs: 'Dict[Tuple[str, float], Dict[str, Any]]' = {}
++    for unit in output_units:
++        key = (str(unit["geometry"]), float(unit["frequency_ghz"]))
++        pair = pairs.setdefault(key, {
++            "geometry": unit["geometry"],
++            "geometry_stem": unit["geometry_stem"],
++            "geometry_input_sha256": unit["geometry_input_sha256"],
++            "frequency_ghz": float(unit["frequency_ghz"]),
++            "channel_units": [],
++        })
++        pair["channel_units"].append(unit)
++    return list(pairs.values())
++
++
++def _pair_name(pair: 'Dict[str, Any]') -> 'str':
++    channels = "+".join(
++        str(unit["polarization"]) for unit in pair["channel_units"]
++    )
++    return (f"{channels}_{float(pair['frequency_ghz']):.3f}GHz_"
++            f"{pair['geometry_stem']}")
++
++
++def _channel_result(
++    result: 'Dict[str, Any]', polarization: 'str'
++) -> 'Dict[str, Any]':
++    samples = (result.get("co_solved_samples", {}) or {}).get(polarization, [])
++    if not samples:
++        raise RuntimeError(
++            f"BoR solve did not return its co-solved {polarization} channel."
++        )
++    channel = dict(result)
++    channel["samples"] = samples
++    channel["polarization"] = polarization
++    channel["polarization_export"] = polarization
++    channel.pop("polarizations", None)
++    channel.pop("polarization_mapping", None)
++    channel.pop("co_solved_samples", None)
++    channel["metadata"] = dict(result.get("metadata", {}) or {})
++    return channel
++
++
++def _load_snapshot(geometry_path: 'str') -> 'Tuple[Dict[str, Any], str]':
++    """Load through the shared reader using this driver's process-local cache."""
++    return load_geometry_snapshot(geometry_path, _SNAPSHOT_CACHE)
++
++
++def _pool_initializer(blas_threads: 'int') -> 'None':
++    hpc_scheduler.pin_blas_threads(blas_threads)
++    hpc_scheduler.install_fingerprint_cache()
++    import ghost_backend.bor.dispatch as bor_dispatch
++
++
++# Units run in concurrent.futures process workers, which may start the
++# near-preparation processes a unit's memory plan admits; multiprocessing.Pool
++# workers are daemonic and could not (see hpc.common.ExecutorPool).
++from ghost_backend.hpc.common import ExecutorPool as _ExecutorPool
++
++
++def _solve_and_export(
++    pair: 'Dict[str, Any]',
++    context: 'Dict[str, Any]',
++    results_dir_str: 'str',
++) -> 'Tuple[str, str]':
++    """Solve one geometry/frequency pair and export its requested channels."""
++
++    results_dir = Path(results_dir_str)
++    channel_units = list(pair["channel_units"])
++    _verify_run_provenance(context)
++    _verify_channel_inputs(channel_units, context)
++    missing = []
++    paths = []
++    for unit in channel_units:
++        out_path = _unit_output_path(results_dir, unit)
++        paths.append(out_path)
++        if out_path.exists():
++            verify_embedded_attestation(
++                str(out_path), _unit_attestation_fields(context, unit)
++            )
++        else:
++            missing.append(unit)
++    if not missing:
++        return ("skipped", ", ".join(str(path) for path in paths))
++
++    snapshot, material_base = _load_snapshot(str(pair["geometry"]))
++
++    from ghost_backend.bor.dispatch import (
++        solve_monostatic_rcs_bor_certified,
++        solve_monostatic_rcs_bor_survey,
++    )
++    solve = (solve_monostatic_rcs_bor_certified if context["mesh_certification"]
++             else solve_monostatic_rcs_bor_survey)
++    from ghost_backend.twod.samples import compact_samples
++    solve = compact_samples()(solve)
++    quality_kwargs = ({"mesh_convergence_policy": validate_mesh_convergence_policy(
++        context.get("mesh_convergence_policy")
++    )} if context["mesh_certification"] else {})
++    result = solve(
++        geometry_snapshot=snapshot,
++        frequencies_ghz=[float(pair["frequency_ghz"])],
++        elevations_deg=[float(a) for a in context["aspects_deg"]],
++        geometry_units=context["geometry_units"],
++        material_base_dir=material_base,
++        cfie_alpha=context["cfie_alpha"],
++        n_modes=context["n_modes"],
++        mode_tol=context["mode_tol"],
++        max_elements=context["max_elements"],
++        workers=context["workers_per_unit"],
++        table_precision=context["table_precision"],
++        assembly=context["assembly"],
++        stream_budget_gb=context["stream_budget_gb"],
++        bor_options=context.get("bor_execution_options", {}),
++        expand_to_360=context["expand_to_360"],
++        **quality_kwargs,
++    )
++    for warning in result.get("metadata", {}).get("warnings", []) or []:
++        print(f"      [warn] {pair['geometry_stem']}: {warning}", flush=True)
++    _verify_run_provenance(context)
++    _verify_channel_inputs(channel_units, context)
++
++    from ghost_backend.io.grim import export_result_to_grim
++    actual_paths = []
++    for unit in missing:
++        out_path = _unit_output_path(results_dir, unit)
++        channel_result = _channel_result(result, str(unit["polarization"]))
++        embed_output_attestation(
++            channel_result, _unit_attestation_fields(context, unit)
++        )
++        written = export_result_to_grim(
++            channel_result, str(out_path),
++            source_path=str(snapshot.get("source_path", "") or ""),
++            history=(f"run_local_bor.py pol={unit['polarization']} "
++                     f"freq={unit['frequency_ghz']}GHz"),
++        )
++        actual_paths.append(str(written[0]) if written else str(out_path))
++    _verify_run_provenance(context)
++    _verify_channel_inputs(channel_units, context)
++    return ("written", ", ".join(actual_paths))
++
++
++def _verify_channel_inputs(channel_units, context):
++    """Read an identical channel input once at each verification boundary.
++
++    A different expected digest is never deduplicated. Nothing persists across
++    the solve or export boundary, so edits during either stage are still caught.
++    """
++    seen = set()
++    for unit in channel_units:
++        key = (str(unit['geometry']), unit.get('geometry_input_sha256'))
++        if key not in seen:
++            _verify_unit_input(unit, context)
++            seen.add(key)
++
++
++def _solve_and_export_star(args: 'tuple') -> 'tuple':
++    """Pool entry point: unpack args and catch exceptions in-band.
++
++    The optional fourth argument is the unit's CPU reservation.  Units run
++    side by side in separate processes, and each would otherwise size its
++    native thread teams, near-preparation workers and BLAS limits to the
++    whole host (``execution.options.allocated_cpu_budget``).
++    """
++
++    unit, context, results_dir_str = args[:3]
++    cpus = args[3] if len(args) > 3 else None
++    try:
++        with hpc_scheduler.cpu_allocation_scope(cpus):
++            status, path = _solve_and_export(unit, context, results_dir_str)
++        return ("ok", status, path)
++    except Exception:
++        return ("err", traceback.format_exc(), "")
++
++
++def _spill_reservation_gib(
++    resource_estimate: 'Dict[str, Any]', free_gib: 'Optional[float]'
++) -> 'float':
++    """Scratch disk (GiB) to reserve for a unit's far-block spill.
++
++    The preview records the spill the solve's streamed plan would write
++    (``stream_spill_candidate_gb``, decimal GB).  At run time the solve
++    spills only when the temporary directory holds that size with its safety
++    margin, so the reservation carries the same margin: an admitted unit then
++    always finds the room it planned for.  A spill that could never fit the
++    free space leaves the solve on its in-memory plan and reserves nothing.
++    """
++
++    candidate = float(
++        resource_estimate.get("stream_spill_candidate_gb")
++        or resource_estimate.get("stream_spill_gb_estimate")
++        or 0.0
++    )
++    if not math.isfinite(candidate) or candidate <= 0.0:
++        return 0.0
++    try:
++        from ghost_backend.bor.streaming import STREAM_SPILL_SAFETY_FACTOR as margin
++    except ImportError:
++        margin = 1.25
++    request = hpc_scheduler.decimal_gb_to_gib(candidate * float(margin))
++    if free_gib is not None and request > free_gib:
++        return 0.0
++    return request
++
++
++def _spill_directory(estimates: 'List[Dict[str, Any]]') -> 'str':
++    """Temporary directory the units' far-block spill goes to."""
++
++    for estimate in estimates:
++        directory = estimate.get("stream_spill_directory")
++        if directory:
++            return str(directory)
++    try:
++        from ghost_backend.execution.options import temporary_directory
++        return temporary_directory()
++    except Exception:
++        import tempfile
++        return tempfile.gettempdir()
++
++
++@preparation_scope()
++def _plan(
++    units: 'List[Dict[str, Any]]',
++    aspects_deg: 'List[float]',
++) -> 'Dict[str, float]':
++    """Relative cost of every unit, read off the .geo profile.
++
++    Deliberately coarser than the 2-D model: there is no equally cheap way to
++    predict a BoR discretization exactly, and an approximate order plus
++    dearest-first dispatch beats an exact plan that costs a solve to compute.
++    """
++
++    extents: 'Dict[str, Tuple[float, float]]' = {}
++    costs: 'Dict[str, float]' = {}
++    from ghost_backend.bor.dispatch import estimate_bor_resources
++    from ghost_backend.assembly.fields import bor_output_profile
++    checked_profiles = set()
++    for unit in units:
++        path = str(unit["geometry"])
++        if path not in extents:
++            extents[path] = hpc_scheduler.predict_bor_extent(
++                path, GEOMETRY_UNITS
++            )
++        arc, radius = extents[path]
++        costs[_pair_name(unit)] = hpc_scheduler.bor_unit_cost(
++            arc, radius, float(unit["frequency_ghz"]), len(aspects_deg)
++        )
++        snapshot, material_base = _load_snapshot(path)
++        if path not in checked_profiles:
++            bor_output_profile(snapshot, GEOMETRY_UNITS)
++            checked_profiles.add(path)
++        unit["resource_estimate"] = estimate_bor_resources(
++            snapshot,
++            float(unit["frequency_ghz"]),
++            aspects_deg,
++            geometry_units=GEOMETRY_UNITS,
++            material_base_dir=material_base,
++            n_modes=N_MODES,
++            max_elements=MAX_ELEMENTS,
++            workers=WORKERS_PER_UNIT,
++            table_precision=TABLE_PRECISION,
++            assembly=ASSEMBLY,
++            stream_budget_gb=STREAM_BUDGET_GB,
++            bor_options=BOR_EXECUTION_OPTIONS,
++            mesh_certification=bool(MESH_CERTIFICATION),
++            fine_factor=float(accuracy_target_policy(ACCURACY_TARGET)["fine_factor"]),
++        )
++    return costs
++
++
++def _validate_config() -> 'List[float]':
++    if ACCURACY_TARGET not in ("standard", "tight"):
++        sys.exit("ERROR: ACCURACY_TARGET must be 'standard' or 'tight'.")
++    if not FREQUENCIES_GHZ: sys.exit("ERROR: FREQUENCIES_GHZ is empty.")
++    try:
++        from ghost_backend.assembly.fields import radar_grid_aspects, validate_radar_grid
++        validate_radar_grid(AZIMUTHS_DEG, ELEVATIONS_DEG)
++        aspects = radar_grid_aspects(
++            AZIMUTHS_DEG,
++            ELEVATIONS_DEG,
++            BODY_AXIS_AZ_DEG,
++            BODY_AXIS_EL_DEG,
++        )
++    except ValueError as exc:
++        sys.exit(f"ERROR: radar grid is invalid -- {exc}")
++    frequencies = [float(value) for value in FREQUENCIES_GHZ]
++    if (
++        not all(math.isfinite(value) and value > 0.0 for value in frequencies)
++        or len(set(frequencies)) != len(frequencies)
++        or len({f"{value:.3f}" for value in frequencies}) != len(frequencies)
++    ):
++        sys.exit(
++            "ERROR: frequencies must be finite, positive, unique, and "
++            "distinct at the 0.001 GHz output-name precision."
++        )
++    if not all(math.isfinite(float(value)) for value in (
++        BODY_AXIS_AZ_DEG, BODY_AXIS_EL_DEG, BODY_ROLL_DEG
++    )):
++        sys.exit("ERROR: body-axis attitude angles must be finite.")
++    if str(ASSEMBLY).strip().lower() not in {"auto", "tables", "streaming"}:
++        sys.exit("ERROR: ASSEMBLY must be auto, tables, or streaming.")
++    if str(TABLE_PRECISION).strip().lower() not in {"auto", "single", "double"}:
++        sys.exit("ERROR: TABLE_PRECISION must be auto, single, or double.")
++    if (
++        not math.isfinite(float(CFIE_ALPHA))
++        or not 0.0 < float(CFIE_ALPHA) < 1.0
++    ):
++        sys.exit(
++            "ERROR: CFIE_ALPHA must be finite and lie strictly between 0 and 1."
++        )
++    if float(STREAM_BUDGET_GB) <= 0.0:
++        sys.exit("ERROR: STREAM_BUDGET_GB must be positive.")
++    if not 0.0 < float(MEMORY_HEADROOM) <= 1.0:
++        sys.exit("ERROR: MEMORY_HEADROOM must be in (0, 1].")
++    if int(WORKERS_PER_UNIT) < 1:
++        sys.exit("ERROR: WORKERS_PER_UNIT must be >= 1.")
++    if int(TASKS_PER_CHILD) < 1:
++        sys.exit("ERROR: TASKS_PER_CHILD must be >= 1.")
++    if WORKERS is not None and int(WORKERS) < 1:
++        sys.exit("ERROR: WORKERS must be a positive integer or None.")
++    return [float(value) for value in aspects]
++
++
++def main() -> 'None':
++    aspects = _validate_config()
++    mesh_policy = accuracy_target_policy(ACCURACY_TARGET)
++    pols = ["VV", "HH"]
++    hpc_scheduler.pin_blas_threads(int(BLAS_THREADS_PER_WORKER))
++    hpc_scheduler.install_fingerprint_cache()
++    # Spill left by a killed earlier solve would otherwise shrink the space
++    # the previews below see (and keep tens of GB of disk occupied).
++    hpc_scheduler.sweep_stale_bor_spill()
++
++    geometries = _discover_geometries()
++    if not geometries:
++        sys.exit("ERROR: no geometry files (*.geo) found under GEOMETRY_DIRS.")
++    stems = [geometry.stem for geometry in geometries]
++    if len(stems) != len(set(stems)):
++        sys.exit(
++            "ERROR: geometry stems must be unique; output names would "
++            "otherwise collide."
++        )
++
++    units: 'List[Dict[str, Any]]' = []
++    from ghost_backend.assembly.fields import geometry_input_fingerprint
++    for geom in geometries:
++        input_fingerprint = geometry_input_fingerprint(
++            str(geom), GEOMETRY_UNITS
++        )
++        for pol in pols:
++            for f in FREQUENCIES_GHZ:
++                # The aspect grid is deliberately NOT repeated per unit: it is
++                # identical for every unit in the run, and carrying it here made
++                # the manifest grow with (units x aspects) instead of with the
++                # sweep. It lives once at manifest level and is bound into each
++                # attestation by hash.
++                units.append({
++                    "geometry":      str(geom.resolve()),
++                    "geometry_stem": geom.stem,
++                    "geometry_input_sha256": input_fingerprint,
++                    "polarization":  pol,
++                    "frequency_ghz": float(f),
++                })
++
++    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
++    run_dir = Path(OUTPUT_DIR).resolve() / run_id
++    results_dir = run_dir / "results"
++    unit_dir = results_dir / "by_frequency"
++    run_dir.mkdir(parents=True, exist_ok=False)
++    results_dir.mkdir()
++    unit_dir.mkdir()
++    solver_config = {
++        "geometry_units": GEOMETRY_UNITS,
++        "cfie_alpha": float(CFIE_ALPHA),
++        "n_modes": N_MODES,
++        "mode_tol": float(MODE_TOL),
++        "max_elements": int(MAX_ELEMENTS),
++        "assembly": ASSEMBLY,
++        "table_precision": TABLE_PRECISION,
++        "stream_budget_gb": float(STREAM_BUDGET_GB),
++        "bor_execution_options": dict(BOR_EXECUTION_OPTIONS),
++        "expand_to_360": False,
++        "mesh_certification": bool(MESH_CERTIFICATION),
++        "accuracy_target": ACCURACY_TARGET,
++        "mesh_convergence_policy": mesh_policy,
++        "workers_per_unit": int(WORKERS_PER_UNIT),
++        "blas_threads_per_worker": int(BLAS_THREADS_PER_WORKER),
++    }
++    manifest: 'Dict[str, Any]' = {
++        "schema": MANIFEST_SCHEMA,
++        "status": "running",
++        "run_id": run_id,
++        "created": datetime.now().isoformat(),
++        "solver": "bor_mom_rcs",
++        "frequencies_ghz": [float(f) for f in FREQUENCIES_GHZ],
++        "aspects_deg": aspects,
++        "polarizations": pols,
++        "unit_output_dir": "results/by_frequency",
++        "radar_grid": {
++            "azimuths_deg": [float(value) for value in AZIMUTHS_DEG],
++            "elevations_deg": [float(value) for value in ELEVATIONS_DEG],
++            "axis_az_deg": float(BODY_AXIS_AZ_DEG),
++            "axis_el_deg": float(BODY_AXIS_EL_DEG),
++            "roll_deg": float(BODY_ROLL_DEG),
++        },
++        "n_units": len(units),
++        "solver_source_sha256": _solver_source_fingerprint(),
++        # Per-file hashes behind that fingerprint, so a later mismatch can say
++        # which file moved instead of only that one did.
++        "solver_source_inventory": _solver_source_inventory(),
++        "runtime_environment_sha256": runtime_environment_fingerprint(),
++        "solver_config": solver_config,
++        "units": units,
++    }
++    manifest_path = run_dir / "manifest.json"
++    _write_json_atomic(manifest_path, manifest)
++
++    # Everything a unit needs from the manifest, resolved once in the parent
++    # instead of re-read and re-parsed inside every unit.
++    context = {
++        "run_id": run_id,
++        "solver_source_sha256": manifest["solver_source_sha256"],
++        "solver_source_inventory": manifest["solver_source_inventory"],
++        "runtime_environment_sha256": manifest["runtime_environment_sha256"],
++        "run_solve_spec_sha256": manifest_solve_spec_fingerprint(manifest),
++        "solver_config_sha256": stable_json_fingerprint(solver_config),
++        "geometry_units": GEOMETRY_UNITS,
++        "cfie_alpha": float(CFIE_ALPHA),
++        "n_modes": N_MODES,
++        "mode_tol": float(MODE_TOL),
++        "max_elements": int(MAX_ELEMENTS),
++        "assembly": ASSEMBLY,
++        "table_precision": TABLE_PRECISION,
++        "stream_budget_gb": float(STREAM_BUDGET_GB),
++        "bor_execution_options": dict(BOR_EXECUTION_OPTIONS),
++        "expand_to_360": False,
++        "mesh_certification": bool(MESH_CERTIFICATION),
++        "mesh_convergence_policy": mesh_policy,
++        "workers_per_unit": int(WORKERS_PER_UNIT),
++        "aspects_deg": aspects,
++        "angular_grid_sha256": stable_json_fingerprint(
++            aspects
++        ),
++    }
++
++    # Dearest-first. Sorted into a new list, never in place: `units` is the
++    # same object the manifest holds, and reordering it after the run
++    # fingerprint was taken would make the manifest on disk hash differently
++    # from what every attestation recorded.
++    solve_units = _paired_solve_units(units)
++    costs = _plan(solve_units, aspects)
++    ordered = sorted(
++        solve_units,
++        key=lambda u: (-costs.get(_pair_name(u), 1.0), _pair_name(u)),
++    )
++
++    # Unit concurrency stays sized on logical CPUs: four 1.5 GHz ogive units
++    # took 38-44 s at 4 units x 4 threads on 16 logical CPUs and 67-69 s at
++    # 2 x 4 on the 8 physical cores (September 2026 A/B), because concurrent
++    # units overlap each other's serial phases.  Each unit's CPU reservation
++    # below bounds its thread teams so units share the CPUs instead of each
++    # sizing itself to the whole host.
++    cores = hpc_scheduler.detect_cores()
++    budget_gb, memory_gb, available_gb = hpc_scheduler.local_memory_budget_gb(
++        float(MEMORY_HEADROOM)
++    )
++    by_threads = max(1, cores // max(1, int(WORKERS_PER_UNIT)))
++    worker_cap = by_threads if WORKERS is None else int(WORKERS)
++    pool_size = max(1, min(by_threads, worker_cap, len(ordered)))
++    # The planner prices decimal GB; the scheduler budgets GiB.
++    reservations_gib = {
++        _pair_name(unit): hpc_scheduler.decimal_gb_to_gib(
++            float(unit["resource_estimate"]["estimated_peak_gb"])
++        )
++        for unit in ordered
++    }
++    unit_cpus = {
++        name: hpc_scheduler.assembly_threads_for_unit(
++            cores, pool_size, budget_gb, peak_gib
++        )
++        for name, peak_gib in reservations_gib.items()
++    }
++    spill_dir = _spill_directory(
++        [unit["resource_estimate"] for unit in ordered]
++    )
++    spill_free_gib = hpc_scheduler.free_disk_gib(spill_dir)
++    spill_gib = {
++        _pair_name(unit): _spill_reservation_gib(
++            unit["resource_estimate"], spill_free_gib
++        )
++        for unit in ordered
++    }
++
++    print("=" * 70)
++    print("Local BoR monostatic RCS sweep")
++    print("=" * 70)
++    print(f"  Run dir       : {run_dir}")
++    print(f"  Geometries    : {len(geometries)}")
++    print(f"  Polarizations : {', '.join(pols)}")
++    print(f"  Frequencies   : {len(FREQUENCIES_GHZ)}  "
++          f"({min(FREQUENCIES_GHZ):g}-{max(FREQUENCIES_GHZ):g} GHz)")
++    print(f"  Radar grid    : {len(AZIMUTHS_DEG)} az x "
++          f"{len(ELEVATIONS_DEG)} el")
++    print(f"  Solver aspects: {len(aspects)} exact body-aspect RHS columns")
++    print(f"  Deliverables  : {len(geometries)} monostatic GRIM(s)")
++    print(f"  Physical solves: {len(ordered)}  (VV/HH co-solved)")
++    print(f"  Mesh check    : {'base + fine comparison' if MESH_CERTIFICATION else 'base only (no mesh comparison)'}")
++    cpu_counts = sorted(set(unit_cpus.values()))
++    cpu_label = (str(cpu_counts[0]) if len(cpu_counts) == 1
++                 else f"{cpu_counts[0]}-{cpu_counts[-1]}")
++    print(f"  Workers       : {pool_size} procs x {WORKERS_PER_UNIT} threads "
++          f"of {cores} cpus; {cpu_label} cpus reserved per solve  "
++          f"(BLAS threads/worker: {BLAS_THREADS_PER_WORKER})")
++    reservations = list(reservations_gib.values())
++    available_text = (f", {available_gb:.1f} GiB available"
++                      if available_gb is not None else "")
++    print(f"  Memory        : {memory_gb:.1f} GiB installed{available_text}, "
++          f"{budget_gb:.1f} GiB schedulable; per-solve reservations "
++          f"{min(reservations):.2f}-{max(reservations):.2f} GiB")
++    spill_total = sum(spill_gib.values())
++    if spill_total > 0.0:
++        free_text = (f"{spill_free_gib:.1f} GiB free"
++                     if spill_free_gib is not None else "free space unknown")
++        print(f"  Spill disk    : up to {max(spill_gib.values()):.1f} GiB per "
++              f"solve in {spill_dir} ({free_text}); concurrent spills are "
++              "admitted against that space")
++    print("=" * 70, flush=True)
++
++    # Parse each distinct geometry once, and import the solver, before the pool
++    # forks: workers then inherit both instead of repeating the work per unit.
++    for unit in ordered:
++        _load_snapshot(str(unit["geometry"]))
++    import ghost_backend.bor.dispatch as bor_dispatch
++    import ghost_backend.io.grim as grim_io
++
++    counters = {"written": 0, "skipped": 0, "failed": 0}
++    started = time.time()
++    total = len(ordered)
++
++    def _resources(unit):
++        name = _pair_name(unit)
++        return reservations_gib[name], unit_cpus[name], spill_gib[name]
++
++    def _prepare(unit):
++        name = _pair_name(unit)
++        return (
++            name,
++            reservations_gib[name],
++            (_solve_and_export_star,
++             ((unit, context, str(unit_dir), unit_cpus[name]),)),
++        )
++
++    def _finished():
++        return counters["written"] + counters["skipped"] + counters["failed"]
++
++    def _on_result(name, payload):
++        kind, first, _second = payload
++        if kind == "ok":
++            counters["skipped" if first == "skipped" else "written"] += 1
++            print(f"  [{_finished():4d}/{total}] {first:7s}  {name}", flush=True)
++        else:
++            counters["failed"] += 1
++            print(f"  [{_finished():4d}/{total}] FAILED   {name}", flush=True)
++            for line in str(first).rstrip().splitlines():
++                print(f"      {line}", flush=True)
++
++    def _on_error(name, exc):
++        counters["failed"] += 1
++        print(f"  [{_finished():4d}/{total}] FAILED (dispatch) {name}: {exc!r}",
++              flush=True)
++
++    dispatcher = None
++    try:
++        with _ExecutorPool(
++            processes=pool_size,
++            initializer=_pool_initializer,
++            initargs=(int(BLAS_THREADS_PER_WORKER),),
++            max_tasks_per_child=int(TASKS_PER_CHILD),
++        ) as pool:
++            dispatcher = hpc_scheduler.MemoryAwareDispatcher(
++                pool, budget_gb=budget_gb, max_concurrent=pool_size,
++                cpu_budget=cores,
++                disk_budget_gb=lambda: hpc_scheduler.free_disk_gib(spill_dir),
++            )
++            dispatcher.run(ordered, _prepare, _on_result, _on_error, _resources)
++    except BaseException as exc:
++        # Whatever stopped the sweep, the manifest must not claim it is
++        # still running; completed units stay valid for inspection.
++        manifest["status"] = (
++            "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
++        )
++        _write_json_atomic(manifest_path, manifest)
++        if isinstance(exc, hpc_scheduler.WorkerPoolFailure):
++            print(f"\n  STOPPED: {exc}", flush=True)
++            print(f"  wrote={counters['written']}, "
++                  f"skipped={counters['skipped']}, "
++                  f"failed={counters['failed']}, "
++                  f"not started={total - _finished()}.", flush=True)
++            raise SystemExit(1)
++        raise
++
++    elapsed = time.time() - started
++    rebuilt = dispatcher.pool_rebuilds if dispatcher is not None else 0
++    print(f"\n  Done. wrote={counters['written']}, "
++          f"skipped={counters['skipped']}, failed={counters['failed']}.  "
++          f"{elapsed:.1f} s elapsed."
++          + (f"  Worker pool rebuilt {rebuilt}x after crashes." if rebuilt else ""))
++    manifest["status"] = "failed" if counters["failed"] else "complete"
++    _write_json_atomic(manifest_path, manifest)
++    if counters["failed"]:
++        raise SystemExit(1)
++    from ghost_backend.hpc.common import (
++        bodies_from_units,
++        bor_solver_diagnostics_from_units,
++        read_unit_grims,
++    )
++    from ghost_backend.assembly.fields import (
++        bor_output_profile, bor_output_profile_metadata, save_monostatic_grim,
++    )
++
++    records = read_unit_grims(unit_dir)
++    for stem in sorted({str(unit["geometry_stem"]) for unit in units}):
++        matching = [unit for unit in units if unit["geometry_stem"] == stem]
++        solver_diagnostics = bor_solver_diagnostics_from_units(
++            records, stem=stem
++        )
++        snapshot, _material_base = _load_snapshot(str(matching[0]["geometry"]))
++        profile = bor_output_profile(snapshot, GEOMETRY_UNITS)
++        save_monostatic_grim(
++            bodies_from_units(records, stem=stem),
++            profile,
++            str(results_dir / f"{stem}.grim"),
++            azimuths_deg=AZIMUTHS_DEG,
++            elevations_deg=ELEVATIONS_DEG,
++            axis_az_deg=BODY_AXIS_AZ_DEG,
++            axis_el_deg=BODY_AXIS_EL_DEG,
++            roll_deg=BODY_ROLL_DEG,
++            history="run_local_bor.py monostatic response",
++            source_path=str(matching[0]["geometry"]),
++            solver_diagnostics=solver_diagnostics,
++            artifact_metadata={
++                **bor_output_profile_metadata(snapshot),
++                "geometry_input_sha256": str(
++                    matching[0].get("geometry_input_sha256", "")
++                ),
++                "solver_source_sha256": str(manifest["solver_source_sha256"]),
++                "runtime_environment_sha256": str(
++                    manifest["runtime_environment_sha256"]
++                ),
++                "run_solve_spec_sha256": manifest_solve_spec_fingerprint(manifest),
++            },
++        )
++    print(f"  Monostatic outputs: {results_dir}/")
++
++
++if __name__ == "__main__":
++    main()
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/run_local_monostatic.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/run_local_monostatic.py
+--- backup_before_fixes/ghost_backend/run_local_monostatic.py	2026-09-30 20:35:26.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/run_local_monostatic.py	2026-10-06 08:08:36.799179600 -0700
+@@ -107,8 +107,9 @@
+ _MEMORY_SAFETY = 1.35
+ _MAX_PANELS = 100_000
+ # Pool workers are replaced after this many units so allocator growth from a
+-# big solve cannot accumulate across a long sweep.
+-_TASKS_PER_CHILD = 4
++# big solve cannot accumulate across a long sweep (a respawn costs about half
++# a second of imports and cold hashing, 60 ms per unit at this interval).
++_TASKS_PER_CHILD = 8
+ _GEOMETRY_EXTS = (".geo",)
+ 
+ MANIFEST_SCHEMA = "ghost.local.2d-run.v3"
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/twod/adaptivity.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/adaptivity.py
+--- backup_before_fixes/ghost_backend/twod/adaptivity.py	2026-10-05 19:20:27.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/adaptivity.py	2026-10-06 08:38:24.180792500 -0700
+@@ -4,22 +4,22 @@
+ Acceptance uses every requested complex far field and the existing residual,
+ condition and mesh-convergence gates. Geometry and material values are unchanged.
+ """
+-import copy
+-import time
+-from functools import lru_cache
++import copy
++import time
++from functools import lru_cache
+ import numpy as np
+ from ghost_backend.execution.runtime import ScopedValue
+ from ghost_backend.execution.options import current_options, execution_scope, automatic_backend_requested
+ from ghost_backend.twod.basis import abscissae
+ 
+-_INDICATORS = ScopedValue('ghost_hp_indicators', None)
+-
+-
+-@lru_cache(maxsize=2)
+-def _legendre_transform(degree):
+-    result = np.linalg.inv(np.polynomial.legendre.legvander(2*abscissae(degree)-1, degree))
+-    result.flags.writeable = False
+-    return result
++_INDICATORS = ScopedValue('ghost_hp_indicators', None)
++
++
++@lru_cache(maxsize=2)
++def _legendre_transform(degree):
++    result = np.linalg.inv(np.polynomial.legendre.legvander(2*abscissae(degree)-1, degree))
++    result.flags.writeable = False
++    return result
+ 
+ 
+ class Indicators:
+@@ -33,16 +33,16 @@
+         # Coefficients in a shifted Legendre basis give a mesh-local smoothness
+         # indicator. Angle batches are discarded; only one scalar per primitive
+         # survives, including contributions from both sides of material interfaces.
+-        transform = _legendre_transform(degree)
++        transform = _legendre_transform(degree)
+         magnitude = np.max(abs(density), axis=0)
+         scale = np.maximum(magnitude, np.finfo(float).tiny)
+         for first in range(0, len(ids), 256):
+             last = min(first+256, len(ids))
+             local = density[ids[first:last]] / scale[None, None, :]
+             tail = np.einsum('a,ear->er', transform[-1], local)
+-            # Sum individual angle energies, not maxima of arbitrary batches.
+-            # This makes refinement independent of RAM-driven RHS batch sizes.
+-            scores = np.sum(abs(tail)**2, axis=1)
++            # Sum individual angle energies, not maxima of arbitrary batches.
++            # This makes refinement independent of RAM-driven RHS batch sizes.
++            scores = np.sum(abs(tail)**2, axis=1)
+             for element, score in zip(mesh.elements[first:last], scores):
+                 key = getattr(element, 'primitive_key', '')
+                 if key:
+@@ -75,6 +75,17 @@
+         indicators.observe(mesh, density)
+ 
+ 
++def _request_forecast_covering(forecast, degree, frequencies):
++    """The request forecast when it priced this candidate degree at every frequency of the step."""
++    if not forecast or forecast.get('requested') != 'adaptive':
++        return None
++    records = forecast.get('meshes') or []
++    wanted = {float(f) for f in frequencies}
++    priced = {float(r.get('frequency_ghz')) for r in records
++              if r.get('polynomial_degree') == degree and r.get('phase') in ('base', 'fine')}
++    return forecast if wanted and wanted <= priced else None
++
++
+ def run_certified(low_level_solver, geometry_snapshot, solver_kwargs,
+                   mesh_convergence_policy, progress_callback, shared_discretization_caches=None):
+     # Quadratic and cubic candidates share panels, so near-pair kernel moments
+@@ -89,7 +100,7 @@
+                    mesh_convergence_policy, progress_callback, shared_discretization_caches=None,
+                    initial_coarsening=None):
+     from ghost_backend.twod import solver as s
+-    from ghost_backend.twod.preparation import prepare_geometry, mesh_frequencies
++    from ghost_backend.twod.preparation import prepare_geometry, mesh_frequencies
+     from ghost_backend.twod.adaptive_geometry import (eligible_snapshot, HP_COARSENING,
+         initial_coarsening as choose_initial_coarsening)
+     from ghost_backend.execution.errors import BackendNumericalError
+@@ -97,8 +108,8 @@
+     options = current_options()
+     _, _, materials, scale = prepare_geometry(geometry_snapshot, solver_kwargs.get('material_base_dir'),
+                                          solver_kwargs.get('geometry_units', 'inches'))
+-    frequencies = (mesh_frequencies(solver_kwargs['frequencies_ghz']) if solver_kwargs.get('mesh_reference_ghz') is not None
+-                   else solver_kwargs['frequencies_ghz'])
++    frequencies = (mesh_frequencies(solver_kwargs['frequencies_ghz']) if solver_kwargs.get('mesh_reference_ghz') is not None
++                   else solver_kwargs['frequencies_ghz'])
+     forced_initial_coarsening = initial_coarsening is not None
+     initial_coarsening = (choose_initial_coarsening(geometry_snapshot) if initial_coarsening is None
+                           else float(initial_coarsening))
+@@ -149,9 +160,33 @@
+         selected_options = dict(options, mesh_strategy='local', basis_order=degree)
+         selection = None
+         if automatic_backend_requested():
+-            from ghost_backend.execution.selection import select_backend
+-            selection = select_backend(kwargs, selected_options, certified=False)
+-            admitted = [selection['selected']] + selection.get('retry_order', [])
++            from ghost_backend.execution.selection import (select_backend, current_batch_selection,
++                                                            current_request_selection)
++            prior = None
++            if len(steps) < 2 and not forced_initial_coarsening:
++                # The two initial candidates are exactly the meshes the request
++                # (or the batch planner) forecast and admitted moments ago:
++                # reuse that admission instead of rebuilding and re-pricing
++                # them here (two hidden forecasts per certified solve).
++                prior = current_batch_selection()
++                if prior is None:
++                    prior = _request_forecast_covering(current_request_selection(), degree,
++                                                       common['frequencies_ghz'])
++            if prior is not None:
++                selection = dict(prior, forecast_reused=True,
++                    reason='Reused the admitted request forecast of this candidate mesh.')
++                selection.pop('meshes', None)
++                if 'admission_budget_gib' not in selection:
++                    # A batch plan carries its candidates' peaks, not the live
++                    # admission figures a request forecast records; report them.
++                    with execution_scope(dict(selected_options, factorization='dense')):
++                        selection['admission_budget_gib'] = s._solve_memory_limit_gb()
++                    peak = (selection.get('candidates') or {}).get('dense', {}).get('peak_gb')
++                    if peak is not None and 'dense_peak_gib' not in selection:
++                        selection['dense_peak_gib'] = peak
++            else:
++                selection = select_backend(kwargs, selected_options, certified=False)
++            admitted = [selection['selected']] + list(selection.get('retry_order', []))
+             preferred = options['factorization']
+             if len(steps) < 2 and preferred in admitted:
+                 # Retain whole-request timing evidence and the scheduler's
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/twod/assembly/kernels.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/assembly/kernels.py
+--- backup_before_fixes/ghost_backend/twod/assembly/kernels.py	2026-09-30 22:23:03.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/assembly/kernels.py	2026-10-06 07:45:55.257616900 -0700
+@@ -412,22 +412,50 @@
+     state.tables[key] = table
+ 
+ 
++_TABLE_BUILDS = {}
++
++
+ def cached_table(state, key, build):
+     """A table from the CPU state's budgeted store, built on a miss (None if rejected).
+ 
+     Near-pair batches ask from assembly threads, so the store is locked; the
+-    build itself runs unlocked and a concurrent duplicate is discarded.
++    build itself runs unlocked.  The first thread to miss a key builds it and
++    the others wait for that build instead of each building a duplicate.
+     """
+     with _TABLE_LOCK:
+         if key in state.tables:
+             table = state.tables.pop(key)
+             state.tables[key] = table
+             return table
+-    table = build()
++        pending = _TABLE_BUILDS.get(key)
++        builder = pending is None
++        if builder:
++            pending = _TABLE_BUILDS[key] = threading.Event()
++    if not builder:
++        pending.wait()
++        with _TABLE_LOCK:
++            if key in state.tables:
++                return state.tables[key]
++        # The builder's table was rejected or belongs to another state.
++        table = build()
++        with _TABLE_LOCK:
++            if key in state.tables:
++                return state.tables[key]
++            _admit_table(state, key, table)
++        return table
++    try:
++        table = build()
++    except BaseException:
++        with _TABLE_LOCK:
++            _TABLE_BUILDS.pop(key, None)
++        pending.set()
++        raise
+     with _TABLE_LOCK:
+-        if key in state.tables:
+-            return state.tables[key]
+-        _admit_table(state, key, table)
++        if key not in state.tables:
++            _admit_table(state, key, table)
++        table = state.tables.get(key, table)
++        _TABLE_BUILDS.pop(key, None)
++    pending.set()
+     return table
+ 
+ 
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/twod/assembly/near_store.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/assembly/near_store.py
+--- backup_before_fixes/ghost_backend/twod/assembly/near_store.py	2026-09-30 22:14:58.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/assembly/near_store.py	2026-10-06 08:08:36.800179400 -0700
+@@ -1,85 +1,89 @@
+-"""Bounded near-block storage preserving the original output accumulation order."""
+-import shutil
+-import tempfile
+-import numpy as np
+-
+-NEAR_STORAGE_BYTES = 16 * 1024**2
+-NEAR_INTEGRATION_PAIRS = 2048
+-
+-
+-class NearStore:
+-    """Keep small near operators in RAM, otherwise use a private temporary file.
+-
+-    The near-pair geometry is indexed separately. Keeping coefficient records on
+-    disk allows each destination to consume all pairs in its original order,
+-    including reverse K' lookup for D, without retaining all complex blocks.
+-    Explicit reads (not mmap) keep the process's buffers bounded on both OSes.
+-    """
+-    def __init__(self, count, width, kinds, checkpoint=None, budget_bytes=None):
+-        self.count, self.width, self.kinds = int(count), int(width), tuple(kinds)
+-        self.checkpoint = checkpoint or (lambda: None)
+-        self.record_bytes = 16*self.width*self.width
+-        self.bytes = self.count*self.record_bytes*len(self.kinds)
+-        budget = NEAR_STORAGE_BYTES if budget_bytes is None else max(0, int(budget_bytes))
+-        self.file, self.arrays = None, {}
+-        if self.bytes <= budget:
+-            self.arrays = {kind: np.zeros((count, width, width), complex) for kind in self.kinds}
+-        else:
+-            from ghost_backend.execution.options import temporary_directory
+-            directory = temporary_directory()
+-            if shutil.disk_usage(directory).free < self.bytes + 64*1024**2:
+-                raise OSError('Insufficient temporary disk space for bounded near-operator storage.')
+-            self.file = tempfile.TemporaryFile(prefix='ghost-near-', suffix='.bin', dir=directory)
+-
+-    @property
+-    def memory_bytes(self):
+-        return sum(a.nbytes for a in self.arrays.values())
+-
+-    def __enter__(self):
+-        return self
+-
+-    def __exit__(self, *exc):
+-        self.close()
+-
+-    def close(self):
+-        if self.file is not None:
+-            self.file.close()
+-        self.arrays.clear()
+-
+-    def _offset(self, kind, start):
+-        return (self.kinds.index(kind)*self.count + int(start))*self.record_bytes
+-
+-    def write(self, kind, start, values):
+-        self.checkpoint()
+-        values = np.asarray(values, dtype=np.complex128)
+-        if values.ndim != 3 or values.shape[1:] != (self.width, self.width) or not 0 <= start <= self.count-len(values):
+-            raise ValueError('Near-block write does not match its storage.')
+-        if self.file is None:
+-            self.arrays[kind][start:start+len(values)] = values
+-        else:
+-            self.file.seek(self._offset(kind, start))
+-            self.file.write(memoryview(np.ascontiguousarray(values)).cast('B'))
+-
+-    def read(self, kind, positions):
+-        self.checkpoint()
+-        positions = np.asarray(positions, dtype=np.int64).reshape(-1)
+-        if np.any(positions < 0) or np.any(positions >= self.count):
+-            raise ValueError('Near-block index is out of bounds.')
+-        if self.file is None:
+-            return self.arrays[kind][positions]
+-        result = np.empty((len(positions), self.width, self.width), complex)
+-        # Sorted contiguous reads are important for reverse-pair queries. Return
+-        # in request order, including duplicates, without mapping the whole file.
+-        order = np.argsort(positions, kind='stable')
+-        sorted_positions = positions[order]
+-        breaks = np.r_[0, np.flatnonzero(np.diff(sorted_positions) != 1)+1, len(order)]
+-        for lo, hi in zip(breaks[:-1], breaks[1:]):
+-            if hi == lo:
+-                continue
+-            self.checkpoint()
+-            self.file.seek(self._offset(kind, sorted_positions[lo]))
+-            block = np.fromfile(self.file, dtype=np.complex128, count=(hi-lo)*self.width*self.width)
+-            if block.size != (hi-lo)*self.width*self.width:
+-                raise OSError('Near-operator temporary storage is incomplete.')
+-            result[order[lo:hi]] = block.reshape(hi-lo, self.width, self.width)
+-        return result
++"""Bounded near-block storage preserving the original output accumulation order."""
++import shutil
++import tempfile
++import numpy as np
++
++NEAR_STORAGE_BYTES = 16 * 1024**2
++NEAR_INTEGRATION_PAIRS = 2048
++
++
++class NearStore:
++    """Keep small near operators in RAM, otherwise use a private temporary file.
++
++    The near-pair geometry is indexed separately. Keeping coefficient records on
++    disk allows each destination to consume all pairs in its original order,
++    including reverse K' lookup for D, without retaining all complex blocks.
++    Explicit reads (not mmap) keep the process's buffers bounded on both OSes.
++    """
++    def __init__(self, count, width, kinds, checkpoint=None, budget_bytes=None):
++        self.count, self.width, self.kinds = int(count), int(width), tuple(kinds)
++        self.checkpoint = checkpoint or (lambda: None)
++        self.record_bytes = 16*self.width*self.width
++        self.bytes = self.count*self.record_bytes*len(self.kinds)
++        budget = NEAR_STORAGE_BYTES if budget_bytes is None else max(0, int(budget_bytes))
++        self.file, self.arrays = None, {}
++        if self.bytes <= budget:
++            self.arrays = {kind: np.zeros((count, width, width), complex) for kind in self.kinds}
++        else:
++            from ghost_backend.execution.options import temporary_directory
++            directory = temporary_directory()
++            if shutil.disk_usage(directory).free < self.bytes + 64*1024**2:
++                raise OSError('Insufficient temporary disk space for bounded near-operator storage.')
++            self.file = tempfile.TemporaryFile(prefix='ghost-near-', suffix='.bin', dir=directory)
++
++    @property
++    def memory_bytes(self):
++        return sum(a.nbytes for a in self.arrays.values())
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        self.close()
++
++    def close(self):
++        if self.file is not None:
++            self.file.close()
++        self.arrays.clear()
++
++    def _offset(self, kind, start):
++        return (self.kinds.index(kind)*self.count + int(start))*self.record_bytes
++
++    def write(self, kind, start, values):
++        self.checkpoint()
++        values = np.asarray(values, dtype=np.complex128)
++        if values.ndim != 3 or values.shape[1:] != (self.width, self.width) or not 0 <= start <= self.count-len(values):
++            raise ValueError('Near-block write does not match its storage.')
++        if self.file is None:
++            target = self.arrays[kind][start:start+len(values)]
++            if (values.__array_interface__['data'][0] == target.__array_interface__['data'][0]
++                    and values.strides == target.strides):
++                return  # the batch integrator already wrote this slice in place
++            target[...] = values
++        else:
++            self.file.seek(self._offset(kind, start))
++            self.file.write(memoryview(np.ascontiguousarray(values)).cast('B'))
++
++    def read(self, kind, positions):
++        self.checkpoint()
++        positions = np.asarray(positions, dtype=np.int64).reshape(-1)
++        if np.any(positions < 0) or np.any(positions >= self.count):
++            raise ValueError('Near-block index is out of bounds.')
++        if self.file is None:
++            return self.arrays[kind][positions]
++        result = np.empty((len(positions), self.width, self.width), complex)
++        # Sorted contiguous reads are important for reverse-pair queries. Return
++        # in request order, including duplicates, without mapping the whole file.
++        order = np.argsort(positions, kind='stable')
++        sorted_positions = positions[order]
++        breaks = np.r_[0, np.flatnonzero(np.diff(sorted_positions) != 1)+1, len(order)]
++        for lo, hi in zip(breaks[:-1], breaks[1:]):
++            if hi == lo:
++                continue
++            self.checkpoint()
++            self.file.seek(self._offset(kind, sorted_positions[lo]))
++            block = np.fromfile(self.file, dtype=np.complex128, count=(hi-lo)*self.width*self.width)
++            if block.size != (hi-lo)*self.width*self.width:
++                raise OSError('Near-operator temporary storage is incomplete.')
++            result[order[lo:hi]] = block.reshape(hi-lo, self.width, self.width)
++        return result
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/twod/operators.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/operators.py
+--- backup_before_fixes/ghost_backend/twod/operators.py	2026-10-05 19:16:07.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/operators.py	2026-10-06 08:08:36.796178800 -0700
+@@ -250,6 +250,12 @@
+     if not bool(compute_single_layer) and not bool(compute_double_layer):
+         raise ValueError("At least one batched near-pair operator is required.")
+ 
++    if width > 2:
++        # Polynomial pairs keep their kernel samples as monomial moments, so
++        # the cubic accuracy candidate of a certified solve reuses the
++        # quadratic candidate's samples (the same panels and wavenumber).
++        return _box_blocks_polynomial(elements, obs_ids, src_ids, k0, obs_normal_deriv, order,
++                                      bool(compute_single_layer), bool(compute_double_layer))
+     qt, qw = _get_quadrature(max(2, int(order)))
+     q = np.asarray(qt, dtype=float)
+     weights = np.asarray(qw, dtype=float)
+@@ -319,6 +325,93 @@
+     )[:, None, None]
+     return s_blocks * scales, k_blocks * scales
+ 
++def _box_monomial_moments(obs_elems, src_elems, k0, obs_normal_deriv, order, want_s, want_k):
++    """Scaled monomial S and K moments, shape (T, 2, D+1, D+1), of full-interval
++    pairs by the tensor-Gauss rule of ``order`` points per axis (the same
++    kernels as the nodal box rule; D = polynomial_quadrature._MOMENT_DEGREE)."""
++    from ghost_backend.twod.polynomial_quadrature import _kernels, _table_for_ends, _MOMENT_DEGREE
++    count = len(obs_elems)
++    moments = np.zeros((count, 2, _MOMENT_DEGREE + 1, _MOMENT_DEGREE + 1), dtype=np.complex128)
++    if not count:
++        return moments
++    qt, qw = _get_quadrature(max(2, int(order)))
++    q = np.asarray(qt, dtype=float)
++    weights = np.asarray(qw, dtype=float)
++    monomials = np.vander(q, _MOMENT_DEGREE + 1, increasing=True)
++    obs_p0 = np.asarray([elem.p0 for elem in obs_elems], dtype=float)
++    src_p0 = np.asarray([elem.p0 for elem in src_elems], dtype=float)
++    obs_seg = np.asarray([elem.p1 - elem.p0 for elem in obs_elems], dtype=float)
++    src_seg = np.asarray([elem.p1 - elem.p0 for elem in src_elems], dtype=float)
++    obs_pts = obs_p0[:, None, :] + q[None, :, None] * obs_seg[:, None, :]
++    src_pts = src_p0[:, None, :] + q[None, :, None] * src_seg[:, None, :]
++    diff = obs_pts[:, :, None, :] - src_pts[:, None, :, :]
++    dist = np.sqrt(np.sum(diff * diff, axis=3))
++    dist_safe = np.maximum(dist, EPS)
++    kr = np.asarray(complex(k0) * dist_safe, dtype=np.complex128)
++    tiny = np.abs(kr) <= 1e-12
++    w_outer = np.outer(weights, weights)
++    green = derivative = None
++    if not np.any(tiny):
++        table = _table_for_ends(k0, obs_p0, obs_p0 + obs_seg, src_p0, src_p0 + src_seg)
++        green, derivative = _kernels(k0, dist_safe, bool(want_k), table)
++    else:
++        kr[tiny] = 1e-12 + 0.0j
++    if want_s:
++        if green is None:
++            green = 0.25j * _hankel2_0_array(kr.reshape(-1)).reshape(dist.shape)
++        moments[:, 0] = monomials.T @ (w_outer[None, :, :] * green) @ monomials
++    if want_k:
++        if derivative is None:
++            derivative = (0.25j * complex(k0)) * _hankel2_1_array(kr.reshape(-1)).reshape(dist.shape)
++        normals = np.asarray([elem.normal for elem in (obs_elems if obs_normal_deriv else src_elems)], dtype=float)
++        proj = np.sum(diff * normals[:, None, None, :], axis=3) / dist_safe
++        dk_vals = (-derivative if obs_normal_deriv else derivative) * proj
++        dk_vals[dist <= EPS] = 0.0
++        moments[:, 1] = monomials.T @ (w_outer[None, :, :] * dk_vals) @ monomials
++    scales = np.asarray([obs.length * src.length for obs, src in zip(obs_elems, src_elems)], dtype=float)
++    moments *= scales[:, None, None, None]
++    return moments
++
++
++def _box_blocks_polynomial(elements, obs_ids, src_ids, k0, obs_normal_deriv, order, want_s, want_k):
++    """Nodal S and K blocks of polynomial fixed-order pairs through their monomial moments.
++
++    The moments depend on the pair geometry, the wavenumber and the rule, not
++    on the polynomial degree; within a certified request's moment-cache scope
++    they are stored, so the cubic candidate projects the quadratic candidate's
++    samples instead of integrating them again (the nodal projection is the
++    same linear map as the direct nodal rule, to rounding).
++    """
++    from ghost_backend.twod.polynomial_quadrature import _MOMENT_CACHE, box_moment_keys
++    from ghost_backend.twod.basis import coefficients
++    obs_elems = [elements[int(index)] for index in obs_ids]
++    src_elems = [elements[int(index)] for index in src_ids]
++    npairs = len(obs_elems)
++    width = len(elements[0].node_ids)
++    degree = width - 1
++    cache = _MOMENT_CACHE.get()
++    if cache is None:
++        moments = _box_monomial_moments(obs_elems, src_elems, k0, obs_normal_deriv, order, want_s, want_k)
++    else:
++        keys = box_moment_keys(k0, obs_normal_deriv, order, want_s, want_k, obs_elems, src_elems)
++        found = [cache.get(key) for key in keys]
++        todo = [index for index, value in enumerate(found) if value is None]
++        if todo:
++            fresh = _box_monomial_moments([obs_elems[i] for i in todo], [src_elems[i] for i in todo],
++                                          k0, obs_normal_deriv, order, want_s, want_k)
++            for position, value in zip(todo, fresh):
++                found[position] = value
++                cache.put(keys[position], value)
++        moments = (np.stack(found) if npairs else
++                   np.zeros((0, 2, degree + 1, degree + 1), dtype=np.complex128))
++    co = coefficients(degree)
++    block = moments[:, :, :degree + 1, :degree + 1]
++    zero = np.zeros((npairs, width, width), dtype=np.complex128)
++    s_blocks = np.einsum('ia,tij,jb->tab', co, block[:, 0], co) if want_s else zero.copy()
++    k_blocks = np.einsum('ia,tij,jb->tab', co, block[:, 1], co) if want_k else zero.copy()
++    return s_blocks, k_blocks
++
++
+ def _single_layer_self_block_exact(
+     elem: 'LinearElement',
+     k0: 'Union[complex, float]',
+@@ -1249,6 +1342,24 @@
+ _FAR_QUAD_ORDER = _env_positive_int("GHOST_FAR_QUAD_ORDER", 0)
+ 
+ 
++def _env_float(name: 'str', default: 'float') -> 'float':
++    try:
++        value = float(str(os.environ.get(name, "")).strip())
++    except (TypeError, ValueError):
++        return default
++    return value if math.isfinite(value) else default
++
++
++# Far pairs of an attenuating medium whose kernels are negligible are skipped:
++# with lower a lower bound of the point-pair distance (centre distance less
++# half of each length), |i H0(kr)/4| <= exp(-a)/sqrt(8 pi a) for a = -Im(k)
++# lower > 1 (DLMF 10.27.8, 10.32.9), below 1e-18 of the near-diagonal kernel
++# scale at the cut of 40 (the compressed backend applies the same bound at 32
++# and accounts the dropped routes in its error evidence).  The near/far
++# classification and the graded orders are unchanged.  0 disables the cut.
++FAR_ATTENUATION_CUT = _env_float("GHOST_FAR_ATTENUATION_CUT", 40.0)
++
++
+ _ASSEMBLY_COMPACT_BELOW = 0.5
+ 
+ 
+@@ -2196,6 +2307,8 @@
+ 
+     abs_k = abs(complex(k0))
+     attenuating = -complex(k0).imag > complex(k0).real
++    attenuation_rate = (-complex(k0).imag if FAR_ATTENUATION_CUT > 1.0 and complex(k0).imag < 0.0
++                        and complex(k0).real > 0.0 else 0.0)
+     w_far_floor = _graded_w_far_floor(k0, lengths, far_ratio, width-1) if want_w else 16
+ 
+     n_acc = width**2 * (int(want_s) + (2 if want_k else 0))
+@@ -2253,6 +2366,13 @@
+             obs_slice[:, None] != src_global[None, :],
+             out=far_sym,
+         )
++        # Far pairs whose kernels are negligible (FAR_ATTENUATION_CUT) are
++        # neither evaluated nor scattered; they stay far for the near
++        # classification and for the graded order below.
++        far_eval = far_sym
++        if attenuation_rate > 0.0:
++            lower = centre_dist - 0.5 * (obs_len[:, None] + src_len[None, :])
++            far_eval = far_sym & (attenuation_rate * lower < FAR_ATTENUATION_CUT)
+ 
+ 
+         far_ij = {}
+@@ -2266,14 +2386,14 @@
+             src_msk = mask[src_global]
+             pairs_ij = src_msk[None, :] & obs_masks[mi][obs_slice][:, None]
+             eligible_ij |= pairs_ij
+-            fij = far_sym & pairs_ij
++            fij = far_eval & pairs_ij
+             far_ij[mi] = fij
+             any_ij = any_ij or bool(fij.any())
+             if mirrored:
+                 obs_msk = mask[obs_slice]
+                 pairs_ji = obs_msk[:, None] & obs_masks[mi][src_global][None, :]
+                 eligible_ji |= pairs_ji
+-                fji = far_sym & pairs_ji
++                fji = far_eval & pairs_ji
+                 far_ji[mi] = fji
+                 any_ji = any_ji or bool(fji.any())
+ 
+@@ -2297,6 +2417,8 @@
+         ratio_min = float(np.min(
+             np.where(any_far, centre_dist / scale, np.inf)
+         )) if any_far.any() else float("inf")
++        if far_eval is not far_sym:
++            any_far = far_eval & (eligible_ij | eligible_ji)
+         kl_max = abs_k * float(max(obs_len.max(), src_len.max()))
+         rule_floor = max(int(minimum_far_order), width + 2 if width > 2 else 2)
+         tile_obs_order = max(rule_floor,
+diff -ru '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=tests' '--exclude=validation' '--exclude=geometry' '--exclude=ui' '--exclude=data_tools' backup_before_fixes/ghost_backend/twod/polynomial_quadrature.py C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/polynomial_quadrature.py
+--- backup_before_fixes/ghost_backend/twod/polynomial_quadrature.py	2026-10-05 18:18:55.000000000 -0700
++++ C:/Users/14col/Documents/20261005_GRIM_claude/tools/GHOST/ghost_backend/twod/polynomial_quadrature.py	2026-10-06 08:38:05.973294900 -0700
+@@ -176,6 +176,8 @@
+ from ghost_backend.execution.runtime import ScopedValue
+ 
+ _MOMENT_DEGREE = 3
++# Rows per moment GEMM (see _monomial_moments).
++_MOMENT_GEMM_ROWS = 64
+ # About 200 bytes of working storage per sample. Concurrent chunks stay within
+ # the near-batch workspace that dense resource forecasts already reserve.
+ _CHUNK_SAMPLES = 1 << 17
+@@ -255,6 +257,11 @@
+     Consumers can copy each result into its final destination immediately;
+     completed results do not accumulate until every job has finished. Queued
+     jobs are cancelled on failure, cancellation, or explicit iterator close.
++
++    Every job runs in a copy of the caller's context: the scoped values of the
++    solve (the CPU kernel-table store, the moment cache, the execution
++    options) are visible on the worker threads, so a near-pair batch finds the
++    solve's kernel table instead of rebuilding one per thread and domain.
+     """
+     if workers <= 1 or len(jobs) <= 1:
+         for job in jobs:
+@@ -266,14 +273,20 @@
+             yield result
+             result = None
+         return
++    import contextvars
+     from collections import deque
+     from concurrent.futures import ThreadPoolExecutor
++    context = contextvars.copy_context()
++
++    def run(job):
++        return context.copy().run(function, job)
++
+     pool = ThreadPoolExecutor(max_workers=workers)
+     try:
+         pending = deque()
+         submitted = 0
+         while submitted < len(jobs) and len(pending) < 2 * workers:
+-            pending.append(pool.submit(function, jobs[submitted]))
++            pending.append(pool.submit(run, jobs[submitted]))
+             submitted += 1
+         while pending:
+             result = pending.popleft().result()
+@@ -282,7 +295,7 @@
+             yield result
+             result = None
+             if submitted < len(jobs):
+-                pending.append(pool.submit(function, jobs[submitted]))
++                pending.append(pool.submit(run, jobs[submitted]))
+                 submitted += 1
+     finally:
+         pool.shutdown(wait=True, cancel_futures=True)
+@@ -354,6 +367,23 @@
+                     (head, obs.p0, obs.p1, obs.normal, src.p0, src.p1, src.normal))
+ 
+ 
++def box_moment_keys(k, obs_derivative, order, want_s, want_k, obs_elems, src_elems):
++    """Moment-cache keys of fixed-order (tensor-Gauss) pairs: wavenumber, rule, channels and geometry.
++
++    The byte layout differs from ``_moment_key`` (the polynomial Duffy rules),
++    so the two families never share an entry."""
++    k = complex(k)
++    rows = np.empty((len(obs_elems), 18), dtype=float)
++    rows[:, 0:6] = (k.real, k.imag, float(bool(obs_derivative)), float(order), float(bool(want_s)), float(bool(want_k)))
++    rows[:, 6:8] = [e.p0 for e in obs_elems]
++    rows[:, 8:10] = [e.p1 for e in obs_elems]
++    rows[:, 10:12] = [e.normal for e in obs_elems]
++    rows[:, 12:14] = [e.p0 for e in src_elems]
++    rows[:, 14:16] = [e.p1 for e in src_elems]
++    rows[:, 16:18] = [e.normal for e in src_elems]
++    return [b'box' + row.tobytes() for row in rows]
++
++
+ def _build_kernel_table(k_real, k_imag, upper):
+     from ghost_backend.twod.assembly.kernels import KernelTable, Rejected
+     try:
+@@ -403,9 +433,24 @@
+     k = complex(k)
+     if not (k.imag < 0 < k.real) or not pairs:
+         return None
+-    ends = [(np.asarray(o.p0), np.asarray(o.p1), np.asarray(s.p0), np.asarray(s.p1)) for o, s in pairs]
+-    reach = max(max(np.linalg.norm(a - b) for a in (op0, op1) for b in (sp0, sp1))
+-                for op0, op1, sp0, sp1 in ends)
++    return _table_for_ends(k, np.array([o.p0 for o, _ in pairs], float), np.array([o.p1 for o, _ in pairs], float),
++                           np.array([s.p0 for _, s in pairs], float), np.array([s.p1 for _, s in pairs], float))
++
++
++def _table_for_ends(k, obs_p0, obs_p1, src_p0, src_p1):
++    """The near table of a lossy wavenumber reaching every endpoint pair of these elements.
++
++    The reach is the largest endpoint-to-endpoint distance over the four
++    endpoint combinations, taken as arrays (the per-pair loop of four norms
++    was the one interpreter-bound stretch of a batch)."""
++    k = complex(k)
++    if not (k.imag < 0 < k.real) or not len(obs_p0):
++        return None
++    reach = 0.
++    for a in (obs_p0, obs_p1):
++        for b in (src_p0, src_p1):
++            difference = a - b
++            reach = max(reach, float(np.max(np.sqrt(difference[:, 0] ** 2 + difference[:, 1] ** 2))))
+     if not np.isfinite(reach) or reach <= 0:
+         return None
+     # Power-of-two domains let later calls at this wavenumber reuse the table.
+@@ -477,6 +522,7 @@
+         y = y0 if shared[1] else 1 - y0
+     else:
+         x, y = x0, y0
++    base_x, base_y = x, y
+     x = oa + (ob - oa) * x[None, :]
+     y = sa + (sb - sa) * y[None, :]
+     if kind == 'regular':
+@@ -498,19 +544,14 @@
+             np.negative(derivative, out=derivative)
+         kernels.append(weight[None, :] * (derivative * projection / distance))
+     moments = np.zeros((count, 2, _MOMENT_DEGREE + 1, _MOMENT_DEGREE + 1), complex)
+-    x = np.ascontiguousarray(np.broadcast_to(x, distance.shape))
+-    y = np.ascontiguousarray(np.broadcast_to(y, distance.shape))
+-    for channel, kernel in enumerate(kernels):
+-        by_source = kernel
+-        for b in range(_MOMENT_DEGREE + 1):
+-            term = by_source.copy()
+-            for a in range(_MOMENT_DEGREE + 1):
+-                # Contiguous row reductions sum each pair independently.
+-                moments[:, channel, a, b] = np.add.reduce(term, axis=1)
+-                if a < _MOMENT_DEGREE:
+-                    np.multiply(term, x, out=term)
+-            if b < _MOMENT_DEGREE:
+-                by_source = by_source * y
++    x = y = None
++    # Every task of a chunk shares its quadrature nodes up to the affine maps
++    # x = oa + (ob - oa) base_x and y = sa + (sb - sa) base_y, so the moments
++    # are one matrix product against the base-node monomials followed by a
++    # per-task binomial change of variable (the identity on unit intervals).
++    moments[:, :len(kernels)] = _monomial_moments(kernels, base_x, base_y, oa[:, 0], (ob - oa)[:, 0],
++                                                  sa[:, 0], (sb - sa)[:, 0])
++    kernels = None
+     if np.any(exact):
+         moments[exact, 0] += _log_monomials() / (2 * np.pi)
+     scale = (np.array([e.length for e in obs]) * np.array([e.length for e in src])
+@@ -521,6 +562,65 @@
+     return moments
+ 
+ 
++@lru_cache(maxsize=1)
++def _binomial_table():
++    from math import comb
++    degree = _MOMENT_DEGREE
++    result = np.array([[float(comb(a, i)) if i <= a else 0. for i in range(degree + 1)]
++                       for a in range(degree + 1)])
++    result.flags.writeable = False
++    return result
++
++
++def _binomial_transform(offset, scale):
++    """``B[t, a, i] = C(a, i) offset_t**(a-i) scale_t**i``, so ``(offset + scale u)**a = sum_i B[t, a, i] u**i``."""
++    degree = _MOMENT_DEGREE
++    binomial = _binomial_table()
++    offsets = np.vander(np.asarray(offset, float), degree + 1, increasing=True)
++    scales = np.vander(np.asarray(scale, float), degree + 1, increasing=True)
++    result = np.zeros((len(offsets), degree + 1, degree + 1))
++    for a in range(degree + 1):
++        for i in range(a + 1):
++            result[:, a, i] = binomial[a, i] * offsets[:, a - i] * scales[:, i]
++    return result
++
++
++def _monomial_moments(kernels, base_x, base_y, x_offset, x_scale, y_offset, y_scale):
++    """``sum_q kernel[t, q] x[t, q]**a y[t, q]**b`` for ``a, b <= _MOMENT_DEGREE``, shape (T, C, D+1, D+1).
++
++    ``x[t, q] = x_offset[t] + x_scale[t] base_x[q]`` (likewise y), so the
++    moments of the base nodes are one GEMM of the (T, q) kernels against the
++    (q, 16) base monomials, followed by the binomial change of variable of each
++    task.  Row ``t`` of the product depends on that task's kernels alone, so a
++    moment is independent of the chunk's composition and of the thread count.
++    """
++    degree = _MOMENT_DEGREE
++    monomials_x = np.vander(np.asarray(base_x, float), degree + 1, increasing=True)
++    monomials_y = np.vander(np.asarray(base_y, float), degree + 1, increasing=True)
++    monomials = (monomials_x[:, :, None] * monomials_y[:, None, :]).reshape(len(monomials_x), -1).astype(complex)
++    stacked = np.stack(kernels)                                   # (C, T, q)
++    channels, count, samples = stacked.shape
++    # Every product has the same shape (_MOMENT_GEMM_ROWS x q by q x 16; the
++    # last block zero-padded), so the BLAS kernel and its summation order are
++    # the same for every task whatever the chunk holds: a moment depends on
++    # its task alone, as the former row-wise reductions did.
++    base = np.empty((channels, count, monomials.shape[1]), dtype=np.complex128)
++    block = np.zeros((channels, _MOMENT_GEMM_ROWS, samples), dtype=np.complex128)
++    for start in range(0, count, _MOMENT_GEMM_ROWS):
++        rows = min(_MOMENT_GEMM_ROWS, count - start)
++        block[:, :rows] = stacked[:, start:start + rows]
++        if rows < _MOMENT_GEMM_ROWS:
++            block[:, rows:] = 0.0
++        base[:, start:start + rows] = (block @ monomials)[:, :rows]
++    base = np.ascontiguousarray(base.reshape(channels, count, degree + 1, degree + 1).transpose(1, 0, 2, 3))
++    unit = (x_offset == 0.) & (x_scale == 1.) & (y_offset == 0.) & (y_scale == 1.)
++    if np.all(unit):
++        return base
++    transform_x = _binomial_transform(x_offset, x_scale)
++    transform_y = _binomial_transform(y_offset, y_scale)
++    return np.einsum('tai,tcij,tbj->tcab', transform_x, base, transform_y)
++
++
+ def _moments(tasks, pairs, k, obs_derivative, order, cache, threads, checkpoint, table=None):
+     result = [None] * len(tasks)
+     groups = {}

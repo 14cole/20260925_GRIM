@@ -55,7 +55,11 @@ class NearStore:
         if values.ndim != 3 or values.shape[1:] != (self.width, self.width) or not 0 <= start <= self.count-len(values):
             raise ValueError('Near-block write does not match its storage.')
         if self.file is None:
-            self.arrays[kind][start:start+len(values)] = values
+            target = self.arrays[kind][start:start+len(values)]
+            if (values.__array_interface__['data'][0] == target.__array_interface__['data'][0]
+                    and values.strides == target.strides):
+                return  # the batch integrator already wrote this slice in place
+            target[...] = values
         else:
             self.file.seek(self._offset(kind, start))
             self.file.write(memoryview(np.ascontiguousarray(values)).cast('B'))

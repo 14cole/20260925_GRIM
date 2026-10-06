@@ -138,7 +138,8 @@ class CompressedReviewTests(unittest.TestCase):
     def test_lost_persistent_worker_closes_and_next_assembly_recreates_pool(self):
         from test_tile_processes import paired_operators, CrashingPairedOracle
         from ghost_backend.compressed.regional_coefficients import PairedOracle
-        with preparation_scope(), tempfile.TemporaryDirectory() as directory:
+        with preparation_scope(), tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {'GHOST_COMPRESSED_RECIPROCAL': 'off'}):
             recovered, _ = paired_operators(CrashingPairedOracle, 2,
                                             str(Path(directory)/'crash-once'))
             broken = run_resources()['compressed_tile_workers']

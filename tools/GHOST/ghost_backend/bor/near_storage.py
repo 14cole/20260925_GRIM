@@ -7,6 +7,40 @@ involved. Apply the parity before the PMCHWT row rotation.
 import numpy as np
 
 
+class ModalBands:
+    """Append checked modal coefficients without copying already solved modes.
+
+    Production reads select one mode. Full-array conversion is provided for
+    diagnostics only; it is deliberately absent from modal assembly.
+    """
+    def __init__(self, previous, following):
+        self.bands = list(previous.bands) if isinstance(previous, ModalBands) else [previous]
+        self.bands.append(following)
+        self.ends = np.cumsum([value.shape[1] for value in self.bands])
+        self.shape = (following.shape[0], int(self.ends[-1])) + following.shape[2:]
+        self.dtype = following.dtype
+
+    @property
+    def nbytes(self):
+        return sum(value.nbytes for value in self.bands) + self.ends.nbytes
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple) and len(key) >= 2 and np.isscalar(key[1]):
+            mode = int(key[1])
+            if mode < 0:
+                mode += self.shape[1]
+            if not 0 <= mode < self.shape[1]:
+                raise IndexError('Modal coefficient index is outside its prepared bands.')
+            index = int(np.searchsorted(self.ends, mode, side='right'))
+            start = 0 if index == 0 else int(self.ends[index-1])
+            return self.bands[index][(key[0], mode-start) + key[2:]]
+        return np.asarray(self)[key]
+
+    def __array__(self, dtype=None, copy=None):
+        value = np.concatenate(self.bands, axis=1)
+        return value if dtype is None else value.astype(dtype, copy=False)
+
+
 def mode_sign(component, mode):
     return -1 if mode < 0 and component in (1, 2) else 1
 

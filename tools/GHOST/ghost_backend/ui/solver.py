@@ -479,6 +479,17 @@ class _SolveWorker(QObject):
         if self.scattering_mode == "bistatic":
             raise ValueError("Bistatic sweeps are not supported by the BoR "
                              "solver yet; use Monostatic.")
+        kwargs = self._bor_arguments()
+        solve = (solve_monostatic_rcs_bor_certified if self.mesh_certification
+                 else solve_monostatic_rcs_bor_survey)
+        if self.checkpoint_directory:
+            from ghost_backend.bor.checkpoints import run_checkpointed
+            return run_checkpointed(solve, kwargs, self.checkpoint_directory,
+                                    self.bor_options, self.mesh_certification)
+        return solve(**kwargs)
+
+    def _bor_arguments(self):
+        """One request definition for checkpoint probing and actual execution."""
         kwargs = dict(
             geometry_snapshot=self.snapshot,
             frequencies_ghz=self.frequencies,
@@ -492,13 +503,7 @@ class _SolveWorker(QObject):
         )
         if self.mesh_certification:
             kwargs['mesh_convergence_policy'] = self.mesh_policy
-        solve = (solve_monostatic_rcs_bor_certified if self.mesh_certification
-                 else solve_monostatic_rcs_bor_survey)
-        if self.checkpoint_directory:
-            from ghost_backend.bor.checkpoints import run_checkpointed
-            return run_checkpointed(solve, kwargs, self.checkpoint_directory,
-                                    self.bor_options, self.mesh_certification)
-        return solve(**kwargs)
+        return kwargs
 
     def _run_2d(self, snapshot, progress_callback):
         from ghost_backend.linalg.refined_lu import linear_precision
@@ -546,6 +551,16 @@ class _SolveWorker(QObject):
             if self.mesh_certification
             else solve_monostatic_rcs_2d_survey
         )
+        monostatic_kwargs = self._monostatic_2d_arguments(snapshot, progress_callback)
+        if self.checkpoint_directory:
+            from ghost_backend.twod.checkpoints import run_checkpointed
+            return run_checkpointed(solve_monostatic, monostatic_kwargs, self.checkpoint_directory,
+                self.execution_options, self.lu_precision, self.mesh_certification,
+                frequency_workers='auto')
+        return solve_monostatic(**monostatic_kwargs)
+
+    def _monostatic_2d_arguments(self, snapshot, progress_callback):
+        """Keep preflight checkpoint identities identical to the solver request."""
         monostatic_kwargs = dict(
             max_panels=_2d_panel_limit(),
             solver_method=self.solver_method,
@@ -559,13 +574,20 @@ class _SolveWorker(QObject):
             abort_event=self.abort_event,
         )
         if self.mesh_certification:
-            monostatic_kwargs["mesh_convergence_policy"] = mesh_policy
-        if self.checkpoint_directory:
-            from ghost_backend.twod.checkpoints import run_checkpointed
-            return run_checkpointed(solve_monostatic, monostatic_kwargs, self.checkpoint_directory,
-                self.execution_options, self.lu_precision, self.mesh_certification,
-                frequency_workers='auto')
-        return solve_monostatic(**monostatic_kwargs)
+            monostatic_kwargs["mesh_convergence_policy"] = self.mesh_policy
+        return monostatic_kwargs
+
+    def _forecast_frequencies(self, checkpoint):
+        if self.preflight_only or not self.checkpoint_directory or self.scattering_mode != 'monostatic':
+            return None
+        from ghost_backend.twod.checkpoints import missing_frequencies
+        if self.solver_kind == 'bor':
+            arguments, options, precision = self._bor_arguments(), self.bor_options, 'double'
+        else:
+            arguments = self._monostatic_2d_arguments(self.snapshot, self._on_progress)
+            options, precision = self.execution_options, self.lu_precision
+        return missing_frequencies(arguments, self.checkpoint_directory, options, precision,
+            self.mesh_certification, solver_kind=self.solver_kind, checkpoint=checkpoint)
 
     @Slot()
     def run(self):
@@ -593,7 +615,8 @@ class _SolveWorker(QObject):
                 def checkpoint():
                     if self.abort_event is not None and self.abort_event.is_set():
                         raise InterruptedError('Setup check canceled.')
-                summary = RunSetupMixin._run_setup_summary(None, self.snapshot, self.base_dir, self.preflight_setup, checkpoint)
+                summary = RunSetupMixin._run_setup_summary(None, self.snapshot, self.base_dir,
+                    self.preflight_setup, checkpoint, self._forecast_frequencies(checkpoint))
                 if self.abort_event is not None and self.abort_event.is_set():
                     raise InterruptedError('Setup check canceled.')
                 self.setup_checked.emit(summary)

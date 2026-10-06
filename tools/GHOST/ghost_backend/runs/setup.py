@@ -38,6 +38,28 @@ def geometry_dimensions(snapshot, units):
     return f'X span {width/.0254:g} in \u00d7 Y span {height/.0254:g} in'
 
 
+def validate_material_coverage(snapshot, library, frequencies, checkpoint=None):
+    """Validate every requested frequency without rebuilding invariant flag sets."""
+    from ghost_backend.twod.formulations.thin_layer import ThinLayerDefinition, validate_thin_layer
+    used_ibcs = {int(seg['properties'][2]) for seg in snapshot['segments']
+                 if int(seg['properties'][2]) > 0}
+    used_media = {int(seg['properties'][i]) for seg in snapshot['segments']
+                  for i in (3, 4) if int(seg['properties'][i]) > 0}
+    for freq in frequencies:
+        if checkpoint is not None:
+            checkpoint()
+        for flag in used_ibcs:
+            model = library.impedance_models[flag]
+            if isinstance(model, ThinLayerDefinition):
+                eps, mu = library.get_medium(model.dielectric_flag, freq)
+                validate_thin_layer(eps, mu, model.thickness_m, 2*math.pi*freq*1e9/299792458.)
+            else:
+                library.get_impedance(flag, freq, arc_s=0.)
+                library.get_impedance(flag, freq, arc_s=1.)
+        for flag in used_media:
+            library.get_medium(flag, freq)
+
+
 class RunSetupMixin:
     def _build_run_setup_controls(self, form):
         try:
@@ -86,33 +108,20 @@ class RunSetupMixin:
         except Exception as exc:
             self.lbl_run_dimensions.setText(str(exc))
 
-    def _run_setup_summary(self, snapshot, base_dir, value, checkpoint=None):
+    def _run_setup_summary(self, snapshot, base_dir, value, checkpoint=None,
+                           forecast_frequencies=None):
         if value['schema'] == 'grim.bor-run-setup':
             from ghost_backend.runs.bor_setup import resource_summary
-            return resource_summary(snapshot, base_dir, value, checkpoint)
+            return resource_summary(snapshot, base_dir, value, checkpoint, forecast_frequencies)
         from ghost_backend.twod.preparation import prepare_geometry
         _, result, library, _ = prepare_geometry(snapshot, base_dir, value['units'])
-        for freq in value['frequencies_ghz']:
-            if checkpoint is not None:
-                checkpoint()
-            from ghost_backend.twod.formulations.thin_layer import (
-                ThinLayerDefinition,
-                validate_thin_layer,
-            )
-            used_ibcs={int(seg['properties'][2]) for seg in snapshot['segments'] if int(seg['properties'][2])>0}
-            used_media={int(seg['properties'][i]) for seg in snapshot['segments'] for i in (3,4) if int(seg['properties'][i])>0}
-            for flag in used_ibcs:
-                model=library.impedance_models[flag]
-                if isinstance(model,ThinLayerDefinition):
-                    eps,mu=library.get_medium(model.dielectric_flag,freq)
-                    validate_thin_layer(eps,mu,model.thickness_m,2*math.pi*freq*1e9/299792458.)
-                else:
-                    library.get_impedance(flag, freq, arc_s=0.)
-                    library.get_impedance(flag, freq, arc_s=1.)
-            for flag in used_media:
-                library.get_medium(flag, freq)
+        validate_material_coverage(snapshot, library, value['frequencies_ghz'], checkpoint)
+        forecast_frequencies = (value['frequencies_ghz'] if forecast_frequencies is None
+                                else list(forecast_frequencies))
         selection_note = ''
-        if value['execution_options']['factorization'] == 'adaptive':
+        if not forecast_frequencies:
+            selection_note = 'Matching checkpoints found for every frequency; no new solve forecast needed.\n'
+        elif value['execution_options']['factorization'] == 'adaptive':
             from ghost_backend.execution.selection import select_backend
             from ghost_backend.runs.quality import accuracy_target_policy
             arguments = dict(geometry_snapshot=snapshot, material_base_dir=base_dir,
@@ -123,7 +132,7 @@ class RunSetupMixin:
             # same requests so its run-scoped cache can serve the actual solve.
             selections = [select_backend(dict(arguments, frequencies_ghz=[frequency]),
                 value['execution_options'], value['mesh_certification'], checkpoint)
-                for frequency in value['frequencies_ghz']]
+                for frequency in forecast_frequencies]
             selection = dict(selected='/'.join(sorted({s['selected'] for s in selections})),
                 dense_peak_gib=max(s['dense_peak_gib'] for s in selections),
                 admission_budget_gib=min(s['admission_budget_gib'] for s in selections))

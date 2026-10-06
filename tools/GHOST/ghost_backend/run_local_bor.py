@@ -64,6 +64,7 @@ from ghost_backend.execution.provenance import (
 # Compatibility imports retain the established module entrypoints.
 from ghost_backend.runs.inputs import verify_local_unit_input as _verify_unit_input
 from ghost_backend.runs.inputs import load_geometry_snapshot
+from ghost_backend.twod.preparation import preparation_scope
 
 
 # ===============================================================================
@@ -117,8 +118,9 @@ MEMORY_HEADROOM = 0.75            # fraction of detected RAM the scheduler may
                                   # room for.
 
 # Pool worker lifetime, in units. Lower than the 2-D default because a BoR
-# unit's streaming blocks are large and worth returning to the OS promptly.
-TASKS_PER_CHILD = 2
+# unit's streaming blocks are large and worth returning to the OS promptly
+# (a respawn costs about half a second: 130 ms per pair at this interval).
+TASKS_PER_CHILD = 4
 
 # ===============================================================================
 
@@ -345,8 +347,7 @@ def _solve_and_export(
     results_dir = Path(results_dir_str)
     channel_units = list(pair["channel_units"])
     _verify_run_provenance(context)
-    for unit in channel_units:
-        _verify_unit_input(unit, context)
+    _verify_channel_inputs(channel_units, context)
     missing = []
     paths = []
     for unit in channel_units:
@@ -395,8 +396,7 @@ def _solve_and_export(
     for warning in result.get("metadata", {}).get("warnings", []) or []:
         print(f"      [warn] {pair['geometry_stem']}: {warning}", flush=True)
     _verify_run_provenance(context)
-    for unit in channel_units:
-        _verify_unit_input(unit, context)
+    _verify_channel_inputs(channel_units, context)
 
     from ghost_backend.io.grim import export_result_to_grim
     actual_paths = []
@@ -414,9 +414,22 @@ def _solve_and_export(
         )
         actual_paths.append(str(written[0]) if written else str(out_path))
     _verify_run_provenance(context)
-    for unit in channel_units:
-        _verify_unit_input(unit, context)
+    _verify_channel_inputs(channel_units, context)
     return ("written", ", ".join(actual_paths))
+
+
+def _verify_channel_inputs(channel_units, context):
+    """Read an identical channel input once at each verification boundary.
+
+    A different expected digest is never deduplicated. Nothing persists across
+    the solve or export boundary, so edits during either stage are still caught.
+    """
+    seen = set()
+    for unit in channel_units:
+        key = (str(unit['geometry']), unit.get('geometry_input_sha256'))
+        if key not in seen:
+            _verify_unit_input(unit, context)
+            seen.add(key)
 
 
 def _solve_and_export_star(args: 'tuple') -> 'tuple':
@@ -483,6 +496,7 @@ def _spill_directory(estimates: 'List[Dict[str, Any]]') -> 'str':
         return tempfile.gettempdir()
 
 
+@preparation_scope()
 def _plan(
     units: 'List[Dict[str, Any]]',
     aspects_deg: 'List[float]',

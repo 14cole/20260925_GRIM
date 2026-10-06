@@ -27,7 +27,8 @@ COMPACT_PRECONDITIONER_TOLERANCE=1e-6
 
 class CompressedFactor:
     def __init__(self,operator,diagnostics=None,label='compressed system',evidence=None,checkpoint=None,
-                 storage_budget_bytes=None, check_precision=True, recycling_key=None,recycling_frequency=None, **kwargs):
+                 storage_budget_bytes=None, check_precision=True, recycling_key=None,recycling_frequency=None,
+                 recycling_coordinate_units='rad/m', **kwargs):
         from ghost_backend.compressed.runtime import storage_budget
         from ghost_backend.linalg.refined_lu import requested_precision
         if check_precision and requested_precision()!='double':raise ValueError('Compressed factorization requires double precision.')
@@ -37,9 +38,12 @@ class CompressedFactor:
         self.relative_residual=np.empty(0)
         self.factor=None;self.reported=0
         self.recycling_key=recycling_key;self.frequency=recycling_frequency
+        self.recycling_coordinate_units=recycling_coordinate_units
         self.original_frequency=recycling_frequency;self.recycled=False
         allowance = storage_budget() if storage_budget_bytes is None else int(storage_budget_bytes)
         self.budget=allowance-operator.bytes-getattr(operator,'reserved_partner_bytes',0)
+        from ghost_backend.twod.assembly.polynomial_pair import retained_bytes as polynomial_retained_bytes
+        self.budget-=polynomial_retained_bytes('compressed')
         from ghost_backend.compressed.recycling import take,live_bytes,reserve_current_inverse
         borrowed=take(recycling_key,recycling_frequency,self.budget,self.checkpoint) if recycling_key is not None else None
         from ghost_backend.compressed.memory import inverse_storage
@@ -54,13 +58,24 @@ class CompressedFactor:
         if borrowed is not None and borrowed[0].bytes<=self.budget and borrowed[0].n==operator.n:
             self.factor,self.original_frequency=borrowed
             self.tolerance=self.factor.tolerance;self.recycled=True
-            self.event['frequency_preconditioner']=dict(reused=True,original_wavenumber=self.original_frequency)
+            self.event['frequency_preconditioner']=dict(self._frequency_evidence(),reused=True)
             self.event['preconditioners'].append(self.factor.evidence)
         else:
             borrowed=None
             self._fresh_build()
         borrowed=None
         if diagnostics is not None:self._condition()
+
+    def _frequency_evidence(self):
+        event=dict(original_frequency_coordinate=self.original_frequency,
+                   current_frequency_coordinate=self.frequency,
+                   coordinate_units=self.recycling_coordinate_units)
+        if self.recycling_coordinate_units=='rad/m':
+            # Preserve the existing 2D field; BoR's frequency is measured in Hz.
+            event['original_wavenumber']=self.original_frequency
+        elif self.recycling_coordinate_units=='Hz':
+            event['original_frequency_hz']=self.original_frequency
+        return event
 
     def _fresh_build(self):
         rejected=False
@@ -242,12 +257,14 @@ class CompressedFactor:
         from ghost_backend.compressed.recycling import save,capacity_bytes
         capacity=capacity_bytes()
         if not capacity:return
-        event=self.event.setdefault('frequency_preconditioner',{})
+        event=self.event.setdefault('frequency_preconditioner',self._frequency_evidence())
         event.update(cached=False,cache_capacity_bytes=capacity)
         if save(self.recycling_key,self.original_frequency,self.factor):
             event['cached']=True
+            event['cached_frequency_coordinate']=self.original_frequency
             self.factor=None
 
+    @timed_stage('condition_estimation')
     def _condition(self):
         rows,columns,norm=self.a.equilibrate()
         probe=CONDITION_PROBE_BACKWARD_ERROR_LIMIT

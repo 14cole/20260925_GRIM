@@ -86,7 +86,10 @@ class BorSamplingTests(unittest.TestCase):
             preview=dispatch.estimate_bor_resources(_pec_sphere_snapshot(explicit_elements=12),
                 1.,[90.],geometry_units='meters',workers=3,n_modes=8,
                 mesh_certification=False,bor_options={'factorization':'dense'})
-        self.assertEqual(preview['near_preparation']['workers'],min(3,options.allocated_cpu_budget()))
+        # A parallel request prepares its near pairs on the CPU allocation's
+        # physical cores, independently of the mode-worker count (October 2026).
+        self.assertEqual(preview['near_preparation']['workers'],
+            max(3,min(options.allocated_cpu_budget(),options.physical_core_count())))
         self.assertGreaterEqual(preview['estimated_peak_gb'],
             bor.estimate_bor_total_peak_gb(preview['near_preparation']['scratch_gb'],0.))
         # A tiny matrix can fit the old unpadded estimate but cannot admit the

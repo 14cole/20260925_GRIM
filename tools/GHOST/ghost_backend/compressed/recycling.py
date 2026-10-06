@@ -2,12 +2,28 @@
 from collections import OrderedDict
 import math
 import sys
+import threading
+from functools import wraps
 import numpy as np
 
-MAX_BYTES=128*1024**2
+# Still at most five percent of the live solve reservation. The previous
+# 128-MiB ceiling could not retain even one qualified 10-GHz cubic inverse.
+# This capacity is opt-in and is included by solve/admission memory models.
+MAX_BYTES=512*1024**2
 FREQUENCY_RATIO=1.10
+_CACHE_LOCK=threading.RLock()
 
 
+def _synchronized(function):
+    @wraps(function)
+    def call(*args,**kwargs):
+        # A tree has exactly one owner: a cache entry or one live solve.
+        # BoR modes may transfer different entries concurrently.
+        with _CACHE_LOCK:return function(*args,**kwargs)
+    return call
+
+
+@_synchronized
 def capacity_bytes():
     from ghost_backend.execution.options import option
     from ghost_backend.twod.solver import _solve_memory_limit_gb
@@ -51,9 +67,11 @@ class InverseCache:
     def __init__(self,capacity):
         self.capacity=capacity;self.bytes=0;self.entries=OrderedDict()
 
+    @_synchronized
     def close(self):
         self.entries.clear();self.bytes=0
 
+    @_synchronized
     def take(self,identity,frequency,budget):
         record=self.entries.pop(identity,None)
         if record is None:return None
@@ -62,6 +80,7 @@ class InverseCache:
             max(frequency,original)/min(frequency,original)>FREQUENCY_RATIO or factor.bytes>budget):return None
         return factor,original
 
+    @_synchronized
     def put(self,identity,frequency,factor):
         if (identity is None or not factor.inverse_only or not math.isfinite(frequency) or frequency<=0):return False
         size=retained_size(factor)+256
@@ -81,6 +100,7 @@ class InverseCache:
         return True
 
 
+@_synchronized
 def cache(create=False):
     from ghost_backend.twod.preparation import run_resources
     resources=run_resources()
@@ -98,11 +118,13 @@ def cache(create=False):
     return resources.get('frequency_inverse_cache')
 
 
+@_synchronized
 def live_bytes():
     owner=cache()
     return owner.bytes if owner is not None else 0
 
 
+@_synchronized
 def reserve_current_inverse(needed,available):
     """Discard optional entries before a tight storage cap would prevent work."""
     owner=cache()
@@ -112,6 +134,7 @@ def reserve_current_inverse(needed,available):
         owner.bytes-=owner.entries.popitem(last=False)[1][0]
 
 
+@_synchronized
 def take(identity,frequency,budget,checkpoint):
     owner=cache()
     if owner is None or identity is None:return None
@@ -120,6 +143,7 @@ def take(identity,frequency,budget,checkpoint):
     return result
 
 
+@_synchronized
 def save(identity,frequency,factor):
     owner=cache(create=True)
     return owner.put(identity,frequency,factor) if owner is not None else False

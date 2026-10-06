@@ -8,6 +8,17 @@ from ghost_backend.execution.runtime import ScopedValue
 from ghost_backend.execution.policy import MODEL, BACKENDS, relative_cost, rank_candidates, work_threads
 
 _BATCH_SELECTION = ScopedValue('ghost_batch_backend_selection', default=None)
+_REQUEST_SELECTION = ScopedValue('ghost_request_backend_selection', default=None)
+
+
+def request_selection_scope(value):
+    """The forecast made at the public boundary of the running request (or None)."""
+    return _REQUEST_SELECTION.override(value)
+
+
+def current_request_selection():
+    value = _REQUEST_SELECTION.get()
+    return dict(value) if value is not None else None
 
 
 def batch_selection_scope(value):

@@ -1125,6 +1125,7 @@ def _compute_resource_plan(pair, snapshot, material_base, manifest, cpus, budget
     """Price and bind a plan on its execution node without changing solve identity."""
     from ghost_backend.bor.dispatch import estimate_bor_resources
     from ghost_backend.execution.options import memory_allocation_scope
+    from ghost_backend.twod.preparation import preparation_scope
 
     config = dict(manifest.get("solver_config", {}) or {})
     workers = max(1, min(int(cpus), int(config.get("workers_per_unit", WORKERS_PER_UNIT))))
@@ -1144,7 +1145,8 @@ def _compute_resource_plan(pair, snapshot, material_base, manifest, cpus, budget
         return estimate_bor_resources(snapshot, float(pair["frequency_ghz"]),
             [float(value) for value in manifest["aspects_deg"]], **arguments)
 
-    with hpc_scheduler.cpu_allocation_scope(cpus), memory_allocation_scope(budget_gib) as admitted_budget:
+    with preparation_scope(), hpc_scheduler.cpu_allocation_scope(cpus), \
+            memory_allocation_scope(budget_gib) as admitted_budget:
         resource = estimate()
         options = dict(resource["bor_execution_options"])
         if options["factorization"] not in {"dense", "compressed"}:

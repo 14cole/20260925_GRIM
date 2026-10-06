@@ -18,13 +18,15 @@ class PreparedAccess:
     def __init__(self,oracle):
         self.get=oracle._get
         if hasattr(oracle,'plan'):
-            self.plan,self.block_matmul=oracle.plan,oracle.block_matmul
+            from ghost_backend.compressed.block_products import prepared_product
+            self.plan,self.block_matmul=oracle.plan,prepared_product(oracle)
 
 
 # Blocks above this many entries estimate their ACA error from random probes
 # instead of reconstructing every coefficient; smaller blocks are checked exactly.
 EXACT_ERROR_ENTRIES=1<<16
 ERROR_PROBES=8
+SAMPLED_MIN_DIMENSION=256
 
 
 class Block(hf.Block):
@@ -40,6 +42,12 @@ class Block(hf.Block):
     def col(self,j):
         if self.planned:return self.oracle.get(self.rows,self.cols[j:j+1],self.row_plan,None)[:,0]
         return self.oracle.get(self.rows,self.cols[j:j+1])[:,0]
+    def matmul(self,rhs):
+        return self.oracle.block_matmul(self.rows,self.cols,rhs,self.row_plan,self.col_plan)
+    def project(self,basis):
+        # Q.H A = (A.H Q).H, using the retained tiles directly. Neither a
+        # reconstructed off-diagonal block nor its dense adjoint is needed.
+        return self.oracle.block_matmul(self.rows,self.cols,basis,self.row_plan,self.col_plan,trans=2).conj().T
     def error(self,u,v):
         """Relative Frobenius error of u@v and the row where it is largest.
 
@@ -101,7 +109,24 @@ class CompressedSystem:
         self.n=oracle.n;self.budget=budget;self.checkpoint=checkpoint or (lambda:None)
         self.checkpoint()
         self.tolerance=tolerance;self.leaf=leaf
+        from ghost_backend.execution.options import environment_value
+        self.builder=environment_value('GHOST_COMPRESSED_INVERSE_BUILDER','aca').strip().lower()
+        if self.builder not in ('randomized','aca'):
+            raise ValueError('GHOST_COMPRESSED_INVERSE_BUILDER must be randomized or aca.')
+        # ACA performs many modest BLAS operations: forming a team for each
+        # one costs more than its work on the measured large physical cases.
+        # Restrict the default to inverse construction; later condition and
+        # field solves retain the caller's configured BLAS policy.
+        default_threads='1' if self.inverse_only and self.builder=='aca' else 'configured'
+        threads=environment_value('GHOST_COMPRESSED_INVERSE_THREADS',default_threads).strip().lower()
+        from ghost_backend.execution.options import allocated_cpu_budget, blas_core_budget, option
+        configured=option('blas_threads','auto')
+        thread_cap=min(allocated_cpu_budget(),blas_core_budget() if configured=='auto' else int(configured))
+        if threads != 'configured' and (not threads.isdecimal() or not 1<=int(threads)<=thread_cap):
+            raise ValueError('GHOST_COMPRESSED_INVERSE_THREADS must be configured or an integer within the CPU allocation and configured BLAS cap.')
+        self.inverse_threads=None if threads=='configured' else int(threads)
         self.bytes=0;self.ranks=[];self.leaves=0
+        self.sampled_blocks=0;self.sampled_fallbacks=0
         self.row_norm=np.zeros(oracle.n);self.row_error=np.zeros(oracle.n)
         self.column_norm=np.zeros(oracle.n);self.column_error=np.zeros(oracle.n)
         self.permutation=hf.spatial_order(coordinates,np.arange(oracle.n),leaf)
@@ -109,12 +134,20 @@ class CompressedSystem:
 
 
         access=PreparedAccess(oracle) if hasattr(oracle,'_get') else oracle
-        self.root=self.build(access,self.permutation)
+        from ghost_backend.compressed.block_products import product_scope
+        with product_scope(enabled=self.builder=='randomized' and self.inverse_only,
+                           blas_threads=self.inverse_threads) as products:
+            self.root=self.build(access,self.permutation)
         self.evidence=dict(bytes=self.bytes,max_rank=max(self.ranks or [0]),leaves=self.leaves,
             accesses=oracle.entries,oracle_calls=oracle.calls,max_query_entries=oracle.max_entries,
             relative_inf_error_bound=float(self.row_error.max()/max(self.row_norm.max(),1e-300)),
             relative_one_error_bound=float(self.column_error.max()/max(self.column_norm.max(),1e-300)),
             storage_budget=budget,inverse_only=self.inverse_only)
+        self.evidence.update(inverse_builder=self.builder if self.inverse_only else 'aca',
+            sampled_blocks=self.sampled_blocks,sampled_fallbacks=self.sampled_fallbacks,
+            sampled_min_dimension=SAMPLED_MIN_DIMENSION,
+            inverse_blas_threads=self.inverse_threads or 'configured')
+        self.evidence['block_products']=dict(products.evidence)
         if self.inverse_only:
             self.evidence['relative_inf_error_bound']=None
             self.evidence['relative_one_error_bound']=None
@@ -142,14 +175,35 @@ class CompressedSystem:
             original-=u[start:start+width] @ v
             self.row_error[rr]+=np.sum(abs(original),axis=1)
             self.column_error[cols]+=np.sum(abs(original),axis=0)
+    def compress_block(self,oracle,rows,cols):
+        block=Block(oracle,rows,cols,self.checkpoint)
+        # Randomized construction is only an inverse approximation. The
+        # authoritative operator and all its coefficient error bounds remain
+        # unchanged, and every field/probe solve is still checked against it.
+        # Small blocks retain ACA to avoid a wide QR where a few rows suffice.
+        if self.inverse_only and self.builder=='randomized' and block.planned and min(block.shape)>=SAMPLED_MIN_DIMENSION:
+            rng=np.random.default_rng((hf.SAMPLE_SEED,len(rows),len(cols),int(rows[0]),int(cols[0])))
+            probes=rng.standard_normal((len(cols),ERROR_PROBES))+1j*rng.standard_normal((len(cols),ERROR_PROBES))
+            image=block.matmul(probes)
+            norm=float(np.linalg.norm(image))/np.sqrt(2*ERROR_PROBES)
+            try:
+                u,v,_=hf.compress_sampled(block,max(norm,1e-300)*self.tolerance*.25,256,rng)
+                error,_=block.error(u,v)
+                if error<=self.tolerance:
+                    self.sampled_blocks+=1
+                    return u,v,error
+            except hf.HierarchicalRejected:
+                pass
+            self.sampled_fallbacks+=1
+        return hf.compress(block,tolerance=self.tolerance)
     def build(self,oracle,ids):
         self.checkpoint()
         node=Node();node.n=len(ids);node.leaf=len(ids)<=self.leaf;node.checkpoint=self.checkpoint
         if not node.leaf:
             mid=len(ids)//2;left,right=ids[:mid],ids[mid:]
             try:
-                node.u12,node.v12,_=hf.compress(Block(oracle,left,right,self.checkpoint),tolerance=self.tolerance)
-                node.u21,node.v21,_=hf.compress(Block(oracle,right,left,self.checkpoint),tolerance=self.tolerance)
+                node.u12,node.v12,_=self.compress_block(oracle,left,right)
+                node.u21,node.v21,_=self.compress_block(oracle,right,left)
             except hf.HierarchicalRejected:
                 if len(ids)>512:raise
                 node.leaf=True

@@ -23,6 +23,7 @@ from ghost_backend.twod.geometry import (
     PanelCoupledInfo,
 )
 from ghost_backend.execution.metrics import timed_stage
+from ghost_backend.twod.assembly.profiling import assembly_component
 from ghost_backend.execution.cpu import current_state, cached_operator
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 from ghost_backend.twod.constants import EPS, EULER_GAMMA
@@ -249,6 +250,12 @@ def _integrate_linear_pairs_box_sk_batched(
     if not bool(compute_single_layer) and not bool(compute_double_layer):
         raise ValueError("At least one batched near-pair operator is required.")
 
+    if width > 2:
+        # Polynomial pairs keep their kernel samples as monomial moments, so
+        # the cubic accuracy candidate of a certified solve reuses the
+        # quadratic candidate's samples (the same panels and wavenumber).
+        return _box_blocks_polynomial(elements, obs_ids, src_ids, k0, obs_normal_deriv, order,
+                                      bool(compute_single_layer), bool(compute_double_layer))
     qt, qw = _get_quadrature(max(2, int(order)))
     q = np.asarray(qt, dtype=float)
     weights = np.asarray(qw, dtype=float)
@@ -317,6 +324,93 @@ def _integrate_linear_pairs_box_sk_batched(
         dtype=float,
     )[:, None, None]
     return s_blocks * scales, k_blocks * scales
+
+def _box_monomial_moments(obs_elems, src_elems, k0, obs_normal_deriv, order, want_s, want_k):
+    """Scaled monomial S and K moments, shape (T, 2, D+1, D+1), of full-interval
+    pairs by the tensor-Gauss rule of ``order`` points per axis (the same
+    kernels as the nodal box rule; D = polynomial_quadrature._MOMENT_DEGREE)."""
+    from ghost_backend.twod.polynomial_quadrature import _kernels, _table_for_ends, _MOMENT_DEGREE
+    count = len(obs_elems)
+    moments = np.zeros((count, 2, _MOMENT_DEGREE + 1, _MOMENT_DEGREE + 1), dtype=np.complex128)
+    if not count:
+        return moments
+    qt, qw = _get_quadrature(max(2, int(order)))
+    q = np.asarray(qt, dtype=float)
+    weights = np.asarray(qw, dtype=float)
+    monomials = np.vander(q, _MOMENT_DEGREE + 1, increasing=True)
+    obs_p0 = np.asarray([elem.p0 for elem in obs_elems], dtype=float)
+    src_p0 = np.asarray([elem.p0 for elem in src_elems], dtype=float)
+    obs_seg = np.asarray([elem.p1 - elem.p0 for elem in obs_elems], dtype=float)
+    src_seg = np.asarray([elem.p1 - elem.p0 for elem in src_elems], dtype=float)
+    obs_pts = obs_p0[:, None, :] + q[None, :, None] * obs_seg[:, None, :]
+    src_pts = src_p0[:, None, :] + q[None, :, None] * src_seg[:, None, :]
+    diff = obs_pts[:, :, None, :] - src_pts[:, None, :, :]
+    dist = np.sqrt(np.sum(diff * diff, axis=3))
+    dist_safe = np.maximum(dist, EPS)
+    kr = np.asarray(complex(k0) * dist_safe, dtype=np.complex128)
+    tiny = np.abs(kr) <= 1e-12
+    w_outer = np.outer(weights, weights)
+    green = derivative = None
+    if not np.any(tiny):
+        table = _table_for_ends(k0, obs_p0, obs_p0 + obs_seg, src_p0, src_p0 + src_seg)
+        green, derivative = _kernels(k0, dist_safe, bool(want_k), table)
+    else:
+        kr[tiny] = 1e-12 + 0.0j
+    if want_s:
+        if green is None:
+            green = 0.25j * _hankel2_0_array(kr.reshape(-1)).reshape(dist.shape)
+        moments[:, 0] = monomials.T @ (w_outer[None, :, :] * green) @ monomials
+    if want_k:
+        if derivative is None:
+            derivative = (0.25j * complex(k0)) * _hankel2_1_array(kr.reshape(-1)).reshape(dist.shape)
+        normals = np.asarray([elem.normal for elem in (obs_elems if obs_normal_deriv else src_elems)], dtype=float)
+        proj = np.sum(diff * normals[:, None, None, :], axis=3) / dist_safe
+        dk_vals = (-derivative if obs_normal_deriv else derivative) * proj
+        dk_vals[dist <= EPS] = 0.0
+        moments[:, 1] = monomials.T @ (w_outer[None, :, :] * dk_vals) @ monomials
+    scales = np.asarray([obs.length * src.length for obs, src in zip(obs_elems, src_elems)], dtype=float)
+    moments *= scales[:, None, None, None]
+    return moments
+
+
+def _box_blocks_polynomial(elements, obs_ids, src_ids, k0, obs_normal_deriv, order, want_s, want_k):
+    """Nodal S and K blocks of polynomial fixed-order pairs through their monomial moments.
+
+    The moments depend on the pair geometry, the wavenumber and the rule, not
+    on the polynomial degree; within a certified request's moment-cache scope
+    they are stored, so the cubic candidate projects the quadratic candidate's
+    samples instead of integrating them again (the nodal projection is the
+    same linear map as the direct nodal rule, to rounding).
+    """
+    from ghost_backend.twod.polynomial_quadrature import _MOMENT_CACHE, box_moment_keys
+    from ghost_backend.twod.basis import coefficients
+    obs_elems = [elements[int(index)] for index in obs_ids]
+    src_elems = [elements[int(index)] for index in src_ids]
+    npairs = len(obs_elems)
+    width = len(elements[0].node_ids)
+    degree = width - 1
+    cache = _MOMENT_CACHE.get()
+    if cache is None:
+        moments = _box_monomial_moments(obs_elems, src_elems, k0, obs_normal_deriv, order, want_s, want_k)
+    else:
+        keys = box_moment_keys(k0, obs_normal_deriv, order, want_s, want_k, obs_elems, src_elems)
+        found = [cache.get(key) for key in keys]
+        todo = [index for index, value in enumerate(found) if value is None]
+        if todo:
+            fresh = _box_monomial_moments([obs_elems[i] for i in todo], [src_elems[i] for i in todo],
+                                          k0, obs_normal_deriv, order, want_s, want_k)
+            for position, value in zip(todo, fresh):
+                found[position] = value
+                cache.put(keys[position], value)
+        moments = (np.stack(found) if npairs else
+                   np.zeros((0, 2, degree + 1, degree + 1), dtype=np.complex128))
+    co = coefficients(degree)
+    block = moments[:, :, :degree + 1, :degree + 1]
+    zero = np.zeros((npairs, width, width), dtype=np.complex128)
+    s_blocks = np.einsum('ia,tij,jb->tab', co, block[:, 0], co) if want_s else zero.copy()
+    k_blocks = np.einsum('ia,tij,jb->tab', co, block[:, 1], co) if want_k else zero.copy()
+    return s_blocks, k_blocks
+
 
 def _single_layer_self_block_exact(
     elem: 'LinearElement',
@@ -1248,6 +1342,24 @@ _ASSEMBLY_TILE = _env_positive_int("GHOST_ASSEMBLY_TILE", 0)
 _FAR_QUAD_ORDER = _env_positive_int("GHOST_FAR_QUAD_ORDER", 0)
 
 
+def _env_float(name: 'str', default: 'float') -> 'float':
+    try:
+        value = float(str(os.environ.get(name, "")).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
+# Far pairs of an attenuating medium whose kernels are negligible are skipped:
+# with lower a lower bound of the point-pair distance (centre distance less
+# half of each length), |i H0(kr)/4| <= exp(-a)/sqrt(8 pi a) for a = -Im(k)
+# lower > 1 (DLMF 10.27.8, 10.32.9), below 1e-18 of the near-diagonal kernel
+# scale at the cut of 40 (the compressed backend applies the same bound at 32
+# and accounts the dropped routes in its error evidence).  The near/far
+# classification and the graded orders are unchanged.  0 disables the cut.
+FAR_ATTENUATION_CUT = _env_float("GHOST_FAR_ATTENUATION_CUT", 40.0)
+
+
 _ASSEMBLY_COMPACT_BELOW = 0.5
 
 
@@ -1853,6 +1965,7 @@ def _maue_blocks(s_blocks, k0, obs_normals, src_normals, obs_lengths, src_length
 
 
 
+@assembly_component('near_integration')
 def _near_pair_blocks(elements, obs_idx, src_idx, k0, obs_normal_deriv, obs_order, src_order,
                       integrate_s, want_k, p0_arr, seg_arr, centers, lengths, node_ids, far_table,
                       single_layer_blocks=None, double_layer_blocks=None):
@@ -2194,6 +2307,8 @@ def _assemble_multi(
 
     abs_k = abs(complex(k0))
     attenuating = -complex(k0).imag > complex(k0).real
+    attenuation_rate = (-complex(k0).imag if FAR_ATTENUATION_CUT > 1.0 and complex(k0).imag < 0.0
+                        and complex(k0).real > 0.0 else 0.0)
     w_far_floor = _graded_w_far_floor(k0, lengths, far_ratio, width-1) if want_w else 16
 
     n_acc = width**2 * (int(want_s) + (2 if want_k else 0))
@@ -2213,6 +2328,7 @@ def _assemble_multi(
              for j0 in range(i0 if symmetric else 0, n_src, tile)]
     near_records: 'List[Optional[List[Tuple[np.ndarray, np.ndarray, int, np.ndarray, bool]]]]' = [None] * len(tiles)
 
+    @assembly_component('far_integration')
     def _far_tile(index: 'int'):
         i0, j0 = tiles[index]
         i1 = min(i0 + tile, n_obs)
@@ -2250,6 +2366,13 @@ def _assemble_multi(
             obs_slice[:, None] != src_global[None, :],
             out=far_sym,
         )
+        # Far pairs whose kernels are negligible (FAR_ATTENUATION_CUT) are
+        # neither evaluated nor scattered; they stay far for the near
+        # classification and for the graded order below.
+        far_eval = far_sym
+        if attenuation_rate > 0.0:
+            lower = centre_dist - 0.5 * (obs_len[:, None] + src_len[None, :])
+            far_eval = far_sym & (attenuation_rate * lower < FAR_ATTENUATION_CUT)
 
 
         far_ij = {}
@@ -2263,14 +2386,14 @@ def _assemble_multi(
             src_msk = mask[src_global]
             pairs_ij = src_msk[None, :] & obs_masks[mi][obs_slice][:, None]
             eligible_ij |= pairs_ij
-            fij = far_sym & pairs_ij
+            fij = far_eval & pairs_ij
             far_ij[mi] = fij
             any_ij = any_ij or bool(fij.any())
             if mirrored:
                 obs_msk = mask[obs_slice]
                 pairs_ji = obs_msk[:, None] & obs_masks[mi][src_global][None, :]
                 eligible_ji |= pairs_ji
-                fji = far_sym & pairs_ji
+                fji = far_eval & pairs_ji
                 far_ji[mi] = fji
                 any_ji = any_ji or bool(fji.any())
 
@@ -2294,6 +2417,8 @@ def _assemble_multi(
         ratio_min = float(np.min(
             np.where(any_far, centre_dist / scale, np.inf)
         )) if any_far.any() else float("inf")
+        if far_eval is not far_sym:
+            any_far = far_eval & (eligible_ij | eligible_ji)
         kl_max = abs_k * float(max(obs_len.max(), src_len.max()))
         rule_floor = max(int(minimum_far_order), width + 2 if width > 2 else 2)
         tile_obs_order = max(rule_floor,
@@ -2380,6 +2505,7 @@ def _assemble_multi(
         if not scatters:
             return None
 
+        @assembly_component('far_scatter')
         def commit():
             for target, rows, columns, values, factor in scatters:
                 target.scatter_tile(rows, columns, values, factor)

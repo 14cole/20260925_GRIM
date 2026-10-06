@@ -231,6 +231,50 @@ def assemble_groups(mesh,geometry,groups,obs_order=8,src_order=8,far_order_floor
             minimum_far_order=(far_order_floors or {}).get(k,0))
 
 
+def reciprocal_values(oracle, requests):
+    """Assemble several opposite queries through one shared kernel traversal.
+
+    Requests carry (rows, columns, missing source indices). Equation matrices
+    are not assumed symmetric: each direction/polarization keeps its own masks,
+    material routes, jump terms and attenuation bounds. The common Galerkin
+    engine can then evaluate reciprocal Green kernels once and produce both
+    normal-derivative directions. No completed global matrix is constructed.
+    """
+    if type(oracle) is PreparedOracle:
+        sources = [oracle]
+    elif type(oracle) is PairedOracle and all(type(source) is PreparedOracle for source in oracle.oracles):
+        sources = oracle.oracles
+    else:
+        raise TypeError('Reciprocal assembly requires the standard regional oracle.')
+    grouped, result = {}, []
+    for rows, cols, missing in requests:
+        values = {}
+        for index in missing:
+            if not isinstance(index, (int, np.integer)) or not 0 <= index < len(sources) or index in values:
+                raise ValueError('Invalid reciprocal source selection.')
+            matrix, error, pending = sources[index].get_with_error(rows, cols, assemble=False)
+            values[index] = (matrix, error, None)
+            for k, outputs, masks, coefficients, additional in pending:
+                item = grouped.setdefault(k, ([], [], [], []))
+                item[0].extend(outputs)
+                item[1].extend(masks)
+                item[2].extend(coefficients)
+                item[3].extend(additional)
+        result.append(values)
+    source = sources[0]
+    floors = {}
+    for item in sources:
+        for k, order in (item.far_order_floors or {}).items():
+            floors[k] = max(floors.get(k, 0), order)
+    assemble_groups(source.mesh, source.geometry,
+                    [(k,) + tuple(values) for k, values in grouped.items()],
+                    source.obs_order, source.src_order, floors)
+    if type(oracle) is PairedOracle:
+        oracle.calls += sum(bool(missing) for _, _, missing in requests)
+        oracle.kernel_groups += len(grouped)
+    return result
+
+
 class PairedOracle:
     """TE/TM destinations share geometry/kernel traversal, preserving each law."""
     process_tiles=True

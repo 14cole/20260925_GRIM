@@ -412,22 +412,50 @@ def _admit_table(state, key, table):
     state.tables[key] = table
 
 
+_TABLE_BUILDS = {}
+
+
 def cached_table(state, key, build):
     """A table from the CPU state's budgeted store, built on a miss (None if rejected).
 
     Near-pair batches ask from assembly threads, so the store is locked; the
-    build itself runs unlocked and a concurrent duplicate is discarded.
+    build itself runs unlocked.  The first thread to miss a key builds it and
+    the others wait for that build instead of each building a duplicate.
     """
     with _TABLE_LOCK:
         if key in state.tables:
             table = state.tables.pop(key)
             state.tables[key] = table
             return table
-    table = build()
+        pending = _TABLE_BUILDS.get(key)
+        builder = pending is None
+        if builder:
+            pending = _TABLE_BUILDS[key] = threading.Event()
+    if not builder:
+        pending.wait()
+        with _TABLE_LOCK:
+            if key in state.tables:
+                return state.tables[key]
+        # The builder's table was rejected or belongs to another state.
+        table = build()
+        with _TABLE_LOCK:
+            if key in state.tables:
+                return state.tables[key]
+            _admit_table(state, key, table)
+        return table
+    try:
+        table = build()
+    except BaseException:
+        with _TABLE_LOCK:
+            _TABLE_BUILDS.pop(key, None)
+        pending.set()
+        raise
     with _TABLE_LOCK:
-        if key in state.tables:
-            return state.tables[key]
-        _admit_table(state, key, table)
+        if key not in state.tables:
+            _admit_table(state, key, table)
+        table = state.tables.get(key, table)
+        _TABLE_BUILDS.pop(key, None)
+    pending.set()
     return table
 
 

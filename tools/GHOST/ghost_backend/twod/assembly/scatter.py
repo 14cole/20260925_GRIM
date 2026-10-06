@@ -1,6 +1,7 @@
 """Route Galerkin contributions straight into the owned equation matrix."""
 import numpy as np
 from ghost_backend.twod.assembly.compact import CompactOperator
+from ghost_backend.twod.assembly.profiling import assembly_component
 
 
 class SystemScatter:
@@ -114,6 +115,7 @@ class SystemScatter:
                 rr = np.broadcast_to(r[None, :, None], block.shape)
                 np.add.at(matrix, (rr[keep], np.broadcast_to(cc[:, None, :], block.shape)[keep]), block[keep])
 
+    @assembly_component('near_scatter')
     def scatter_pairs(self, rows, columns, values):
         """scatter_add(rows[p][:, None], columns[p][None, :], values[p]) for every p in order.
 

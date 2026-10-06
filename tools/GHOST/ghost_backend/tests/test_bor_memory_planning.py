@@ -88,6 +88,46 @@ class NearStorageTests(unittest.TestCase):
 
 
 class MemoryPlanningTests(unittest.TestCase):
+    def test_preparation_workers_are_independent_but_price_their_own_phase(self):
+        with mock.patch('ghost_backend.execution.options.allocated_cpu_budget',return_value=4), \
+                mock.patch.object(bor,'estimate_bor_dense_peak_gb',return_value=.2), \
+                mock.patch('ghost_backend.bor.near_parallel.process_backend_possible',return_value=False):
+            plan = bor.plan_bor_mode_workers(10,4,2,1,.2,memory_limit_gb=2.,preparation_workers=4)
+        self.assertEqual(plan['workers'],1)
+        self.assertEqual(plan['near_preparation']['workers'],4)
+        self.assertEqual(plan['requested_preparation_workers'],4)
+        expected = max(bor.estimate_bor_total_peak_gb(.2,.2),
+            bor.estimate_bor_total_peak_gb(.2+4*bor._NEAR_TASK_SCRATCH_BYTES/1e9,0.))
+        self.assertEqual(plan['estimated_peak_gb'],expected)
+
+    def test_preparation_workers_obey_cpu_and_memory_even_with_one_modal_task(self):
+        with mock.patch.object(bor,'estimate_bor_dense_peak_gb',return_value=.2), \
+                mock.patch('ghost_backend.bor.near_parallel.process_backend_possible',return_value=False):
+            for cpu,limit,expected in ((4,1.3,2),(2,2.,2)):
+                with mock.patch('ghost_backend.execution.options.allocated_cpu_budget',return_value=cpu):
+                    plan = bor.plan_bor_mode_workers(10,4,2,1,.2,memory_limit_gb=limit,preparation_workers=4)
+                self.assertEqual(plan['workers'],1)
+                self.assertEqual(plan['near_preparation']['workers'],expected)
+                self.assertLessEqual(plan['estimated_peak_gb'],limit)
+            with mock.patch('ghost_backend.execution.options.allocated_cpu_budget',return_value=4):
+                rejected = bor.plan_bor_mode_workers(10,4,2,1,.2,memory_limit_gb=.9,preparation_workers=4)
+            self.assertFalse(rejected['fits_memory'])
+
+    def test_axial_streamed_solve_prepares_with_four_workers_but_solves_one_mode(self):
+        points = bor.sphere_generatrix(.025,8)
+        kwargs = dict(freq_hz=1e9,thetas_deg=[0.,180.],assembly='streaming',
+                      bor_options=dict(factorization='dense',near_backend='threads'))
+        reference = bor.solve_bor(points,workers=1,**kwargs)
+        with mock.patch('ghost_backend.execution.options.allocated_cpu_budget',return_value=4), \
+                mock.patch.object(bor,'_solve_memory_limit_gb',return_value=4.):
+            result = bor.solve_bor(points,workers=4,**kwargs)
+        plan = result['modal_execution']['worker_plan']
+        self.assertEqual(plan['workers'],1)
+        self.assertEqual(plan['near_preparation']['workers'],4)
+        self.assertEqual(result['stream_mode_block'],2)
+        for field in ('amp_vv','amp_hh'):
+            np.testing.assert_allclose(result[field],reference[field],rtol=3e-12,atol=1e-13)
+
     def test_runtime_reduces_concurrency_and_keeps_original_fields(self):
         # Controlled workspace prices exercise real admission and execution,
         # without allocating a large physical matrix just to force throttling.

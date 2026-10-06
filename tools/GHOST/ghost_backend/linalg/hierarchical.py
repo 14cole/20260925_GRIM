@@ -38,6 +38,10 @@ HIERARCHICAL_MIN_UNKNOWNS = 10000
 def automatic_hierarchical(n):
     """Whether a dense system of order ``n`` is factored hierarchically by default."""
     raw = os.environ.get('GHOST_HIERARCHICAL_MIN_UNKNOWNS', '').strip()
+    if not raw:
+        from ghost_backend.linalg.crossover import chosen
+        measured=chosen(n)
+        if measured is not None:return measured=='hodlr'
     threshold = int(raw) if raw else HIERARCHICAL_MIN_UNKNOWNS
     return threshold > 0 and int(n) >= threshold
 
@@ -159,6 +163,67 @@ class Block:
                 largest = float(norms.max())
                 pivot = start+int(np.argmax(norms))
         return np.sqrt(error/max(total, 1e-300)), pivot
+
+
+class OrderedBlock:
+    """A block of the spatially ordered copy of the matrix: contiguous slices, no gathers.
+
+    Same interface as :class:`Block` for the sampled compression (``shape``,
+    ``dense``, ``matmul``, ``project``, ``checkpoint``); the products act on
+    strided views (BLAS takes the leading dimension), so no panel copies.
+    """
+    def __init__(self, ordered, rows, cols, checkpoint):
+        self.a, self.rows, self.cols, self.checkpoint = ordered, rows, cols, checkpoint
+        self.shape = rows.stop - rows.start, cols.stop - cols.start
+
+    def dense(self):
+        return np.array(self.a[self.rows, self.cols], order='C')
+
+    def matmul(self, rhs):
+        self.checkpoint()
+        return self.a[self.rows, self.cols] @ rhs
+
+    def project(self, basis):
+        self.checkpoint()
+        return basis.conj().T @ self.a[self.rows, self.cols]
+
+
+# A build copies the matrix into spatial order when the copy is at most this
+# large and the host has twice its size (plus 1 GiB) available: interleaved
+# unknown layouts fragment every block into runs of one or two entries, and
+# gathering them was 47% of a build (4.2 N^2 entries at ~1.4 GB/s).  The copy
+# is one threaded N^2 gather, released after the build.
+ORDERED_COPY_MAX_BYTES = 8 << 30
+
+
+def ordered_copy(matrix, permutation, checkpoint):
+    """``matrix[perm][:, perm]`` as a contiguous array, or None when RAM does not allow it."""
+    from ghost_backend.execution.options import _optional_psutil, blas_core_budget
+    psutil = _optional_psutil()
+    if psutil is None or matrix.nbytes > ORDERED_COPY_MAX_BYTES:
+        return None
+    try:
+        available = int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+    if available < 2 * matrix.nbytes + (1 << 30):
+        return None
+    checkpoint()
+    n = len(permutation)
+    out = np.empty((n, n), dtype=matrix.dtype)
+    threads = min(blas_core_budget(), max(1, n * n // GATHER_ENTRIES_PER_THREAD))
+    step = -(-n // (4 * threads)) if threads > 1 else n
+
+    def gather(start):
+        out[start:start+step] = matrix[np.ix_(permutation[start:start+step], permutation)]
+    if threads <= 1:
+        gather(0)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            for _ in pool.map(gather, range(0, n, step)):
+                pass
+    return out
 
 
 def compress(block, tolerance=2e-10, maximum_rank=256):
@@ -337,6 +402,10 @@ class HierarchicalFactor:
         self.evidence = dict(backend='hodlr', compression='randomized', builds=0, tighter_rebuilds=0)
         coordinates = np.arange(self.n)[:, None] if coordinates is None else np.asarray(coordinates)
         self.permutation = spatial_order(coordinates, np.arange(self.n))
+        self._position = np.empty(self.n, dtype=np.intp)
+        self._position[self.permutation] = np.arange(self.n)
+        self.ordered = ordered_copy(matrix, self.permutation, self.checkpoint)
+        self.evidence['ordered_copy'] = self.ordered is not None
         # The transposed norm is only needed by transposed solves (condition estimates).
         self.norms = [matrix_inf_norm(matrix) if matrix_norm is None else matrix_norm, None]
         self.scale = float(self.norms[0])
@@ -350,6 +419,15 @@ class HierarchicalFactor:
 
 
             self._rebuild(self.TIGHT_TOLERANCE)
+        self.ordered = None
+
+    def _block(self, rows, cols):
+        """The block of ``rows`` x ``cols`` (contiguous runs of the permutation) for the build."""
+        if self.ordered is not None:
+            row_start, col_start = int(self._position[rows[0]]), int(self._position[cols[0]])
+            return OrderedBlock(self.ordered, slice(row_start, row_start + len(rows)),
+                                slice(col_start, col_start + len(cols)), self.checkpoint)
+        return Block(self.a, rows, cols, self.checkpoint)
 
     def _rebuild(self, tolerance):
 
@@ -387,7 +465,7 @@ class HierarchicalFactor:
         node.checkpoint = self.checkpoint
         node.n, node.leaf = len(ids), len(ids) <= LEAF_SIZE
         if node.leaf:
-            node.lu = self._lu(Block(self.a, ids, ids, self.checkpoint).dense())
+            node.lu = self._lu(self._block(ids, ids).dense())
             self.evidence['leaves'] += 1
             return node
         mid = len(ids)//2
@@ -396,10 +474,10 @@ class HierarchicalFactor:
 
 
         try:
-            u12, node.v12, err1 = compress_sampled(Block(self.a, left, right, self.checkpoint),
+            u12, node.v12, err1 = compress_sampled(self._block(left, right),
                                                    threshold, self.MAXIMUM_RANK, self.rng)
             # The transposed block has about the same rank: sample that many at once.
-            u21, node.v21, err2 = compress_sampled(Block(self.a, right, left, self.checkpoint),
+            u21, node.v21, err2 = compress_sampled(self._block(right, left),
                                                    threshold, self.MAXIMUM_RANK, self.rng,
                                                    start=max(SAMPLE_COLUMNS, u12.shape[1] + 8))
         except HierarchicalRejected:
@@ -411,7 +489,7 @@ class HierarchicalFactor:
 
             u12 = None
             node.v12 = node.v21 = None
-            node.lu = self._lu(Block(self.a, ids, ids, self.checkpoint).dense())
+            node.lu = self._lu(self._block(ids, ids).dense())
             self.evidence['leaves'] += 1
             return node
         r, s = u12.shape[1], u21.shape[1]

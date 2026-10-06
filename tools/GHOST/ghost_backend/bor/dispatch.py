@@ -37,6 +37,7 @@ from ghost_backend.runs.quality import (
     scale_snapshot_panel_density,
     validate_mesh_convergence_policy,
 )
+from ghost_backend.twod.preparation import prepare_geometry
 
 DEFAULT_ELEMENTS_PER_WAVELENGTH = 20
 MAX_ELEMENTS_DEFAULT = 50_000
@@ -497,9 +498,9 @@ def resolve_automatic_plan(
 
     ``assembly`` is None unless the chooser replaces the caller's ``'auto'``:
     when the dense plan of the solvers' own assembly decision cannot fit
-    (they choose tables below a fixed 2 GB whatever the limit is), dense
-    streaming is priced next and compression is selected only when neither
-    fits. Snapshot entries choose once for the whole sweep, so an imposed
+    (conductors stream; the material solvers choose tables below a fixed 2 GB
+    whatever the limit is), dense streaming is priced next and compression is
+    selected only when neither fits. Snapshot entries choose once for the whole sweep, so an imposed
     streamed assembly applies to every frequency; it costs about what tables
     cost, and compression several times more.
     """
@@ -695,6 +696,7 @@ def _direct_dense_plan(supplied, layout, modes, order):
         plan_combined_streaming_mode_block, plan_streaming_mode_block)
     from ghost_backend.bor.memory import solve_memory_limit_gb as _solve_memory_limit_gb
     workers = max(1, int(supplied.get('workers') or 1))
+    preparation_workers = workers
     assembly = str(supplied.get('assembly', 'auto')).strip().lower()
     budget = float(supplied.get('stream_budget_gb') or BOR_STREAM_BUDGET_GB_DEFAULT)
     dofs = sum((2 if conductor else 4) * (elements + 1) for elements, conductor, _ in layout)
@@ -717,14 +719,17 @@ def _direct_dense_plan(supplied, layout, modes, order):
               and supplied.get('points_core') is not None and 'eps_r' in supplied)
     if len(layout) == 1:
         decision = sides * estimate_bor_table_gb(elements, modes, formulation, has_ibc, order, False)
-        streaming = assembly == 'streaming' or (assembly == 'auto' and decision > 2.0)
+        # solve_bor streams every automatic conductor solve (October 2026); the
+        # dielectric solver keeps its 2 GB table threshold.
+        streaming = assembly == 'streaming' or (assembly == 'auto' and (conductor or decision > 2.0))
         if streaming:
             block, held, planned = plan_streaming_mode_block(elements, modes, formulation, has_ibc,
                                                              False, budget / sides, workers)
             # The solve's spill decision (solve_bor, solve_bor_dielectric).
             _, held, workers, _, _, _ = _mirror_stream_spill(
                 (block, sides * held, planned), workers, modes,
-                sides * estimate_streaming_block_gb(elements, modes, 1, formulation, has_ibc, False))
+                sides * estimate_streaming_block_gb(elements, modes, 1, formulation, has_ibc, False),
+                surface_layout=plain)
             assembly_peak = held + BOR_STREAM_TILE_BUDGET_GB
         else:
             assembly_peak = _table_plan_peak_gb(decision, plain, modes, order)
@@ -755,7 +760,8 @@ def _direct_dense_plan(supplied, layout, modes, order):
                             for _side in range(1 if conductor else 2)]
             _, held, workers, _, _, _ = _mirror_stream_spill(
                 plan, workers, modes, combined_stream_mode_gb(modes, specs), exact=coated,
-                surely_short=(modes + 1) * combined_stream_mode_gb(modes, always_built) > budget)
+                surely_short=(modes + 1) * combined_stream_mode_gb(modes, always_built) > budget,
+                surface_layout=plain)
             assembly_peak = held + BOR_STREAM_TILE_BUDGET_GB
         else:
             assembly_peak = _table_plan_peak_gb(decision if coated else decision - auxiliary, plain, modes, order)
@@ -763,7 +769,8 @@ def _direct_dense_plan(supplied, layout, modes, order):
     # The same process limit as the snapshot chooser and the 2-D entries.
     plan = plan_bor_mode_workers(dofs, rhs, workers, modes + 1,
                                  assembly_peak + auxiliary + max(output_reserved_gb(), direct_output),
-                                 memory_limit_gb=_solve_memory_limit_gb())
+                                 memory_limit_gb=_solve_memory_limit_gb(),
+                                 preparation_workers=preparation_workers)
     plan['assumed_assembly'] = 'streaming' if streaming else 'tables'
     return plan
 
@@ -835,16 +842,7 @@ def estimate_bor_resources(
         preview_snapshot, material_base_dir
     )
     _reject_unsupported_bor_ibc_interfaces(preview_snapshot)
-    validate_geometry_snapshot_for_solver(
-        preview_snapshot,
-        base_dir=base_dir,
-        meters_scale=scale,
-    )
-    materials = MaterialLibrary.from_entries(
-        preview_snapshot.get("ibcs", []) or [],
-        preview_snapshot.get("dielectrics", []) or [],
-        base_dir=base_dir,
-    )
+    base_dir, _, materials, scale = prepare_geometry(preview_snapshot, base_dir, geometry_units)
     wavelength, _max_index, _flags = (
         _conservative_mesh_wavelength_for_frequencies(
             preview_snapshot, materials, [frequency]
@@ -885,26 +883,42 @@ def estimate_bor_resources(
     )
     if compressed_requested():
         auxiliary = _estimate_junction_auxiliary_gb(surface_layout, mode_cap, pair_counts, surface_kinds)
+        retained_far_gb, far_work_gb, stream_mode_block = 0., 0., None
+        exact_spill_directory, exact_spill_candidate = None, 0.
+        effective_workers = worker_count
+        from ghost_backend.bor.solver import (plan_compressed_far_cache,
+            plan_compressed_far_spill, COMPRESSED_FAR_WORK_GB)
+        if kind in {'conductor', 'sheet'}:
+            cache_plan = plan_compressed_far_cache(element_count, mode_cap, formulation, has_ibc,
+                stream_budget, worker_count, 2*aspects.size, auxiliary['peak_gb']+output_gb,
+                near_pairs=max(pair_counts.values(), default=0))
+            if cache_plan is not None:
+                stream_mode_block, retained_far_gb, effective_workers = cache_plan
+                far_work_gb = COMPRESSED_FAR_WORK_GB
+                exact_spill_directory, exact_spill_candidate = plan_compressed_far_spill(
+                    element_count, mode_cap, formulation, has_ibc, stream_mode_block)
         worker_plan = plan_bor_mode_workers(unknowns, 2*aspects.size,
-            worker_count, mode_cap+1, auxiliary['peak_gb'] + output_gb,
-            near_pairs=max(pair_counts.values(), default=0))
+            effective_workers, mode_cap+1, auxiliary['peak_gb'] + retained_far_gb + far_work_gb + output_gb,
+            near_pairs=max(pair_counts.values(), default=0), preparation_workers=worker_count)
         near_plan = worker_plan['near_preparation']
+        from ghost_backend.bor.options import resolved_compression_tile
         return dict(frequency_ghz=frequency, geometry_kind=kind, mesh_elements=int(element_count),
             surface_count=len(surface_layout), n_unknowns_estimate=int(unknowns),
             mode_cap_estimate=int(mode_cap), mode_tail_start_estimate=int(mode_tail_start),
             active_mode_workers=worker_plan['workers'], assembly_estimate='compressed',
-            table_precision_estimate='double', persistent_assembly_gb=auxiliary['retained_gb'],
-            held_assembly_gb=auxiliary['retained_gb'], junction_projection_gb=auxiliary['projection_gb'],
-            near_junction_operator_gb=auxiliary['near_gb'], stream_mode_block_estimate=None,
+            table_precision_estimate='double', persistent_assembly_gb=auxiliary['retained_gb'] + retained_far_gb,
+            held_assembly_gb=auxiliary['retained_gb'] + retained_far_gb, junction_projection_gb=auxiliary['projection_gb'],
+            near_junction_operator_gb=auxiliary['near_gb'], stream_mode_block_estimate=stream_mode_block,
             estimated_peak_gb=worker_plan['estimated_peak_gb'], worker_plan=worker_plan,
             output_grid_gb=output_gb,
             near_preparation=near_plan,
             mesh_certification=bool(mesh_certification),
             memory_estimate_method='compressed_payload_cap_and_workspace',
             angle_batch_size=current_options()['angle_batch_size'],
-            # Compressed assembly keeps its operators in RAM; nothing spills.
-            stream_spill_gb_estimate=0.0, stream_spill_candidate_gb=0.0,
-            stream_spill_directory=None)
+            compression_tile_estimate=resolved_compression_tile(current_options(), stream_mode_block is not None),
+            stream_spill_gb_estimate=exact_spill_candidate if exact_spill_directory else 0.,
+            stream_spill_candidate_gb=exact_spill_candidate,
+            stream_spill_directory=str(exact_spill_directory) if exact_spill_directory else None)
     persistent_gb = 0.0
     held_assembly_gb = 0.0
     stream_mode_block = None
@@ -933,10 +947,9 @@ def estimate_bor_resources(
         table_double = estimate_bor_table_gb(
             element_count, mode_cap, formulation, has_ibc, FAR_GAUSS_ORDER, False
         )
-        use_streaming = (
-            assembly_key == "streaming"
-            or (assembly_key == "auto" and table_double > 2.0)
-        )
+        # Conductors and sheets stream whenever the caller leaves the assembly
+        # automatic (solve_bor, October 2026); tables are an explicit request.
+        use_streaming = assembly_key in ("streaming", "auto")
         full_double = (
             estimate_streaming_gb(
                 element_count, mode_cap, formulation, has_ibc, False
@@ -969,7 +982,7 @@ def estimate_bor_resources(
                 (stream_mode_block, held_assembly_gb, effective_workers),
                 worker_count, mode_cap,
                 estimate_streaming_block_gb(element_count, mode_cap, 1, formulation,
-                                            has_ibc, use_single))
+                                            has_ibc, use_single), surface_layout=surface_layout)
         elif not use_streaming:
             held_assembly_gb = _table_plan_peak_gb(persistent_gb, surface_layout, mode_cap)
         estimated_assembly = "streaming" if use_streaming else "tables"
@@ -1020,7 +1033,7 @@ def estimate_bor_resources(
                 (stream_mode_block, 2.0 * held_one, effective_workers),
                 worker_count, mode_cap,
                 2.0 * estimate_streaming_block_gb(dielectric_elements, mode_cap, 1,
-                                                  "efie", True, use_single))
+                                                  "efie", True, use_single), surface_layout=surface_layout)
             assembly_peak_gb = (
                 held_assembly_gb + BOR_STREAM_TILE_BUDGET_GB
             )
@@ -1086,7 +1099,8 @@ def estimate_bor_resources(
             (stream_mode_block, held_assembly_gb, effective_workers, spill_gb,
              spill_candidate_gb, spill_directory) = _mirror_stream_spill(
                 (stream_mode_block, held_assembly_gb, effective_workers),
-                worker_count, mode_cap, combined_stream_mode_gb(mode_cap, stream_specs))
+                worker_count, mode_cap, combined_stream_mode_gb(mode_cap, stream_specs),
+                surface_layout=surface_layout)
             assembly_peak_gb = (
                 held_assembly_gb + BOR_STREAM_TILE_BUDGET_GB
             )
@@ -1185,7 +1199,7 @@ def estimate_bor_resources(
                 worker_count, mode_cap, combined_stream_mode_gb(mode_cap, stream_specs),
                 exact=False,
                 surely_short=(mode_cap + 1) * combined_stream_mode_gb(mode_cap, always_built)
-                > stream_budget)
+                > stream_budget, surface_layout=surface_layout)
             full_far_gb = full_far_double / (2.0 if use_single else 1.0)
             persistent_gb = (
                 full_far_gb + auxiliary_estimate["retained_gb"]
@@ -1224,7 +1238,7 @@ def estimate_bor_resources(
     # as the executor does, so preview charges process workers only if used.
     worker_plan = plan_bor_mode_workers(unknowns, 2 * int(aspects.size),
         effective_workers, mode_cap + 1, assembly_peak_gb + output_gb,
-        near_pairs=max(pair_counts.values(), default=0))
+        near_pairs=max(pair_counts.values(), default=0), preparation_workers=worker_count)
     active_modes = worker_plan['workers']
     near_plan = worker_plan['near_preparation']
     peak_gb = worker_plan['estimated_peak_gb']
@@ -1682,7 +1696,7 @@ def _layout_storage(surface_layout, mode_cap, pair_counts=None, kinds=None, gaus
 
 def _mirror_stream_spill(plan, requested_workers: 'int', mode_cap: 'int',
                          per_mode_gb: 'float', exact: 'bool' = True,
-                         surely_short: 'bool' = True):
+                         surely_short: 'bool' = True, surface_layout=None):
     """A streamed ``(mode block, held GB, workers)`` plan after the spill decision.
 
     Every streamed BoR solve applies ``plan_stream_spill`` to its plan: when
@@ -1704,6 +1718,10 @@ def _mirror_stream_spill(plan, requested_workers: 'int', mode_cap: 'int',
     """
     from ghost_backend.bor.streaming import plan_stream_spill, stream_spill_candidate_gb
     mode_block, held_gb, workers = plan
+    from ghost_backend.bor.compressed_far import far_compression_selected
+    if surface_layout and any(far_compression_selected(int(elements) + 1)
+                              for elements, _ in surface_layout):
+        return mode_block, held_gb, workers, 0.0, 0.0, None
     mode_count = int(mode_cap) + 1
     candidate = stream_spill_candidate_gb(mode_block, mode_count, per_mode_gb)
     base, spilled_block, resident_gb = plan_stream_spill(mode_block, mode_count, per_mode_gb)
@@ -1877,17 +1895,13 @@ def solve_monostatic_rcs_bor(
         workers = max(1, (os.cpu_count() or 2) - 1)
 
     _reject_unsupported_bor_ibc_interfaces(geometry_snapshot)
-    preflight = validate_geometry_snapshot_for_solver(
-        geometry_snapshot,
-        base_dir=base_dir,
-        meters_scale=scale,
-    )
-
-    materials = MaterialLibrary.from_entries(
-        geometry_snapshot.get("ibcs", []) or [],
-        geometry_snapshot.get("dielectrics", []) or [],
-        base_dir=base_dir,
-    )
+    base_dir, preflight, prepared_materials, scale = prepare_geometry(
+        geometry_snapshot, base_dir, geometry_units)
+    # Parsed models are immutable for this run. Notices belong to this solve:
+    # sharing the library's warning lists would contaminate later frequencies
+    # and the fine certification pass with earlier numerical warnings.
+    materials = MaterialLibrary(prepared_materials.impedance_models,
+                                prepared_materials.dielectric_models)
 
 
     mesh_control_frequencies = set(frequencies)

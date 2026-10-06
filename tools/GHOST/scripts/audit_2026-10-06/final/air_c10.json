@@ -1,0 +1,90 @@
+{
+ "case": "air_c10",
+ "spec": {
+  "kind": "2d",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\airfoil.geo",
+  "units": "inches",
+  "ghz": 10.0,
+  "set": "full"
+ },
+ "import_seconds": 0.2196923000010429,
+ "wall": 20.717936400003964,
+ "stage_seconds": {
+  "operators": 5.456110599996464,
+  "condition_scaling": 0.709020900001633,
+  "factorization": 7.856221999994887,
+  "condition_estimation": 1.5940342000103556,
+  "excitation": 0.30976349999400554,
+  "rhs_solve": 1.078410799993435,
+  "linear_solve": 1.3646019999941927,
+  "rhs_compression": 2.1977956000046106,
+  "far_field": 0.032597199991869275,
+  "mesh_certification": 0.002423499994620215
+ },
+ "backend": "dense",
+ "planning_seconds": 0.40863050000189105,
+ "adaptive_used": true,
+ "adaptive_fallback": false,
+ "steps": [
+  {
+   "polynomial_degree": 2,
+   "panels": 2472,
+   "nodes": 4950,
+   "seconds": 9.241809099999955,
+   "backend": "dense"
+  },
+  {
+   "polynomial_degree": 3,
+   "panels": 2472,
+   "nodes": 7422,
+   "seconds": 10.922138800000539,
+   "backend": "dense"
+  }
+ ],
+ "panel_count": 2472,
+ "nodes": 7422,
+ "degree": 3,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": true,
+ "warnings": [
+  "Geometry contains 4 high-degree node(s) (>2 connected primitives)."
+ ],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 7526,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 2.4361547000007704
+  },
+  {
+   "label": null,
+   "unknowns": 7526,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 2.4176619999925606
+  },
+  {
+   "label": null,
+   "unknowns": 11284,
+   "factor_variant": "hodlr",
+   "condition_est": null,
+   "factor_work_seconds": 3.8402649000054225
+  },
+  {
+   "label": null,
+   "unknowns": 11284,
+   "factor_variant": "hodlr",
+   "condition_est": null,
+   "factor_work_seconds": 3.6299500999957672
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

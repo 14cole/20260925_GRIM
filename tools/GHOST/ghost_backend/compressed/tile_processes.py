@@ -11,16 +11,49 @@ import multiprocessing as mp
 import os
 import pickle
 import sys
+import time
 
 MIB = 1024**2
-# Interpreter, libraries, kernel tables and one tile's assembly workspace.
-WORKER_BYTES = 384*MIB
+# Interpreter, libraries, CPU-owned kernel tables and up to two reciprocal
+# tile destinations (the extra 32 MiB is retained in all worker forecasts).
+WORKER_BASE_BYTES = 416*MIB
+# One bounded cache per process, retained across compatible mesh generations.
+# Both process admission and retained-worker forecasts use WORKER_BYTES.
+WORKER_MOMENT_BYTES = 64*MIB
+WORKER_BYTES = WORKER_BASE_BYTES + WORKER_MOMENT_BYTES
 MAX_WORKERS = 8
 # Smaller operators finish before worker start-up would pay for itself.
 MIN_TILES = 256
 COUNTERS = ('calls', 'entries', 'dropped_routes')
 
 _WORKER = None
+_MOMENTS = None
+
+
+class TileCounters(list):
+    """Existing per-source counters plus one report for the shared traversal."""
+    moment_cache = None
+    component_seconds = None
+
+
+def _moment_cache():
+    global _MOMENTS
+    if _MOMENTS is None:
+        from ghost_backend.twod.polynomial_quadrature import MomentCache
+
+        class WorkerMomentCache(MomentCache):
+            # _tile always installs a CPUState, which already owns/prices tables.
+            TABLE_BUDGET = 0
+
+            def put(self, key, value):
+                if key in self.values or self.ENTRY_BYTES > self.budget:
+                    return
+                # Batch results are views: retaining one must not pin an entire
+                # quadrature batch after the other entries have been evicted.
+                super().put(key, value.copy())
+
+        _MOMENTS = WorkerMomentCache(WORKER_MOMENT_BYTES)
+    return _MOMENTS
 
 
 @contextmanager
@@ -93,22 +126,41 @@ def _initialize(payload):
     limits = threadpool_limits(1)
     far.SPLIT_WORKERS = 1
     _WORKER = oracle, compressors, options, CPUState(), limits
+    _moment_cache()
 
 
 def _tile(task):
     from ghost_backend.execution.cpu import _STATE
     from ghost_backend.execution.options import execution_scope
-    i, j, missing = task
+    from ghost_backend.twod.polynomial_quadrature import _MOMENT_CACHE
+    # Old single-tile calls remain valid for internal diagnostics.
+    legacy=bool(task and isinstance(task[0],int))
+    if legacy:task=(task,)
     oracle, compressors, options, state, _ = _WORKER
     groups = compressors[0].groups
     sources = _sources(oracle)
     before = [[getattr(o, name) for name in COUNTERS] for o in sources]
-    with execution_scope(options, assembly_threads=1), _STATE.override(state):
-        from ghost_backend.compressed.operator import tile_values
-        values = tile_values(oracle, groups[i], groups[j], missing)
-    counters = [([getattr(o, name)-old for name, old in zip(COUNTERS, previous)], o.max_entries)
-                for o, previous in zip(sources, before)]
-    return {index: compressors[index].compress_tile(i,j,*value) for index,value in values.items()}, counters
+    moments = _moment_cache()
+    moment_before = moments.hits, moments.stores, moments.evictions
+    started=time.perf_counter()
+    from ghost_backend.twod.assembly.profiling import profile_scope
+    with execution_scope(options, assembly_threads=1), _STATE.override(state), _MOMENT_CACHE.override(moments), profile_scope() as profile:
+        from ghost_backend.compressed.operator import tile_batch_values
+        values = tile_batch_values(oracle, groups, task)
+    coefficient_seconds=time.perf_counter()-started
+    started=time.perf_counter()
+    compressed={(i,j):{index:compressors[index].compress_tile(i,j,*value)
+                       for index,value in batch.items()}
+                for (i,j,_),batch in zip(task,values)}
+    compression_seconds=time.perf_counter()-started
+    counters = TileCounters(([getattr(o, name)-old for name, old in zip(COUNTERS, previous)], o.max_entries)
+                            for o, previous in zip(sources, before))
+    counters.moment_cache = dict(pid=os.getpid(), hits=moments.hits-moment_before[0],
+        stores=moments.stores-moment_before[1], evictions=moments.evictions-moment_before[2],
+        retained_bytes=len(moments.values)*moments.ENTRY_BYTES)
+    counters.component_seconds=dict(coefficients=coefficient_seconds,compression=compression_seconds)
+    counters.component_seconds.update(profile.seconds)
+    return (compressed[task[0][:2]] if legacy else compressed),counters
 
 
 def compressed_tiles(oracle, operators, workers, payload, checkpoint):
@@ -122,13 +174,25 @@ def compressed_tiles(oracle, operators, workers, payload, checkpoint):
     from ghost_backend.execution.runtime import single_thread_worker_environment
     groups = operators[0].groups
     def tiles():
-        return ((i, j, [index for index,op in enumerate(operators) if (i,j) not in op.pilot_tiles])
-                for j in range(len(groups)) for i in range(len(groups)))
+        from ghost_backend.compressed.operator import assembly_tasks
+        return assembly_tasks(oracle,operators)
     remaining = iter(tiles())
     sources = _sources(oracle)
     done = 0
     pending = deque()
     window = max(1, 2*int(workers))
+    moment_evidence = dict(hits=0, stores=0, evictions=0, workers=int(workers),
+        budget_bytes_per_worker=WORKER_MOMENT_BYTES,
+        accounted_retained_bytes=0, peak_accounted_retained_bytes=0,
+        scope='shared tile traversal; paired polarizations report the same counters')
+    retained_moments = {}
+    components=dict(worker_coefficients_seconds=0.,worker_compression_seconds=0.,
+        worker_prepare_seconds=0.,parent_wait_seconds=0.,
+        semantics='worker elapsed sums, parallel work may overlap; parent wait includes computation and IPC',
+        scope='shared tile traversal; paired polarizations report the same counters')
+    for operator in operators:
+        operator.worker_moment_cache = moment_evidence
+        operator.assembly_components = components
     from ghost_backend.compressed.worker_pool import acquire, run_tile
     owner = acquire(workers)
     path = owner.prepare(payload) if owner is not None else None
@@ -145,7 +209,7 @@ def compressed_tiles(oracle, operators, workers, payload, checkpoint):
                     break
                 checkpoint()
                 from concurrent.futures import Future
-                if task[2]:
+                if any(query[2] for query in task):
                     future = executor.submit(run_tile,path,task) if owner is not None else executor.submit(_tile,task)
                 else:
                     future = Future();future.set_result(({}, [([0]*len(COUNTERS),o.max_entries) for o in sources]))
@@ -155,21 +219,38 @@ def compressed_tiles(oracle, operators, workers, payload, checkpoint):
         while pending:
             checkpoint()
             future,task = pending[0]
+            wait_started=time.perf_counter()
             while True:
                 try:
                     compressed, counters = future.result(timeout=.1)
                     break
                 except TimeoutError:
                     checkpoint()
+            components['parent_wait_seconds']+=time.perf_counter()-wait_started
             pending.popleft()
+            timings=getattr(counters,'component_seconds',None)
+            if timings:
+                for name,value in timings.items():
+                    key='worker_'+name+'_seconds'
+                    components[key]=components.get(key,0.)+value
             for source, (deltas, largest) in zip(sources, counters):
                 for name, delta in zip(COUNTERS, deltas):
                     setattr(source, name, getattr(source, name)+delta)
                 source.max_entries = max(source.max_entries, largest)
+            moments = getattr(counters, 'moment_cache', None)
+            if moments is not None:
+                for name in ('hits', 'stores', 'evictions'):
+                    moment_evidence[name] += moments[name]
+                retained_moments[moments['pid']] = moments['retained_bytes']
+                moment_evidence['accounted_retained_bytes'] = sum(retained_moments.values())
+                moment_evidence['peak_accounted_retained_bytes'] = max(
+                    moment_evidence['peak_accounted_retained_bytes'], sum(retained_moments.values()))
             done += 1
             from ghost_backend.compressed.operator import take_pilot
-            yield [compressed[index] if index in compressed else take_pilot(op,*task[:2])
-                   for index,op in enumerate(operators)]
+            for i,j,_ in task:
+                batch=compressed.get((i,j),{})
+                yield [batch[index] if index in batch else take_pilot(op,i,j)
+                       for index,op in enumerate(operators)]
             # The consumer has stored/released the preceding result before
             # another job enters the window. Futures cannot retain the full
             # operator behind a slow early tile.
@@ -191,9 +272,10 @@ def compressed_tiles(oracle, operators, workers, payload, checkpoint):
                     process.terminate()
             executor.shutdown(wait=True, cancel_futures=True)
     from itertools import islice
-    for i, j, missing in islice(tiles(), done, None):
+    for task in islice(tiles(), done, None):
         checkpoint()
-        from ghost_backend.compressed.operator import tile_values, take_pilot
-        values = tile_values(oracle,groups[i],groups[j],missing) if missing else {}
-        yield [op.compress_tile(i,j,*values[index]) if index in values else take_pilot(op,i,j)
-               for index,op in enumerate(operators)]
+        from ghost_backend.compressed.operator import tile_batch_values,take_pilot
+        values=tile_batch_values(oracle,groups,task)
+        for (i,j,_),batch in zip(task,values):
+            yield [op.compress_tile(i,j,*batch[index]) if index in batch else take_pilot(op,i,j)
+                   for index,op in enumerate(operators)]

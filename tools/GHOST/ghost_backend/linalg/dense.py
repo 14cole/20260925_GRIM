@@ -1,13 +1,29 @@
 """Reusable CPU factorization with bounded solves and shared residual evidence."""
 import numpy as np
+import time
+from functools import wraps
 from ghost_backend.execution.metrics import timed_stage
 from ghost_backend.linalg.workspace import matrix_inf_norm, first_nonfinite, checked_row_norms
 from ghost_backend.linalg.refined_lu import requested_precision
 
 
+def _timed_factor_work(function):
+    @wraps(function)
+    def call(self,*args,**kwargs):
+        started=time.perf_counter()
+        try:return function(self,*args,**kwargs)
+        except BaseException:
+            self.event['factor_work_failed']=True
+            raise
+        finally:
+            self._record_factor_work(time.perf_counter()-started)
+    return call
+
+
 class DenseFactor:
     def __init__(self, matrix, diagnostics=None, label='dense system', evidence=None,
                  checkpoint=None, force_double=False, coordinates=None, owned_matrix=False):
+        started=time.perf_counter()
         import ghost_backend.twod.solver as rcs
         self.a = np.asarray(matrix, dtype=np.complex128)
         self.diagnostics, self.label = diagnostics, label
@@ -81,6 +97,13 @@ class DenseFactor:
             except BaseException:
                 self.close()
                 raise
+        self._record_factor_work(time.perf_counter()-started)
+
+    def _record_factor_work(self,seconds):
+        self.event['factor_work_seconds']=self.event.get('factor_work_seconds',0.)+seconds
+        self.event['factor_variant']='hodlr' if self.hierarchical is not None else 'mixed_lu' if self.mixed is not None else 'lu'
+        self.event['factor_rebuilds']=max(0,self.event['factorizations']-1)
+        self.event['factor_fallback']=bool(self.fallback_reason)
 
     def _sync_hierarchical_builds(self):
         if self.hierarchical is not None:
@@ -213,6 +236,7 @@ class DenseFactor:
                 (self.lu, self.piv), b, check_finite=False)
         return (x, None) if return_residual else x
 
+    @_timed_factor_work
     @timed_stage('linear_solve')
     def solve(self, rhs):
         import ghost_backend.twod.solver as rcs

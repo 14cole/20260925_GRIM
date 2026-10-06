@@ -33,8 +33,11 @@ class BorOptionsWidget(QGroupBox):
         self.storage.setToolTip('Combined numeric operator and inverse storage across active modes, shared by the concurrently factored modes. Automatic sizes it from the solve memory limit. Workspaces and near quadrature require additional RAM.')
         form.addRow('Compressed storage cap',self.storage)
         self.tile=QSpinBox()
-        self.tile.setRange(8,128)
-        self.tile.setValue(32)
+        # The out-of-domain minimum is only a UI sentinel; profiles store
+        # the string 'auto', preserving all existing integer8..128 settings.
+        self.tile.setRange(7,128)
+        self.tile.setSpecialValueText('Automatic')
+        self.tile.setValue(7)
         form.addRow('Compression tile size',self.tile)
         self.cache=QSpinBox()
         self.cache.setRange(0,4096)
@@ -60,7 +63,7 @@ class BorOptionsWidget(QGroupBox):
         self.batch.setValue(value['angle_batch_size'])
         self.reuse.setCurrentIndex(self.reuse.findData(value['rhs_compression']))
         self.storage.setValue(value['compressed_storage_mib'])
-        self.tile.setValue(value['compression_tile'])
+        self.tile.setValue(7 if value['compression_tile'] == 'auto' else value['compression_tile'])
         self.cache.setValue(value['tile_cache_mib'])
         self.quadrature.setCurrentIndex(self.quadrature.findData(value['quadrature_check']))
         self._extra_options = {key:value[key] for key in ('near_backend','stream_spill','far_compression','near_refinement')}
@@ -69,5 +72,6 @@ class BorOptionsWidget(QGroupBox):
     def value(self):
         return validate_options(dict(getattr(self, '_extra_options', {}), factorization=self.factorization.currentData(),
             angle_batch_size=self.batch.value(),rhs_compression=self.reuse.currentData(),
-            compressed_storage_mib=self.storage.value(),compression_tile=self.tile.value(),
+            compressed_storage_mib=self.storage.value(),
+            compression_tile='auto' if self.tile.value() == 7 else self.tile.value(),
             tile_cache_mib=self.cache.value(),quadrature_check=self.quadrature.currentData()))

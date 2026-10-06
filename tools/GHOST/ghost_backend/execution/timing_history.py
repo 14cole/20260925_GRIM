@@ -30,15 +30,29 @@ NEARBY_WIN_MARGIN=.20
 
 class RequestKey(str):
     """Backward-compatible exact digest carrying optional interpolation inputs."""
-    def __new__(cls, value, nearby=None, stage=None):
+    def __new__(cls, value, nearby=None, stage=None, factor=None):
         result=str.__new__(cls,value)
         result.nearby=nearby
         result.stage=stage
+        result.factor=factor
         return result
 
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,allow_nan=False).encode()).hexdigest()
+
+
+def with_factor_choices(key, choices):
+    """Do not mix whole-run timings before and after a learned factor change."""
+    if not choices:
+        return key
+    signature = sorted((int(n), variant) for n, variant in choices.items())
+    def scoped(descriptor):
+        if descriptor is None:
+            return None
+        return dict(descriptor, family=_digest((descriptor['family'], signature)))
+    return RequestKey(_digest((str(key), signature)), scoped(key.nearby),
+                      scoped(key.stage), key.factor)
 
 
 def _nearby_descriptor(payload,options,arguments):
@@ -59,7 +73,7 @@ def _nearby_descriptor(payload,options,arguments):
             family['elevations_deg']=dict(uniform_span=[angles[0],angles[-1]])
     family['reservation']=(options.get('ram_budget_gib'),allocated_memory_budget(),allocated_cpu_budget())
     family['runtime_overrides']={name:value for name,value in os.environ.items()
-                                 if name.startswith('GHOST_') and name!='GHOST_TIMING_CACHE_DIR'}
+                                 if name.startswith('GHOST_') and name not in ('GHOST_TIMING_CACHE_DIR','GHOST_CPU_FACTORIZATION')}
     batch=max(1,int(options.get('angle_batch_size',256)))
     family['angle_work_regime']=((len(angles)+batch-1)//batch,len(angles)>=32)
     return dict(family=_digest(family),frequency_ghz=float(frequencies[0]),angle_count=len(angles))
@@ -100,9 +114,12 @@ def request_key(arguments,options,name):
                      platform.python_version(),np.__version__,scipy.__version__,effective_assembly_threads())
     payload['source']=source_bundle_fingerprint(backend_source_records(str(Path(__file__).resolve().parents[1])))
     payload['entrypoint']=name
+    payload['runtime_overrides']={key:value for key,value in os.environ.items()
+        if key.startswith('GHOST_') and key not in ('GHOST_TIMING_CACHE_DIR','GHOST_CPU_FACTORIZATION')}
     nearby=_nearby_descriptor(payload,options,arguments)
     stage=dict(nearby,options=dict(options)) if nearby else None
-    return RequestKey(_digest(payload),nearby,stage)
+    from ghost_backend.execution.factor_timing import descriptor
+    return RequestKey(_digest(payload),nearby,stage,descriptor(payload,options))
 
 
 def read():
@@ -130,8 +147,9 @@ def _samples(entry):
     return result
 
 
-def measured_costs(key):
-    return {mode:statistics.median(values) for mode,values in _samples(read().get(key,{})).items()
+def measured_costs(key,entries=None):
+    entries=read() if entries is None else entries
+    return {mode:statistics.median(values) for mode,values in _samples(entries.get(key,{})).items()
             if len(values)>=2}
 
 
@@ -148,7 +166,7 @@ def _same_dof_regime(left,right):
             automatic_hierarchical(left)==automatic_hierarchical(right))
 
 
-def _nearby_costs(key,selection):
+def _nearby_costs(key,selection,entries=None):
     target=getattr(key,'nearby',None)
     meshes=selection.get('meshes',[])
     if not target or not meshes:return {},None
@@ -157,7 +175,8 @@ def _nearby_costs(key,selection):
     # One paired workload supplies both timings; never compare unrelated
     # one-backend runs or pool distant requests to manufacture a crossover.
     matches=[]
-    for digest,entry in read().items():
+    entries=read() if entries is None else entries
+    for digest,entry in entries.items():
         if not isinstance(entry,dict):continue
         source=entry.get('_nearby')
         if not isinstance(source,dict) or source.get('family')!=target['family']:continue
@@ -196,17 +215,20 @@ def _nearby_costs(key,selection):
     return medians,dict(evidence,source_request=digest)
 
 
-def adjust(selection,key,batch=False):
+def adjust(selection,key,batch=False,entries=None):
     candidates=selection.get('candidates',{})
-    measured={m:t for m,t in measured_costs(key).items() if m in candidates}
+    # One decision uses one bounded snapshot, even if another process writes
+    # timing evidence while exact, nearby and stage matches are considered.
+    entries=read() if entries is None else entries
+    measured={m:t for m,t in measured_costs(key,entries).items() if m in candidates}
     nearby=None
     if len(measured)<2:
-        measured,nearby=_nearby_costs(key,selection)
+        measured,nearby=_nearby_costs(key,selection,entries)
         measured={m:t for m,t in measured.items() if m in candidates}
     stages=None
     if len(measured)<2:
         from ghost_backend.execution.stage_timing import predict
-        measured,stages=predict(key,selection,read(),MAX_AGE)
+        measured,stages=predict(key,selection,entries,MAX_AGE)
     if len(measured)<2:return selection
     ratios=[t/candidates[m]['cost'] for m,t in measured.items()]
     scale=statistics.median(ratios)
@@ -232,7 +254,10 @@ def _clean_success(metadata,mode):
     if (selection.get('failed_attempts') or selection.get('selected',mode)!=mode or
         metadata.get('dense_fallback_reasons')):return False
     adaptation=metadata.get('adaptive_mesh',{})
-    if (adaptation.get('fallback') or any(step.get('failed_backends') or step.get('backend')!=mode
+    if any(event.get('fallback') for event in adaptation.get('polynomial_pair',[])
+           if isinstance(event,dict)):return False
+    if (adaptation.get('fallback') or adaptation.get('conservative_retry')
+        or any(step.get('failed_backends') or step.get('backend')!=mode
                                         for step in adaptation.get('steps',[]))):return False
     if any(event.get('coarse_rejection') or event.get('compact_preconditioner') or
            event.get('frequency_preconditioner',{}).get('reused')
@@ -241,6 +266,9 @@ def _clean_success(metadata,mode):
     if isinstance(hierarchical,dict):hierarchical=[event for rows in hierarchical.values() for event in rows]
     if any(event.get('coarse_rejection') or event.get('builds',1)>1 or event.get('tighter_rebuilds')
            for event in hierarchical):return False
+    if any(event.get('factor_work_failed') or event.get('factor_fallback') or event.get('factor_rebuilds')
+           for event in metadata.get('experimental_cpu',{}).get('systems',[])
+           if isinstance(event,dict)):return False
     children=list(metadata.get('channel_metadata',{}).values())
     children.extend(row.get('metadata',{}) for row in metadata.get('frequency_metadata',[]))
     return all(_clean_success(child,mode) for child in children)
@@ -267,6 +295,12 @@ def record(key,mode,seconds,metadata):
             entry['_nearby']=dict(descriptor,unknowns=sizes,sample_counts=counts)
         rows=entry.get(mode,[])
         entry[mode]=(rows[-4:] if isinstance(rows,list) else [])+[[time.time(),seconds]]
+        if mode=='dense':
+            from ghost_backend.execution.factor_timing import observation as factor_observation
+            factor_sample=factor_observation(key,metadata)
+            if factor_sample is not None:
+                previous=entry.get('_factorizations',[])
+                entry['_factorizations']=(previous[-4:] if isinstance(previous,list) else [])+[factor_sample]
         from ghost_backend.execution.stage_timing import observation
         sample=observation(key,mode,seconds,metadata)
         if sample is not None:

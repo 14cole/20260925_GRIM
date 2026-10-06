@@ -349,10 +349,10 @@ def _native_trig_moments(rows, xi, count, want_sin):
     return cosine, sine
 
 
-def _numpy_trig_moments(rows, xi, count, want_cos=True, want_sin=False):
+def _numpy_trig_moments(rows, xi, count, want_cos=True, want_sin=False, start_order=0):
     """NumPy form of the moment kernels (trigonometric tables in blocks)."""
     n, r, _ = rows.shape
-    orders = np.arange(int(count))
+    orders = np.arange(int(start_order), int(start_order) + int(count))
     cosine = np.empty((n, r, len(orders))) if want_cos else None
     sine = np.empty((n, r, len(orders))) if want_sin else None
     for start in range(0, len(orders), 32):
@@ -437,6 +437,17 @@ FAR_TABLE_CACHE_BYTES = 64_000_000
 _FAR_TABLES = OrderedDict()
 _FAR_TABLE_BYTES = [0]
 _FAR_TABLE_LOCK = threading.Lock()
+# Each tile thread keeps references to the few tables it uses, so the shared
+# store's lock (taken once per pair group per tile: 8-12% of the far build's
+# thread time at eight threads) is only reached on a miss.
+_FAR_TABLE_LOCAL = threading.local()
+_FAR_TABLE_LOCAL_ENTRIES = 16
+
+
+def _remember_local_table(local, key, entry):
+    if len(local) >= _FAR_TABLE_LOCAL_ENTRIES:
+        local.clear()
+    local[key] = entry
 
 
 def _far_sample_counts(bracket, rp, rq, gap, k, top_order, pts_per_peak=8.0):
@@ -524,11 +535,19 @@ def _half_grid_tables(size, modes, want_sine, projection='complex'):
     shared across threads; the cache is bounded by FAR_TABLE_CACHE_BYTES.
     """
     key = (int(size), modes.tobytes(), bool(want_sine), projection)
+    local = getattr(_FAR_TABLE_LOCAL, 'tables', None)
+    if local is None:
+        local = _FAR_TABLE_LOCAL.tables = {}
+    entry = local.get(key)
+    if entry is not None:
+        return entry
     with _FAR_TABLE_LOCK:
         entry = _FAR_TABLES.get(key)
         if entry is not None:
             _FAR_TABLES.move_to_end(key)
-            return entry
+    if entry is not None:
+        _remember_local_table(local, key, entry)
+        return entry
     size = int(size)
     half = size // 2 + 1
     xi = 2 * np.pi * np.arange(half) / size - np.pi
@@ -562,6 +581,9 @@ def _half_grid_tables(size, modes, want_sine, projection='complex'):
                 while _FAR_TABLE_BYTES[0] > FAR_TABLE_CACHE_BYTES and len(_FAR_TABLES) > 1:
                     _, old = _FAR_TABLES.popitem(last=False)
                     _FAR_TABLE_BYTES[0] -= sum(v.nbytes for v in old if v is not None)
+            else:
+                entry = _FAR_TABLES[key]
+        _remember_local_table(local, key, entry)
     return entry
 
 
@@ -1604,11 +1626,13 @@ def _near_nodes(layout, orders, delta):
     return xi, w_all
 
 
-def _green_node_moments(points, k, xi, w, count):
+def _green_node_moments(points, k, xi, w, count, start_order=0):
     """Cosine moments [n, 2, count] of Re/Im(w g) on explicit nodes
     (sampler + projection: the reference of ``near_green_rule``)."""
     gw = _green_samples(*points, k, xi) * w
     rows = np.ascontiguousarray(np.stack([gw.real, gw.imag], axis=1))
+    if start_order:
+        return _numpy_trig_moments(rows, xi, count, True, False, start_order)[0]
     native = _native_trig_moments(rows, xi, count, False)
     if native is not None:
         return native[0]
@@ -1616,7 +1640,7 @@ def _green_node_moments(points, k, xi, w, count):
     return _numpy_trig_moments(rows, xi, count, True, False)[0]
 
 
-def _bracket_node_moments(kind, stable, points, k, xi, w, count):
+def _bracket_node_moments(kind, stable, points, k, xi, w, count, start_order=0):
     """Parity moments (cos [n, 4, count], sin [n, 4, count]) of the weighted
     brackets on explicit nodes (sampler + ``_parity_moments``: the reference
     of ``near_brackets_rule``)."""
@@ -1640,10 +1664,13 @@ def _bracket_node_moments(kind, stable, points, k, xi, w, count):
     weighted = [2 * value * w for value in samples]
     even = np.stack([weighted[0].real, weighted[3].real, weighted[0].imag, weighted[3].imag], axis=1)
     odd = np.stack([weighted[1].real, weighted[2].real, weighted[1].imag, weighted[2].imag], axis=1)
+    if start_order:
+        return (_numpy_trig_moments(even, xi, count, True, False, start_order)[0],
+                _numpy_trig_moments(odd, xi, count, False, True, start_order)[1])
     return _parity_moments(even, odd, xi, count)
 
 
-def _near_rule_moments(kind, stable, points, delta, k, layout, orders, count):
+def _near_rule_moments(kind, stable, points, delta, k, layout, orders, count, start_order=0):
     """Moments of one group level: [n, 2, count] (Green's function) or the
     parity pair (cos, sin) [n, 4, count] (brackets).  One native call per
     group (``near_green_rule`` / ``near_brackets_rule``) when available, else
@@ -1651,7 +1678,7 @@ def _near_rule_moments(kind, stable, points, delta, k, layout, orders, count):
     n = len(delta)
     wavenumber = complex(k)
     native = _native_entry('near_green_rule' if kind == 'g' else 'near_brackets_rule')
-    if native is not None:
+    if native is not None and not start_order:
         s_core, n_core, xi_shared, w_shared = _near_rule_parts(layout, orders)
         u, wu = _unit_gauss(n_core) if n_core else (xi_shared, w_shared)
         arrays = [np.ascontiguousarray(v, dtype=float) for v in points]
@@ -1670,8 +1697,8 @@ def _near_rule_moments(kind, stable, points, delta, k, layout, orders, count):
         return cosines, sines
     xi, w = _near_nodes(layout, orders, delta)
     if kind == 'g':
-        return _green_node_moments(points, k, xi, w, count)
-    return _bracket_node_moments(kind, stable, points, k, xi, w, count)
+        return _green_node_moments(points, k, xi, w, count, start_order)
+    return _bracket_node_moments(kind, stable, points, k, xi, w, count, start_order)
 
 
 def _near_layout(d, a, on_axis, kabs, top, order_floor, tail_floor):
@@ -1724,7 +1751,8 @@ def _near_layout(d, a, on_axis, kabs, top, order_floor, tail_floor):
     return J, orders
 
 
-def _graded_near_kernels(kind, args, k, m_max, order_floor=0, tail_floor=0, signed=True):
+def _graded_near_kernels(kind, args, k, m_max, order_floor=0, tail_floor=0, signed=True,
+                         mode_start=0):
     """Checked graded near rule of the Green's function (kind 'g') or the
     MFIE/IBC brackets.
 
@@ -1751,8 +1779,11 @@ def _graded_near_kernels(kind, args, k, m_max, order_floor=0, tail_floor=0, sign
     q = 4 if bracket else 2
     rp, zp, rq, zq = arrays[0], arrays[1], arrays[q], arrays[q + 1]
     n = len(rp)
-    count = m_max + 1 if bracket else m_max + 2
-    top = count - 1
+    mode_start = int(mode_start)
+    if mode_start < 0 or mode_start > int(m_max) or (bracket and signed and mode_start):
+        raise ValueError('A near modal band requires nonnegative orders within the cap.')
+    top = m_max if bracket else m_max + 1
+    count = top + 1 - mode_start
     if bracket:
         out = (np.zeros((n, 4, count)), np.zeros((n, 4, count)))
     else:
@@ -1767,7 +1798,8 @@ def _graded_near_kernels(kind, args, k, m_max, order_floor=0, tail_floor=0, sign
             # R = d for every angle: only G_0 is nonzero.
             R0 = np.hypot(rp[on_axis] - rq[on_axis], zp[on_axis] - zq[on_axis])
             g0 = np.exp(-1j * complex(k) * R0) / (4.0 * np.pi * np.maximum(R0, 1e-300))
-            out[on_axis, 0] = 2.0 * np.pi * g0
+            if mode_start == 0:
+                out[on_axis, 0] = 2.0 * np.pi * g0
             todo &= ~on_axis
         stable = np.zeros(n, dtype=bool)
         if bracket:
@@ -1782,23 +1814,62 @@ def _graded_near_kernels(kind, args, k, m_max, order_floor=0, tail_floor=0, sign
             fine = np.ceil(orders * NEAR_LEVEL_GROWTH).astype(np.int64)
             if int(fine.max()) > NEAR_ANGULAR_MAX_ORDER:
                 raise ValueError("BoR near angular quadrature exceeds its accuracy limit; refine the mesh or reduce modal bandwidth.")
-            keys = np.column_stack([J, stable[index].astype(np.int64), orders])
-            _, group, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
-            inverse = np.asarray(inverse).ravel()
-            order = np.argsort(inverse, kind='stable')
-            bounds = np.searchsorted(inverse[order], np.arange(len(group) + 1))
+            order, bounds = _layout_groups(np.column_stack([J + 1, stable[index].astype(np.int64), orders]))
             delta = d / np.where(a > 0, a, 1.0)
-            for g in range(len(group)):
-                members = index[order[bounds[g]:bounds[g + 1]]]
-                first = int(group[g])
+            for g in range(len(bounds) - 1):
+                local = order[bounds[g]:bounds[g + 1]]
+                members = index[local]
+                first = int(local[0])
                 layout = int(J[first])
                 base = orders[first, :layout + 2] if layout >= 0 else orders[first, :1]
                 _run_near_group(kind, arrays, k, count, members, layout, base,
-                                bool(stable[index[first]]), delta, out)
+                                bool(stable[index[first]]), delta, out, mode_start)
     if not bracket:
         return out
-    m = np.arange(-m_max, m_max + 1) if signed else np.arange(0, m_max + 1)
+    if mode_start or not signed:
+        # Nonnegative orders only: the parity moments are the outputs themselves
+        # (tt/ff = C[m], tf/ft = -j S[m], the m = 0 sine moments vanishing).
+        even = out[0][:, :2] + 1j * out[0][:, 2:]
+        odd = -1j * (out[1][:, :2] + 1j * out[1][:, 2:])
+        if not mode_start:
+            odd[:, :, 0] = 0.0
+        return even[:, 0], odd[:, 0], odd[:, 1], even[:, 1]
+    m = np.arange(-m_max, m_max + 1)
     return tuple(_parity_outputs(out[0], out[1], m))
+
+
+_LAYOUT_KEY_BITS = 13      # orders are at most NEAR_ANGULAR_MAX_ORDER = 4096
+_LAYOUT_KEY_FIELDS = 64 // _LAYOUT_KEY_BITS
+
+
+def _layout_groups(keys):
+    """``(order, bounds)``: point indices sorted by layout key (stable), and the
+    group boundaries in that order, for nonnegative integer key rows below
+    2**_LAYOUT_KEY_BITS.  Rows are packed into a few int64 words and sorted
+    lexicographically, which replaces ``np.unique(axis=0)`` plus a second
+    stable argsort (8% of a serial near preparation) by one sort of the
+    packed words; the groups and their member order are identical."""
+    keys = np.asarray(keys, dtype=np.int64)
+    n, fields = keys.shape
+    words = []
+    for start in range(0, fields, _LAYOUT_KEY_FIELDS):
+        word = np.zeros(n, dtype=np.int64)
+        for column in range(start, min(start + _LAYOUT_KEY_FIELDS, fields)):
+            word = (word << _LAYOUT_KEY_BITS) | keys[:, column]
+        words.append(word)
+    if len(words) == 1:
+        order = np.argsort(words[0], kind='stable')
+    else:
+        order = np.lexsort(words[::-1])
+    change = np.empty(n, dtype=bool)
+    change[0] = True
+    if n > 1:
+        change[1:] = False
+        for word in words:
+            sorted_word = word[order]
+            change[1:] |= sorted_word[1:] != sorted_word[:-1]
+    bounds = np.r_[np.flatnonzero(change), n]
+    return order, bounds
 
 
 def _near_check(kind, fine, coarse):
@@ -1823,18 +1894,29 @@ def _near_check(kind, fine, coarse):
     return error, scale
 
 
-def _run_near_group(kind, arrays, k, count, members, layout, base_orders, stable, delta, out):
-    """Coarse/fine refinement of one layout group (see _graded_near_kernels)."""
+def _run_near_group(kind, arrays, k, count, members, layout, base_orders, stable, delta, out,
+                    start_order=0):
+    """Coarse/fine refinement of one layout group (see _graded_near_kernels).
+
+    A modal band (``start_order > 0``) is evaluated over every order from 0,
+    by the native rule, and sliced when it is stored: the acceptance check
+    then keeps the full-range scale.  Checked against the band's own orders
+    alone, near-axis points never converged (their high orders are rounding
+    noise of the dominant low ones), so the automatic cap-expansion retry
+    raised on closed bodies; the band path was also slower per point than a
+    full native evaluation.
+    """
     bracket = kind != 'g'
     growth = NEAR_LEVEL_GROWTH
     native = _native_entry('near_green_rule' if kind == 'g' else 'near_brackets_rule') is not None
     per_sample = _NEAR_BYTES_PER_SAMPLE['native' if native else 'numpy']
+    full = int(count) + int(start_order)
 
     def evaluate(ids, orders, use_stable):
         # Angular scratch stays within NEAR_KERNEL_WORK_BYTES at every level.
         block = max(1, int(NEAR_KERNEL_WORK_BYTES // (per_sample * max(int(np.sum(orders)), 1))))
         parts = [_near_rule_moments(kind, use_stable, tuple(v[ids[i:i + block]] for v in arrays),
-                                    delta[ids[i:i + block]], k, layout, orders, count)
+                                    delta[ids[i:i + block]], k, layout, orders, full, 0)
                  for i in range(0, len(ids), block)]
         if len(parts) == 1:
             return parts[0]
@@ -1848,14 +1930,17 @@ def _run_near_group(kind, arrays, k, count, members, layout, base_orders, stable
 
     # The coarse and fine moments of a chunk ([n, 2 or 8, count] each) stay
     # within the scratch budget as well.
-    chunk = max(1, int(NEAR_KERNEL_WORK_BYTES // (2 * 8 * (8 if bracket else 2) * count)))
+    chunk = max(1, int(NEAR_KERNEL_WORK_BYTES // (2 * 8 * (8 if bracket else 2) * full)))
     for start in range(0, len(members), chunk):
         _refine_near_chunk(kind, arrays, np.asarray(members[start:start + chunk]), stable,
-                           base_orders, evaluate, next_orders, out)
+                           base_orders, evaluate, next_orders, out, int(start_order))
 
 
-def _refine_near_chunk(kind, arrays, ids, stable, base_orders, evaluate, next_orders, out):
-    """Coarse/fine levels of one chunk of a layout group (_run_near_group)."""
+def _refine_near_chunk(kind, arrays, ids, stable, base_orders, evaluate, next_orders, out, offset=0):
+    """Coarse/fine levels of one chunk of a layout group (_run_near_group).
+
+    ``offset`` is the first order kept: the evaluated moments cover every
+    order from 0 and only ``[offset:]`` is stored."""
     bracket = kind != 'g'
     use_stable = stable
     coarse_orders = np.asarray(base_orders, dtype=np.int64)
@@ -1869,10 +1954,10 @@ def _refine_near_chunk(kind, arrays, ids, stable, base_orders, evaluate, next_or
         converged = np.isfinite(error) & (error <= NEAR_ANGULAR_RTOL * np.maximum(scale, 1e-280))
         accepted = ids[converged]
         if bracket:
-            out[0][accepted] = fine[0][converged]
-            out[1][accepted] = fine[1][converged]
+            out[0][accepted] = fine[0][converged][:, :, offset:]
+            out[1][accepted] = fine[1][converged][:, :, offset:]
         else:
-            out[accepted] = 2.0 * (fine[:, 0][converged] + 1j * fine[:, 1][converged])
+            out[accepted] = 2.0 * (fine[:, 0][converged][:, offset:] + 1j * fine[:, 1][converged][:, offset:])
         if np.all(converged):
             return
         pending = ~converged
@@ -1903,32 +1988,33 @@ def _refine_near_chunk(kind, arrays, ids, stable, base_orders, evaluate, next_or
 
 
 def modal_kernels_near(rho_p, z_p, rho_q, z_q, k, m_max: 'int', order: 'int' = 0,
-                       tail_order: 'int' = 0):
+                       tail_order: 'int' = 0, mode_start: 'int' = 0):
     """G_m, m = 0..m_max+1, at near point pairs by the checked graded rule.
 
     ``order``/``tail_order`` (> 0) are optional lower bounds of the fine
     level's core and tail Gauss orders.  Returns [n_pairs, m_max+2].
     """
-    return _graded_near_kernels('g', (rho_p, z_p, rho_q, z_q), k, m_max, order, tail_order)
+    return _graded_near_kernels('g', (rho_p, z_p, rho_q, z_q), k, m_max, order, tail_order,
+                                mode_start=mode_start)
 
 
 def mfie_kernels_near(rho_p, z_p, tr_p, tz_p, rho_q, z_q, tr_q, tz_q, k,
                       m_max: 'int', order: 'int' = 0, tail_order: 'int' = 0,
-                      signed: 'bool' = True):
+                      signed: 'bool' = True, mode_start: 'int' = 0):
     """Four MFIE modal kernels of near point pairs by the checked graded rule:
     [n_pairs, 2*m_max+1] (m = -m_max..m_max), or [n_pairs, m_max+1]
     (m = 0..m_max) with ``signed=False``."""
     return _graded_near_kernels('mfie', (rho_p, z_p, tr_p, tz_p, rho_q, z_q, tr_q, tz_q),
-                                k, m_max, order, tail_order, signed)
+                                k, m_max, order, tail_order, signed, mode_start)
 
 
 def ibc_kernels_near(rho_p, z_p, tr_p, tz_p, rho_q, z_q, tr_q, tz_q, k,
                      m_max: 'int', order: 'int' = 0, tail_order: 'int' = 0,
-                     signed: 'bool' = True):
+                     signed: 'bool' = True, mode_start: 'int' = 0):
     """Four IBC modal kernels of near point pairs by the checked graded rule
     (layout as ``mfie_kernels_near``)."""
     return _graded_near_kernels('ibc', (rho_p, z_p, tr_p, tz_p, rho_q, z_q, tr_q, tz_q),
-                                k, m_max, order, tail_order, signed)
+                                k, m_max, order, tail_order, signed, mode_start)
 
 
 def gc_gs_from_g(G: 'np.ndarray', m: 'int') -> 'Tuple[np.ndarray, np.ndarray]':

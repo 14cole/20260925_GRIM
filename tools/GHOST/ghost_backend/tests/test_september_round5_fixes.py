@@ -309,11 +309,13 @@ class BorPlanningTests(unittest.TestCase):
                                           bor_options=dict(factorization=factorization))
                         raised[factorization] = caught.exception
                 self.assertNotIsInstance(raised['auto'], ValueError)
-                # Every automatic plan was rejected; the smallest requirement is reported
-                # (on this small body the streamed plan is the larger one) and the other stays visible.
+                # October 2026: a conductor's automatic assembly is the streamed one,
+                # so the single-precision request has exactly one dense plan; its
+                # rejection is the diagnostic (no second plan to report beside it).
                 self.assertEqual(raised['auto'].required_gb, raised['dense'].required_gb)
                 self.assertEqual(raised['auto'].mode_cap, 6)
-                self.assertIn('dense/streaming', str(raised['auto'].__cause__))
+                self.assertTrue(raised['auto'].streaming)
+                self.assertIsNone(raised['auto'].__cause__)
                 self.assertIsNone(raised['dense'].__cause__)
 
     def test_only_admission_rejections_change_the_plan(self):
@@ -590,7 +592,9 @@ class BorSnapshotPlanTests(unittest.TestCase):
     def test_imposed_streaming_reaches_the_snapshot_solvers(self):
         snapshot = dict(segments=[_snapshot_chain('sphere', 2, bor.sphere_generatrix(.05, 10))], ibcs=[], dielectrics=[])
         common = dict(geometry_units='meters', workers=1)
-        tables = dispatch.solve_monostatic_rcs_bor(snapshot, [1.], [0., 60.], bor_options=dict(factorization='dense'), **common)
+        # October 2026: conductors stream by default; tables remain an explicit choice.
+        tables = dispatch.solve_monostatic_rcs_bor(snapshot, [1.], [0., 60.], bor_options=dict(factorization='dense'),
+                                                   assembly='tables', **common)
         self.assertEqual(tables['metadata']['per_frequency'][0]['assembly'], 'tables')
         self.assertNotIn('automatic_assembly', tables)
         # No small body has a natural window (streaming is its larger plan), so

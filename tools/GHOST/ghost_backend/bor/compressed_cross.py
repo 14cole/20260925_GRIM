@@ -74,6 +74,7 @@ class CompressedCrossFarBlocks:
         if np.dtype(dtype) != np.dtype(np.complex128):
             raise ValueError('Verified rectangular compression requires double precision.')
         self.cross, self.sp, self.sq = cross, cross.sp, cross.sq
+        self.families = ('efie', 'ibc') if cross.need_p else ('efie',)
         self.m_max, self.k = int(m_max), complex(cross.k)
         self.Np, self.Nq = self.sp.Nn, self.sq.Nn
         self.go_p, self.go_q = self.sp.gauss_order, self.sq.gauss_order
@@ -88,8 +89,9 @@ class CompressedCrossFarBlocks:
             raise ValueError('Streaming tile budget must be positive and finite.')
         self._work_bytes = min(st.modal_kernels.FFT_BUILD_BUDGET, budget/8)
         rho = max(np.max(self.sp.gen.nodes[:,0]), np.max(self.sq.gen.nodes[:,0]))
-        nx = max(st._n_xi_efie(self.k,rho,self.m_max,cross._far_gap),
-                 st._n_xi_bracket(self.k,rho,self.m_max,cross._far_gap))
+        nx = st._n_xi_efie(self.k,rho,self.m_max,cross._far_gap)
+        if cross.need_p:
+            nx = max(nx, st._n_xi_bracket(self.k,rho,self.m_max,cross._far_gap))
         self._tile_nodes = CROSS_TILE_NODES
 
         def tile_cost(nodes, modes):
@@ -98,7 +100,7 @@ class CompressedCrossFarBlocks:
             # bounded SVD/reconstruction while the sampled band is retained.
             te,fe = min(nodes+1,self.sp.gen.n_elems),min(nodes+1,self.sq.gen.n_elems)
             return (st.BOR_STREAM_TILE_SLACK * st._banded_tile_bytes(
-                te,fe,self.go_p,self.go_q,modes+2,modes,True,True,self._work_bytes,nx)
+                te,fe,self.go_p,self.go_q,modes+2,modes,True,cross.need_p,self._work_bytes,nx)
                 + 16*nodes*nodes*(4*modes+12))
 
         while self._tile_nodes > 1 and tile_cost(self._tile_nodes,1) > budget/2:
@@ -110,9 +112,9 @@ class CompressedCrossFarBlocks:
             min(self.mode_block,self.m_max+1))
         held_modes = self.m_max+1 if spill is not None else self.mode_block
         tiles = math.ceil(self.Np/self._tile_nodes)*math.ceil(self.Nq/self._tile_nodes)
-        # Eight components, three int64 values each. The fixed per-tile
-        # allowance covers two index arrays, dictionary keys and containers.
-        index_upper = tiles*(held_modes*8*24+2048)
+        # Four components per requested family, three int64 values each.
+        # The fixed allowance conservatively covers their keys and containers.
+        index_upper = tiles*(held_modes*4*len(self.families)*24+2048)
         if index_upper+CROSS_STORAGE_CHUNK_BYTES > budget/4:
             raise CrossCompressionBudgetError('Rectangular compression indexes exceed their work allowance.')
         self._index_upper = index_upper
@@ -123,7 +125,7 @@ class CompressedCrossFarBlocks:
         self._arena = []
         self._payload = self._disk_bytes = self.n_sweeps = 0
         self.lo, self.hi = 1, 0
-        self.Z, self.B = _Family('efie'), _Family('ibc')
+        self.Z, self.B = _Family('efie'), _Family('ibc') if cross.need_p else None
         self.evidence = dict(backend='verified_rectangular_tiles', tolerance=FAR_COMPRESSION_TOLERANCE,
                              coefficient_check='all_original_coefficients',
                              max_relative_block_error=0., lowrank_components=0, dense_components=0,
@@ -222,11 +224,11 @@ class CompressedCrossFarBlocks:
 
     def _build_range(self, lo, hi):
         from ghost_backend.execution.options import single_thread_blas
-        self._blocks = {'efie':{}, 'ibc':{}}
+        self._blocks = {family: {} for family in self.families}
         self._arena = []
         self._payload = 0
         self._chunk_items = max(1,min(CROSS_STORAGE_CHUNK_BYTES//16,
-                                     8*self.Np*self.Nq*(hi-lo+1)))
+                                     4*len(self.families)*self.Np*self.Nq*(hi-lo+1)))
         with single_thread_blas():
             for i in range(0,self.Np,self._tile_nodes):
                 I = (i,min(i+self._tile_nodes,self.Np))
@@ -235,7 +237,7 @@ class CompressedCrossFarBlocks:
                     J = (j,min(j+self._tile_nodes,self.Nq))
                     eligible = self._eligible(I,J)
                     batch = self._modal_batch
-                    for family in ('efie','ibc'):
+                    for family in self.families:
                         entries = np.empty((hi-lo+1,4,3),np.int64)
                         for start in range(lo,hi+1,batch):
                             self._checkpoint()
@@ -268,6 +270,8 @@ class CompressedCrossFarBlocks:
         # The production sweep has a mode-range barrier. Keep standalone
         # concurrent callers safe too: descriptors and their arena must belong
         # to the same range for the whole reconstruction/copy operation.
+        if which not in self.families:
+            raise ValueError('This cross stream was prepared for EFIE only.')
         with self._range_lock:
             self._ensure(abs(m))
             blocks, index = self._blocks[which],abs(m)-self.lo

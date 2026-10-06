@@ -34,6 +34,24 @@ def mode():
 # even a rank-one batch could save.
 AUTO_QR_FLOP_RATIO = 3.0
 AUTO_MAX_RANK_FRACTION = 0.5
+# LU-backed factors (dense LU, mirror halves) of at least LU_DIRECT_MIN_UNKNOWNS
+# unknowns solve batches directly in 'auto' unless the system is very large
+# for the batch: a LAPACK solve of r columns streams the whole factor once
+# (about 60 ms for a 1.2 GB factor) whatever r is, and the pivoted QR costs
+# about 2.4x its flop model, so at 8,608 unknowns a 256-column batch measured
+# 0.563 s reconstructed against 0.533 s direct.  Reconstruction pays again once
+# the factor is large against the batch (n above LU_DIRECT_RATIO columns), and
+# always for compressed and hierarchical factors, whose solves scale with the
+# column count.
+LU_DIRECT_MIN_UNKNOWNS = 4096
+LU_DIRECT_RATIO = 60
+
+
+def _lu_backed(factor):
+    """True for a factor whose solve is a LAPACK triangular solve of the whole LU."""
+    if getattr(factor, 'hierarchical', None) is not None or getattr(factor, 'mixed', None) is not None:
+        return False
+    return getattr(factor, 'lu', None) is not None or getattr(factor, 'mirror', None) is not None
 
 
 def _auto_qr_cannot_pay(n, count):
@@ -226,6 +244,10 @@ def solve(factor, rhs, basis_state=None, setting=None, hint=None):
     if auto:
         if evidence.get('auto_suspended'):
             return _direct(factor, rhs, evidence, count, 'suspended_batches')
+        retained = (basis_state is not None and basis_state.q is not None and basis_state.q.shape[1] > 0
+                    and basis_state.owner is not None and basis_state.owner() is factor)
+        if not retained and LU_DIRECT_MIN_UNKNOWNS <= n < LU_DIRECT_RATIO * count and _lu_backed(factor):
+            return _direct(factor, rhs, evidence, count, 'lu_direct_batches')
         if hint is not None and 'hint_probe' not in evidence:
             evidence['hint_probe'] = hint.begin_factor()
             if not evidence['hint_probe']:

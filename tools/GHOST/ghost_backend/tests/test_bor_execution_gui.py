@@ -14,6 +14,17 @@ class BorExecutionGuiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):cls.app=QApplication.instance() or QApplication([])
 
+    def test_tile_automatic_default_and_saved_integer_round_trip(self):
+        from ghost_backend.ui.bor_options import BorOptionsWidget
+        widget = BorOptionsWidget()
+        try:
+            self.assertEqual(widget.value()['compression_tile'],'auto')
+            for value in ('auto',8,24,32,64,128):
+                widget.set_value(dict(compression_tile=value))
+                self.assertEqual(widget.value()['compression_tile'],value)
+        finally:
+            widget.close()
+
     def test_options_select_and_reach_worker(self):
         workspace=GhostWorkspace()
         try:

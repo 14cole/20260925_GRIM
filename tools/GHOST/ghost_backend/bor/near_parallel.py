@@ -70,13 +70,14 @@ def process_backend_possible(workers):
             and process_capable())
 
 
-def processes_selected(pair_count=None, mode_tasks=None):
+def processes_selected(pair_count=None, mode_tasks=None, workers=None):
     """The one workload policy shared by memory planning and the executor.
 
-    ``mode_tasks`` is the number of prepared modes (cap + 1). An unknown
-    workload is not selected in advance: the planner then keeps the thread
-    reservation and records the process pool size that was verified to fit,
-    which bounds the executor if it meets a large job later.
+    ``mode_tasks`` is the number of prepared modes (cap + 1); ``workers`` is
+    accepted for interface compatibility and does not change the policy. An
+    unknown workload is not selected in advance: the planner then keeps the
+    thread reservation and records the process pool size that was verified
+    to fit, which bounds the executor if it meets a large job later.
     """
     from ghost_backend.bor.options import current_options
     backend = current_options()['near_backend']
@@ -112,7 +113,7 @@ def executor_for(pair_count, mode_cap):
     if state['executor'] is None:
         if (state['process_workers'] <= 1
                 or not process_backend_possible(state['process_workers'])
-                or not processes_selected(pair_count, mode_cap+1)):
+                or not processes_selected(pair_count, mode_cap+1, state['process_workers'])):
             return None
         # The pool spawns its workers on demand while this scope lasts; they
         # must start with one BLAS thread (see SINGLE_THREAD_WORKER_ENVIRONMENT).
@@ -137,9 +138,11 @@ class NearTask:
     """
 
     def __init__(self, gp, gq, k, m_max, kinds, depth=4, pair_kind=None,
-                 near_order=12, near_rtol=2e-5, near_max_order=192):
+                 near_order=12, near_rtol=2e-5, near_max_order=192,
+                 mode_start=0, return_families=False):
         self.gp, self.gq, self.k = gp, gq, k
         self.m_max, self.kinds, self.depth = m_max, kinds, depth
+        self.mode_start, self.return_families = int(mode_start), bool(return_families)
         self.pair_kind = pair_kind
         from ghost_backend.bor.options import current_options
         self.junction_refinement = current_options()['near_refinement']
@@ -174,16 +177,17 @@ class NearTask:
             points = (_same_surface_points(self.gp, e, f, self.kinds, self.depth)
                       if self.pair_kind is None else _junction_cell_points(cell, self.junction_refinement))
             touching.append((index, (self.gp, e, self.gq, f, points)))
-        pick = (lambda blocks: blocks[self.kinds[0]]) if self.pair_kind is None else (lambda blocks: blocks)
+        pick = ((lambda blocks: blocks[self.kinds[0]])
+                if self.pair_kind is None and not self.return_families else (lambda blocks: blocks))
         if touching:
             outs = _contract_near_batch([job for _, job in touching], self.k, self.m_max,
-                                        self.kinds, signed=False)
+                                        self.kinds, signed=False, mode_start=self.mode_start)
             for (index, _), blocks in zip(touching, outs):
                 results[index] = (pick(blocks), None)
         if disjoint:
             outs = _converged_disjoint_batch(self.gp, self.gq, [pair for _, pair in disjoint],
                 self.k, self.m_max, self.kinds, self.near_order, self.near_rtol, self.near_max_order,
-                signed=False)
+                signed=False, mode_start=self.mode_start)
             for (index, _), (blocks, order, error) in zip(disjoint, outs):
                 results[index] = (pick(blocks), (order, error))
         return results

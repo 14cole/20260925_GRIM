@@ -482,6 +482,7 @@ def _summarize_residuals(values: 'List[float]') -> 'Tuple[float, float, int]':
     return max_value, mean_value, int(residuals.size - finite.size)
 
 
+@timed_stage('condition_scaling')
 def _equilibrated_scaling_and_norm_1(
     a_mat: 'np.ndarray',
     max_block_bytes: 'int' = 16 * 1024 * 1024,
@@ -538,6 +539,7 @@ def _equilibrated_scaling_and_norm_1(
     return row_scale, col_scale, norm_a
 
 
+@timed_stage('condition_estimation')
 def _equilibrated_condition_from_lu(
     a_mat: 'np.ndarray',
     lu: 'np.ndarray',
@@ -567,8 +569,23 @@ def _equilibrated_condition_from_lu(
         solved = solve_override(rhs, trans=2) if solve_override is not None else _SCIPY_LINALG.lu_solve((lu, piv), rhs, trans=2, check_finite=False)
         return row_scale * solved
 
+    def _inverse_matmat(matrix):
+        rhs = row_scale[:, None] * np.asarray(matrix, dtype=np.complex128)
+        solved = (solve_override(rhs) if solve_override is not None else
+                  _SCIPY_LINALG.lu_solve((lu, piv), rhs, check_finite=False))
+        return col_scale[:, None] * solved
+
+    def _inverse_rmatmat(matrix):
+        rhs = col_scale[:, None] * np.asarray(matrix, dtype=np.complex128)
+        solved = (solve_override(rhs, trans=2) if solve_override is not None else
+                  _SCIPY_LINALG.lu_solve((lu, piv), rhs, trans=2, check_finite=False))
+        return row_scale[:, None] * solved
+
+    # Block probes share the original-matrix residual passes of checked
+    # hierarchical solves instead of reading a large matrix once per column.
     inverse = _SCIPY_SPARSE_LINALG.LinearOperator(
         (n, n), matvec=_inverse_matvec, rmatvec=_inverse_rmatvec,
+        matmat=_inverse_matmat, rmatmat=_inverse_rmatmat,
         dtype=np.complex128,
     )
     inverse_norm = _deterministic_onenormest(inverse)
@@ -1986,12 +2003,14 @@ def _solve_multi_region_indirect(mesh, infos, pol, k0, elevations_deg,
     matrix, layout = assemble_system(mesh, infos, pol, obs_order, src_order)
     mask, density = exterior_projection(mesh, layout)
     from ghost_backend.twod.formulations.combined_regions import exterior_double_density
+    double_density = exterior_double_density(mesh, layout)
     return _solve_fields(mesh, matrix, k0, elevations_deg,
         lambda angles: rhs_many(mesh, layout, k0, angles), condition_diagnostics,
         "multi-region indirect system", density_builder=density, element_mask=mask,
         observation_angles=observation_angles_deg, order=obs_order,
         return_density=return_density, project=project, coordinates=dof_coordinates(mesh, layout),
-        second_potential='DLP', second_density_builder=exterior_double_density(mesh, layout),
+        second_potential='DLP' if double_density is not None else None,
+        second_density_builder=double_density,
         second_element_mask=mask,
         adaptive_routes=[(layout['ifaces'][mi]['nodes'], offset) for (mi, _), (offset, _) in layout['dof_map'].items()])
 

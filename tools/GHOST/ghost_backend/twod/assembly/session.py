@@ -93,10 +93,12 @@ def shared_assembly(function):
         session = AssemblySession()
         session.abort_event = signature.bind(*args, **kwargs).arguments.get('abort_event')
         from ghost_backend.twod.polynomial_quadrature import moment_cache_scope
-        with _SESSION.override(session), moment_cache_scope():
+        from ghost_backend.twod.assembly.profiling import profile_scope
+        with _SESSION.override(session), moment_cache_scope(), profile_scope() as profile:
             try:
                 result = function(*args, **kwargs)
                 result.setdefault('metadata', {})['assembled_system_reuses'] = session.reuses
+                result['metadata']['assembly_components'] = profile.evidence()
                 return result
             finally:
                 session.pending = None

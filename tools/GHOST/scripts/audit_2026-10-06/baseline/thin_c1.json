@@ -1,0 +1,77 @@
+{
+ "case": "thin_c1",
+ "spec": {
+  "kind": "2d",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\tools\\GHOST\\ghost_backend\\validation\\material_examples\\type1_thin_dielectric.geo",
+  "units": "meters",
+  "ghz": 1.0,
+  "set": "quick"
+ },
+ "import_seconds": 0.2679463999957079,
+ "wall": 0.5374296999943908,
+ "stage_seconds": {
+  "operators": 0.15246990000014193,
+  "near_and_hypersingular": 0.06270960000256309,
+  "condition_scaling": 0.0003167999966535717,
+  "factorization": 0.0010286000033374876,
+  "condition_estimation": 0.0016747000045143068,
+  "excitation": 0.0047124000047915615,
+  "rhs_solve": 0.0026723000046331435,
+  "linear_solve": 0.005329800012987107,
+  "rhs_compression": 0.005606799997622147,
+  "far_field": 0.008591199999500532,
+  "thin_layer_operators_and_solve": 0.2873931999929482,
+  "mesh_certification": 0.002388799999607727
+ },
+ "backend": "dense",
+ "planning_seconds": 0.11008259999653092,
+ "adaptive_used": false,
+ "adaptive_fallback": null,
+ "steps": [],
+ "panel_count": 120,
+ "nodes": 121,
+ "degree": 1,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": true,
+ "warnings": [
+  "Geometry contains 2 dangling endpoint node(s)."
+ ],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 162,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.003235000003769528
+  },
+  {
+   "label": null,
+   "unknowns": 81,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.0011702000047080219
+  },
+  {
+   "label": null,
+   "unknowns": 242,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.004026300004625227
+  },
+  {
+   "label": null,
+   "unknowns": 121,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.0019444000063231215
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

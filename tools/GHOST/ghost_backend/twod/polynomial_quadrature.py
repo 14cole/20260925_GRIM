@@ -176,6 +176,8 @@ from contextlib import contextmanager
 from ghost_backend.execution.runtime import ScopedValue
 
 _MOMENT_DEGREE = 3
+# Rows per moment GEMM (see _monomial_moments).
+_MOMENT_GEMM_ROWS = 64
 # About 200 bytes of working storage per sample. Concurrent chunks stay within
 # the near-batch workspace that dense resource forecasts already reserve.
 _CHUNK_SAMPLES = 1 << 17
@@ -255,6 +257,11 @@ def map_checked(function, jobs, workers, checkpoint=None):
     Consumers can copy each result into its final destination immediately;
     completed results do not accumulate until every job has finished. Queued
     jobs are cancelled on failure, cancellation, or explicit iterator close.
+
+    Every job runs in a copy of the caller's context: the scoped values of the
+    solve (the CPU kernel-table store, the moment cache, the execution
+    options) are visible on the worker threads, so a near-pair batch finds the
+    solve's kernel table instead of rebuilding one per thread and domain.
     """
     if workers <= 1 or len(jobs) <= 1:
         for job in jobs:
@@ -266,14 +273,20 @@ def map_checked(function, jobs, workers, checkpoint=None):
             yield result
             result = None
         return
+    import contextvars
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
+    context = contextvars.copy_context()
+
+    def run(job):
+        return context.copy().run(function, job)
+
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         pending = deque()
         submitted = 0
         while submitted < len(jobs) and len(pending) < 2 * workers:
-            pending.append(pool.submit(function, jobs[submitted]))
+            pending.append(pool.submit(run, jobs[submitted]))
             submitted += 1
         while pending:
             result = pending.popleft().result()
@@ -282,7 +295,7 @@ def map_checked(function, jobs, workers, checkpoint=None):
             yield result
             result = None
             if submitted < len(jobs):
-                pending.append(pool.submit(function, jobs[submitted]))
+                pending.append(pool.submit(run, jobs[submitted]))
                 submitted += 1
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
@@ -340,12 +353,35 @@ def _classify(task, obs, src):
 
 
 def _moment_key(k, obs_derivative, obs, src, task, order):
+    # Endpoint welding can change across mesh generations even when this
+    # pair's coordinates do not. Include the classified rule and its corner
+    # orientation; polynomial degree is deliberately absent from the key.
+    kind = {'regular': 0, 'same': 1, 'shared': 2}[task.kind]
+    shared = (-1, -1) if task.shared is None else task.shared
     head = np.array([complex(k).real, complex(k).imag, float(obs_derivative),
                      float(obs.panel_index == src.panel_index),
                      task.intervals[0][0], task.intervals[0][1],
-                     task.intervals[1][0], task.intervals[1][1], float(order)])
+                     task.intervals[1][0], task.intervals[1][1], float(order),
+                     float(kind), float(shared[0]), float(shared[1])])
     return b''.join(np.asarray(part, float).tobytes() for part in
                     (head, obs.p0, obs.p1, obs.normal, src.p0, src.p1, src.normal))
+
+
+def box_moment_keys(k, obs_derivative, order, want_s, want_k, obs_elems, src_elems):
+    """Moment-cache keys of fixed-order (tensor-Gauss) pairs: wavenumber, rule, channels and geometry.
+
+    The byte layout differs from ``_moment_key`` (the polynomial Duffy rules),
+    so the two families never share an entry."""
+    k = complex(k)
+    rows = np.empty((len(obs_elems), 18), dtype=float)
+    rows[:, 0:6] = (k.real, k.imag, float(bool(obs_derivative)), float(order), float(bool(want_s)), float(bool(want_k)))
+    rows[:, 6:8] = [e.p0 for e in obs_elems]
+    rows[:, 8:10] = [e.p1 for e in obs_elems]
+    rows[:, 10:12] = [e.normal for e in obs_elems]
+    rows[:, 12:14] = [e.p0 for e in src_elems]
+    rows[:, 14:16] = [e.p1 for e in src_elems]
+    rows[:, 16:18] = [e.normal for e in src_elems]
+    return [b'box' + row.tobytes() for row in rows]
 
 
 def _build_kernel_table(k_real, k_imag, upper):
@@ -397,9 +433,24 @@ def _table_for(k, pairs):
     k = complex(k)
     if not (k.imag < 0 < k.real) or not pairs:
         return None
-    ends = [(np.asarray(o.p0), np.asarray(o.p1), np.asarray(s.p0), np.asarray(s.p1)) for o, s in pairs]
-    reach = max(max(np.linalg.norm(a - b) for a in (op0, op1) for b in (sp0, sp1))
-                for op0, op1, sp0, sp1 in ends)
+    return _table_for_ends(k, np.array([o.p0 for o, _ in pairs], float), np.array([o.p1 for o, _ in pairs], float),
+                           np.array([s.p0 for _, s in pairs], float), np.array([s.p1 for _, s in pairs], float))
+
+
+def _table_for_ends(k, obs_p0, obs_p1, src_p0, src_p1):
+    """The near table of a lossy wavenumber reaching every endpoint pair of these elements.
+
+    The reach is the largest endpoint-to-endpoint distance over the four
+    endpoint combinations, taken as arrays (the per-pair loop of four norms
+    was the one interpreter-bound stretch of a batch)."""
+    k = complex(k)
+    if not (k.imag < 0 < k.real) or not len(obs_p0):
+        return None
+    reach = 0.
+    for a in (obs_p0, obs_p1):
+        for b in (src_p0, src_p1):
+            difference = a - b
+            reach = max(reach, float(np.max(np.sqrt(difference[:, 0] ** 2 + difference[:, 1] ** 2))))
     if not np.isfinite(reach) or reach <= 0:
         return None
     # Power-of-two domains let later calls at this wavenumber reuse the table.
@@ -471,6 +522,7 @@ def _evaluate_chunk(tasks, pairs, k, obs_derivative, order, kind, shared, table=
         y = y0 if shared[1] else 1 - y0
     else:
         x, y = x0, y0
+    base_x, base_y = x, y
     x = oa + (ob - oa) * x[None, :]
     y = sa + (sb - sa) * y[None, :]
     if kind == 'regular':
@@ -492,19 +544,14 @@ def _evaluate_chunk(tasks, pairs, k, obs_derivative, order, kind, shared, table=
             np.negative(derivative, out=derivative)
         kernels.append(weight[None, :] * (derivative * projection / distance))
     moments = np.zeros((count, 2, _MOMENT_DEGREE + 1, _MOMENT_DEGREE + 1), complex)
-    x = np.ascontiguousarray(np.broadcast_to(x, distance.shape))
-    y = np.ascontiguousarray(np.broadcast_to(y, distance.shape))
-    for channel, kernel in enumerate(kernels):
-        by_source = kernel
-        for b in range(_MOMENT_DEGREE + 1):
-            term = by_source.copy()
-            for a in range(_MOMENT_DEGREE + 1):
-                # Contiguous row reductions sum each pair independently.
-                moments[:, channel, a, b] = np.add.reduce(term, axis=1)
-                if a < _MOMENT_DEGREE:
-                    np.multiply(term, x, out=term)
-            if b < _MOMENT_DEGREE:
-                by_source = by_source * y
+    x = y = None
+    # Every task of a chunk shares its quadrature nodes up to the affine maps
+    # x = oa + (ob - oa) base_x and y = sa + (sb - sa) base_y, so the moments
+    # are one matrix product against the base-node monomials followed by a
+    # per-task binomial change of variable (the identity on unit intervals).
+    moments[:, :len(kernels)] = _monomial_moments(kernels, base_x, base_y, oa[:, 0], (ob - oa)[:, 0],
+                                                  sa[:, 0], (sb - sa)[:, 0])
+    kernels = None
     if np.any(exact):
         moments[exact, 0] += _log_monomials() / (2 * np.pi)
     scale = (np.array([e.length for e in obs]) * np.array([e.length for e in src])
@@ -513,6 +560,65 @@ def _evaluate_chunk(tasks, pairs, k, obs_derivative, order, kind, shared, table=
     if not np.all(np.isfinite(moments)):
         raise ValueError('Polynomial near quadrature did not converge: non-finite kernel block.')
     return moments
+
+
+@lru_cache(maxsize=1)
+def _binomial_table():
+    from math import comb
+    degree = _MOMENT_DEGREE
+    result = np.array([[float(comb(a, i)) if i <= a else 0. for i in range(degree + 1)]
+                       for a in range(degree + 1)])
+    result.flags.writeable = False
+    return result
+
+
+def _binomial_transform(offset, scale):
+    """``B[t, a, i] = C(a, i) offset_t**(a-i) scale_t**i``, so ``(offset + scale u)**a = sum_i B[t, a, i] u**i``."""
+    degree = _MOMENT_DEGREE
+    binomial = _binomial_table()
+    offsets = np.vander(np.asarray(offset, float), degree + 1, increasing=True)
+    scales = np.vander(np.asarray(scale, float), degree + 1, increasing=True)
+    result = np.zeros((len(offsets), degree + 1, degree + 1))
+    for a in range(degree + 1):
+        for i in range(a + 1):
+            result[:, a, i] = binomial[a, i] * offsets[:, a - i] * scales[:, i]
+    return result
+
+
+def _monomial_moments(kernels, base_x, base_y, x_offset, x_scale, y_offset, y_scale):
+    """``sum_q kernel[t, q] x[t, q]**a y[t, q]**b`` for ``a, b <= _MOMENT_DEGREE``, shape (T, C, D+1, D+1).
+
+    ``x[t, q] = x_offset[t] + x_scale[t] base_x[q]`` (likewise y), so the
+    moments of the base nodes are one GEMM of the (T, q) kernels against the
+    (q, 16) base monomials, followed by the binomial change of variable of each
+    task.  Row ``t`` of the product depends on that task's kernels alone, so a
+    moment is independent of the chunk's composition and of the thread count.
+    """
+    degree = _MOMENT_DEGREE
+    monomials_x = np.vander(np.asarray(base_x, float), degree + 1, increasing=True)
+    monomials_y = np.vander(np.asarray(base_y, float), degree + 1, increasing=True)
+    monomials = (monomials_x[:, :, None] * monomials_y[:, None, :]).reshape(len(monomials_x), -1).astype(complex)
+    stacked = np.stack(kernels)                                   # (C, T, q)
+    channels, count, samples = stacked.shape
+    # Every product has the same shape (_MOMENT_GEMM_ROWS x q by q x 16; the
+    # last block zero-padded), so the BLAS kernel and its summation order are
+    # the same for every task whatever the chunk holds: a moment depends on
+    # its task alone, as the former row-wise reductions did.
+    base = np.empty((channels, count, monomials.shape[1]), dtype=np.complex128)
+    block = np.zeros((channels, _MOMENT_GEMM_ROWS, samples), dtype=np.complex128)
+    for start in range(0, count, _MOMENT_GEMM_ROWS):
+        rows = min(_MOMENT_GEMM_ROWS, count - start)
+        block[:, :rows] = stacked[:, start:start + rows]
+        if rows < _MOMENT_GEMM_ROWS:
+            block[:, rows:] = 0.0
+        base[:, start:start + rows] = (block @ monomials)[:, :rows]
+    base = np.ascontiguousarray(base.reshape(channels, count, degree + 1, degree + 1).transpose(1, 0, 2, 3))
+    unit = (x_offset == 0.) & (x_scale == 1.) & (y_offset == 0.) & (y_scale == 1.)
+    if np.all(unit):
+        return base
+    transform_x = _binomial_transform(x_offset, x_scale)
+    transform_y = _binomial_transform(y_offset, y_scale)
+    return np.einsum('tai,tcij,tbj->tcab', transform_x, base, transform_y)
 
 
 def _moments(tasks, pairs, k, obs_derivative, order, cache, threads, checkpoint, table=None):

@@ -1,7 +1,7 @@
 """Explicit compressed CPU path: bounded geometry assembly and strict rejection."""
 from ghost_backend.execution.options import temporary_directory
 from ghost_backend.execution.options import environment_value
-import os,tempfile
+import os,tempfile,time
 import numpy as np
 from ghost_backend.execution.metrics import timed_stage
 
@@ -96,6 +96,133 @@ def native(mesh,infos,pol,k0,kind,obs_order=8,src_order=8,layer=None):
 
 @timed_stage('compressed_assembly')
 def regional(mesh,infos,pol,obs_order=8,src_order=8):
+    shared=_projected_regional(mesh,infos,pol,obs_order,src_order)
+    return shared if shared is not None else _regional(mesh,infos,pol,obs_order,src_order)
+
+
+def _projected_regional(mesh,infos,pol,obs_order,src_order):
+    from ghost_backend.twod.assembly import polynomial_pair as pair
+    owner=pair.current_pair()
+    if owner is None or owner.building:return None
+    previous=pair.take(mesh,infos,pol,'compressed',obs_order,src_order)
+    if previous is not None:
+        from ghost_backend.compressed.retained_storage import RetainedOperatorSpool
+        operator,layout=previous
+        if isinstance(operator,RetainedOperatorSpool):
+            try:return operator.restore(),layout
+            except InterruptedError:
+                pair.discard_backend('compressed')
+                raise
+            except OSError as exc:
+                pair.discard_backend('compressed')
+                owner.evidence.append(dict(backend='compressed',polarization=pol,
+                    action='independent_assembly',fallback='joint_storage_rejection',
+                    reason='retained cubic storage unavailable: '+str(exc)))
+                return None
+        return previous
+    from ghost_backend.twod.assembly.session import current_session,system_key
+    session=current_session()
+    partner=getattr(session,'compressed_partner',None)
+    # A paired traversal is already the baseline. Keep it intact: project both
+    # polarizations or leave the ordinary assembly path entirely unchanged.
+    if pol!='TE' or partner is None or partner[0] is not mesh:return None
+    plans=[pair.prepare(mesh,values,label,obs_order,src_order)
+           for values,label in ((infos,'TE'),(partner[1],'TM'))]
+    if any(plan is None for plan in plans):return None
+    import ghost_backend.twod.solver as solver
+    from ghost_backend.compressed.memory import inverse_storage
+    from ghost_backend.twod.formulations.regions import dof_coordinates
+    fine=plans[0]['fine_mesh'];records=[]
+    for candidate in (mesh,fine):
+        phase=[]
+        for values,label in ((infos,'TE'),(partner[1],'TM')):
+            resources=solver._dense_formulation_resources(candidate,values,label)
+            peak=solver._estimate_memory_gb(resources['nodes'],False,
+                system_dofs=resources['system_dofs'],n_regions=resources['n_regions'],
+                operator_matrices=resources['operator_matrices'],n_rhs=owner.n_rhs,
+                solver_method=owner.solver_method,formulation='multi_region',dense_resources=resources)
+            phase.append((peak*1024**3,resources['memory_estimate']['operator_allowance_bytes']))
+        records.append(phase)
+    coarse_allowance=sum(row[1] for row in records[0]);fine_allowance=sum(row[1] for row in records[1])
+    inverse=max(inverse_storage(plan['coarse_layout']['n_dof'])[0] for plan in plans)
+    from ghost_backend.compressed.projection import projection_workspace_bytes
+    projection_workspace=projection_workspace_bytes()
+    required=max(max(row[0] for row in records[0])+fine_allowance,
+                 max(row[0] for row in records[1])+fine_allowance+coarse_allowance+projection_workspace)
+    limit=solver._solve_memory_limit_gb()*1024**3;storage=storage_budget()
+    if required>limit or fine_allowance+coarse_allowance+inverse>storage:
+        owner.evidence.append(dict(backend='compressed',action='independent_assembly',
+            reason='joint polynomial storage exceeds reservation',required_gib=required/1024**3,
+            budget_gib=limit/1024**3,retained_storage_required=fine_allowance+coarse_allowance+inverse,
+            retained_storage_budget=storage))
+        return None
+    from ghost_backend.compressed.projection import project_operator
+    from ghost_backend.compressed.retained_storage import RetainedOperatorSpool
+    built=[];owner.building=True;started=time.perf_counter()
+    try:
+        session.compressed_partner=(fine,partner[1])
+        fine_te,layout_te=_regional(fine,infos,'TE',obs_order,src_order)
+        built.append(fine_te)
+        fine_tm,layout_tm=session.take(system_key(fine,partner[1],'compressed_region',obs_order,src_order),'TM')
+        built.append(fine_tm)
+        fine_te.reserved_partner_bytes=0
+        retained=sum(operator.bytes for operator in built)
+        if storage-retained-inverse<=0:
+            raise MemoryError('Retained cubic operators leave no admitted quadratic projection storage.')
+        coarse_te=project_operator(fine_te,plans[0]['prolongation'],
+            dof_coordinates(mesh,plans[0]['coarse_layout']),storage-retained-inverse,checkpoint)
+        built.append(coarse_te)
+        retained_te=RetainedOperatorSpool(fine_te,temporary_directory());built.append(retained_te)
+        if storage-retained-coarse_te.bytes-inverse<=0:
+            raise MemoryError('Retained polynomial operators leave no admitted partner projection storage.')
+        # Keep the existing fine TM spool on disk while projecting TE. Only
+        # one fine polarization needs resident tiles at a time.
+        fine_tm.load()
+        coarse_tm=project_operator(fine_tm,plans[1]['prolongation'],
+            dof_coordinates(mesh,plans[1]['coarse_layout']),storage-retained-coarse_te.bytes-inverse,
+            checkpoint,spool_directory=temporary_directory())
+        built.append(coarse_tm)
+        retained_tm=RetainedOperatorSpool(fine_tm,temporary_directory());built.append(retained_tm)
+        coarse_te.reserved_partner_bytes=coarse_tm.bytes
+        pair.remember(fine,infos,'TE',retained_te,layout_te,'compressed',obs_order,src_order)
+        pair.remember(fine,partner[1],'TM',retained_tm,layout_tm,'compressed',obs_order,src_order)
+        session.save(system_key(mesh,partner[1],'compressed_region',obs_order,src_order),'TE',
+                     (coarse_tm,plans[1]['coarse_layout']))
+        session.compressed_partner=None
+        owner.evidence.append(dict(backend='compressed',action='project_quadratic',
+            fine_dofs=len(fine_te),coarse_dofs=len(coarse_te),retained_fine_bytes=0,
+            retained_fine_disk_bytes=retained_te.disk_bytes+retained_tm.disk_bytes,
+            projection_workspace_bytes=projection_workspace,
+            required_gib=required/1024**3,budget_gib=limit/1024**3,
+            propagated_fine_errors=True))
+        return coarse_te,plans[0]['coarse_layout']
+    except InterruptedError:
+        # Cancellation is an OSError subclass, but must never start a rebuild.
+        session.pending=None;session.compressed_partner=partner
+        for operator in built:
+            if hasattr(operator,'close'):operator.close()
+        pair.discard_backend('compressed')
+        raise
+    except (MemoryError,OSError) as exc:
+        session.pending=None;session.compressed_partner=partner
+        for operator in built:
+            if hasattr(operator,'close'):operator.close()
+        pair.discard_backend('compressed')
+        owner.evidence.append(dict(backend='compressed',action='independent_assembly',
+            reason=str(exc),fallback='joint_storage_rejection',spent_seconds=time.perf_counter()-started))
+        # Return before ordinary assembly so the rejected build and traceback
+        # no longer retain its operators while the original path starts.
+        return None
+    except BaseException:
+        session.pending=None;session.compressed_partner=partner
+        for operator in built:
+            if hasattr(operator,'close'):operator.close()
+        raise
+    finally:
+        owner.building=False
+
+
+def _regional(mesh,infos,pol,obs_order=8,src_order=8):
     import ghost_backend.twod.formulations.regions as mr
     from ghost_backend.compressed.regional_coefficients import PreparedOracle, PairedOracle
     from ghost_backend.compressed.operator import StreamedOperator

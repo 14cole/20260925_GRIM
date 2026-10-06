@@ -179,12 +179,14 @@ class SelectionAndPlanningTests(unittest.TestCase):
             compressed = bor_streaming.estimate_streaming_gb(elements, modes, "cfie")
             self.assertEqual(compressed, cf.estimate_compressed_far_gb(elements, modes, "cfie"))
             self.assertEqual(bor_streaming.estimate_streaming_block_gb(elements, modes, 1, "cfie"),
-                             compressed)
-            # Every mode at once, whatever the dense block budget: nothing spills.
+                             compressed / (modes + 1))
+            # The retained compressed band now obeys the same hard budget.
             block, held, workers = bor_streaming.plan_streaming_mode_block(
                 elements, modes, "cfie", False, False, compressed / 10, 8)
-            self.assertEqual((block, held, workers), (modes + 1, compressed, 8))
-            self.assertEqual(bor_streaming.plan_stream_spill(block, modes + 1, compressed)[0], None)
+            self.assertEqual((block, workers), (4, 4))
+            self.assertLessEqual(held, compressed / 10)
+            self.assertEqual(bor_streaming.plan_stream_spill(block, modes + 1, compressed,
+                                                            allow_spill=False)[0], None)
         self.assertLess(compressed, dense / 5)
 
     def test_solve_bor_matches_dense_streaming(self):

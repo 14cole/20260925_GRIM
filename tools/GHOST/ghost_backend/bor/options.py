@@ -18,13 +18,41 @@ from ghost_backend.execution.runtime import ScopedValue
 # streamed surface and 'off' keeps the dense streamed blocks.
 DEFAULTS = dict(version=1, angle_batch_size=64, rhs_compression='auto',
                 factorization='auto', compressed_storage_mib=0,
-                compression_tile=32, tile_cache_mib=16, near_backend='auto',
+                compression_tile='auto', tile_cache_mib=16, near_backend='auto',
                 stream_spill='auto', far_compression='auto',
                 quadrature_check='off', near_refinement=0)
 _ACTIVE = ScopedValue('ghost_bor_options', default=None)
 _ABORT = ScopedValue('ghost_bor_abort', default=None)
 _OUTPUT_GB = ScopedValue('ghost_bor_output_gb', default=0.)
 _RESUME = ScopedValue('ghost_bor_mode_resume', default=None)
+_RECYCLING = ScopedValue('ghost_bor_frequency_identity', default=(None, None))
+
+
+def current_recycling_parameters():
+    return _RECYCLING.get()
+
+
+def _recycling_parameters(function, arguments, options):
+    """Run-local identity of a modal equation, independent of frequency/RHS.
+
+    Include material values, geometry, formulation, basis and quadrature
+    controls. Dispersive values that change therefore conservatively miss.
+    Callbacks, output grids and resource controls do not change the operator.
+    """
+    if 'freq_hz' not in arguments or options['factorization'] != 'compressed':
+        return None, None
+    from ghost_backend.compressed.recycling import capacity_bytes
+    if not capacity_bytes():
+        return None, None
+    import hashlib
+    import pickle
+    excluded = {'freq_hz', 'thetas_deg', 'n_modes', 'workers', 'progress',
+                'check_abort', 'mode_tol', 'assembly', 'stream_budget_gb'}
+    values = {name: value for name, value in arguments.items() if name not in excluded}
+    controls = (options['near_refinement'], options['quadrature_check'])
+    identity = hashlib.sha256(pickle.dumps(
+        (function.__module__, function.__qualname__, values, controls), protocol=5)).digest()
+    return ('bor_modal_v1', identity), float(arguments['freq_hz'])
 
 
 def current_mode_resume():
@@ -158,11 +186,13 @@ def validate_options(value):
         raise ValueError('BOR options must contain supported fields only.')
     result = dict(DEFAULTS)
     result.update(value)
-    for name, lower, upper in (('version', 1, 1), ('angle_batch_size', 1, 256),
-                               ('compression_tile', 8, 128)):
+    for name, lower, upper in (('version', 1, 1), ('angle_batch_size', 1, 256)):
         number = result[name]
         if type(number) is not int or not lower <= number <= upper:
             raise ValueError('BOR {} must be an integer in {}..{}.'.format(name, lower, upper))
+    tile = result['compression_tile']
+    if tile != 'auto' and (type(tile) is not int or not 8 <= tile <= 128):
+        raise ValueError('BOR compression_tile must be auto or an integer in 8..128.')
     storage = result['compressed_storage_mib']
     if type(storage) is not int or not (storage == 0 or 16 <= storage <= 1048576):
         raise ValueError('BOR compressed_storage_mib must be 0 for automatic, '
@@ -190,6 +220,12 @@ def validate_options(value):
 
 def current_options():
     return dict(_ACTIVE.get() or DEFAULTS)
+
+
+def resolved_compression_tile(options, exact_far_cache=False):
+    """Honor explicit sizes; larger automatic tiles require cheap exact slices."""
+    tile = options['compression_tile']
+    return (128 if exact_far_cache else 32) if tile == 'auto' else int(tile)
 
 
 def compressed_requested():
@@ -258,12 +294,15 @@ def _run_configured(function, signature, bound, options, supplied, checkpoint, e
     direct_grid = bound.arguments.get('thetas_deg')
     import numpy as np
     direct_output = 0. if direct_grid is None else estimate_output_gb(1, np.size(direct_grid))
-    with _ACTIVE.override(options):
+    recycling = _recycling_parameters(function, bound.arguments, options)
+    from ghost_backend.bor.preparation import numerical_preparation
+    with _ACTIVE.override(options), _RECYCLING.override(recycling), numerical_preparation() as prepared:
         with _ABORT.override(checkpoint), _OUTPUT_GB.override(max(output_reserved_gb(),direct_output)):
             with cache_scope(cache):
                 resume_state = {} if automatic_modes else None
                 while True:
                     try:
+                        prepared.begin_attempt()
                         with _RESUME.override(resume_state):
                             result = function(*args, **kwargs)
                         break
@@ -282,13 +321,17 @@ def _run_configured(function, signature, bound, options, supplied, checkpoint, e
                         raise
                 if expanded_caps and isinstance(result, dict):
                     result['automatic_mode_cap_extensions'] = expanded_caps
+                if isinstance(result, dict) and prepared.surfaces:
+                    result['numerical_preparation'] = prepared.evidence()
     return result, cache
 
 
 def configured(function):
     """Accept bor_options= on public APIs, restoring nested calls on failure."""
+    from ghost_backend.twod.preparation import preparation_scope
     signature = inspect.signature(function)
     @wraps(function)
+    @preparation_scope()
     def wrapped(*args, **kwargs):
         supplied = kwargs.pop('bor_options', None)
         options = current_options() if supplied is None else validate_options(supplied)

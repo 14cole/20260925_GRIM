@@ -51,6 +51,7 @@ _BLAS_LOCK = threading.RLock()
 _BLAS_EVENTS = ScopedValue('ghost_blas_events', default=None)
 _PUBLIC_DEPTH = ScopedValue('ghost_public_execution_depth',default=0)
 _AUTOMATIC_REQUEST = ScopedValue('ghost_automatic_backend_request', default=False)
+_FACTOR_EVIDENCE = ScopedValue('ghost_measured_factor_evidence', default=None)
 
 
 def automatic_backend_requested():
@@ -532,6 +533,12 @@ def configured_execution(function):
                 base=from_environment()
                 if not os.environ.get('GHOST_CPU_FACTORIZATION','').strip():
                     base['factorization']='adaptive'
+                if requested is None and not os.environ.get('GHOST_ASSEMBLY_THREADS','').strip():
+                    # A bare automatic request runs on the host's physical cores,
+                    # as the GUI and batch profiles do (the former one-thread
+                    # default made a direct API solve 4x slower than the GUI's).
+                    base['assembly_threads']='auto'
+                    base['blas_threads']='auto'
                 if requested is None or 'mesh_strategy' not in requested:
                     base['mesh_strategy']='adaptive'
                 requested=dict(base,**(requested or {}))
@@ -562,6 +569,21 @@ def configured_execution(function):
                     timing_key=request_key(bound.arguments,value,function.__name__)
             except (OSError,TypeError,ValueError):
                 pass  # Optional timing evidence never replaces input validation.
+        timing_entries=None
+        if timing_key is not None and _PUBLIC_DEPTH.get()==1:
+            from ghost_backend.execution.timing_history import read, MAX_AGE, with_factor_choices
+            from ghost_backend.execution.factor_timing import choices
+            from ghost_backend.linalg.crossover import install
+            from ghost_backend.execution.selection import current_batch_selection
+            timing_entries=read()
+            factor_choices,factor_evidence=choices(timing_key,timing_entries,MAX_AGE)
+            # A batch reservation was priced outside this request scope. Keep
+            # its original factor policy rather than introduce a larger LU
+            # workspace without repricing that already admitted worker plan.
+            if current_batch_selection() is None and not os.environ.get('GHOST_HIERARCHICAL_MIN_UNKNOWNS'):
+                install(factor_choices)
+                _FACTOR_EVIDENCE.get().update(factor_evidence)
+                timing_key=with_factor_choices(timing_key,factor_choices)
         selection = None
         requested_value = value
         if value['factorization'] == 'adaptive':
@@ -577,7 +599,7 @@ def configured_execution(function):
                 selection['planning_seconds']=time.perf_counter()-planning_start
             if timing_key is not None:
                 from ghost_backend.execution.timing_history import adjust
-                selection=adjust(selection,timing_key,batch=batch_planned)
+                selection=adjust(selection,timing_key,batch=batch_planned,entries=timing_entries)
             value = dict(value, factorization=selection['selected'])
         if bound.arguments.get('solver_method') == 'auto' and value['factorization'] == 'compressed':
             bound.arguments['solver_method']='experimental_cpu'
@@ -585,14 +607,19 @@ def configured_execution(function):
         def invoke():
             nonlocal value,selection
             from ghost_backend.execution.errors import BackendNumericalError
+            from ghost_backend.execution.selection import request_selection_scope
             from numpy.linalg import LinAlgError
             failures=[]
             modes=[value['factorization']]+(selection.get('retry_order',[]) if selection else [])
+            # The forecast of this request (its candidate meshes, priced and
+            # admitted) is visible to the adaptive controller, which would
+            # otherwise rebuild and re-price the same meshes per candidate step.
+            forecast=selection if selection is not None and selection.get('meshes') else None
             for index,mode in enumerate(modes):
                 value=dict(value,factorization=mode)
                 attempt_start=time.perf_counter()
                 try:
-                    with execution_scope(value):
+                    with execution_scope(value), request_selection_scope(forecast):
                         result=function(*args,**kwargs)
                 except (MemoryError,BackendNumericalError,LinAlgError) as exc:
                     if selection is None or index == len(modes)-1:
@@ -618,6 +645,8 @@ def configured_execution(function):
             if isinstance(result, dict):
                 metadata = result.setdefault('metadata', {})
                 metadata['linear_algebra_execution'] = list(events[event_start:])
+                if _FACTOR_EVIDENCE.get():
+                    metadata['measured_factor_choices']=dict(_FACTOR_EVIDENCE.get())
                 adaptation = metadata.get('adaptive_mesh', {})
                 actual = dict(value, basis_order=metadata.get('polynomial_degree', value['basis_order']))
                 per_frequency = metadata.get('frequency_metadata', [])
@@ -651,7 +680,11 @@ def configured_execution(function):
             return result
     @wraps(function)
     def call(*args,**kwargs):
-        with _PUBLIC_DEPTH.override(_PUBLIC_DEPTH.get()+1):
+        if _PUBLIC_DEPTH.get():
+            with _PUBLIC_DEPTH.override(_PUBLIC_DEPTH.get()+1):
+                return invoke_configured(*args,**kwargs)
+        from ghost_backend.linalg.crossover import scope
+        with _PUBLIC_DEPTH.override(1), scope({}), _FACTOR_EVIDENCE.override({}):
             return invoke_configured(*args,**kwargs)
     parameters = list(signature.parameters.values())
     parameters.append(inspect.Parameter('execution_options', inspect.Parameter.KEYWORD_ONLY, default=None))

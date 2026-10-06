@@ -3,21 +3,30 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 from pathlib import Path
 import tempfile
+import time
 
 _GENERATION = None
 
 
 def run_tile(path, task):
     global _GENERATION
+    prepared=0.
     from ghost_backend.compressed import tile_processes as tiles
     if _GENERATION != path:
-        # Drop the previous mesh, tables, and oracles before loading this one.
+        started=time.perf_counter()
+        # Drop mesh/oracle/CPU tables, but retain the separately bounded near
+        # moments. Their keys include geometry, wavenumber, direction and rule;
+        # compatible P2/P3 generations can therefore reuse the same integrals.
         tiles._WORKER = None
         import gc
         gc.collect()
         tiles._initialize(Path(path).read_bytes())
         _GENERATION = path
-    return tiles._tile(task)
+        prepared=time.perf_counter()-started
+    result,counters=tiles._tile(task)
+    if counters.component_seconds is not None:
+        counters.component_seconds['prepare']=prepared
+    return result,counters
 
 
 class WorkerPool:

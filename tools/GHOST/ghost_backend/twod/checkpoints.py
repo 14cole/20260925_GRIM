@@ -52,10 +52,32 @@ def input_identity(arguments, options, precision, certified, solver_kind='2d'):
         source=source.hexdigest(), schema=2)).encode('utf-8')).hexdigest()
 
 
+def missing_frequencies(arguments, directory, options, precision, certified,
+                        *, solver_kind='2d', checkpoint=None):
+    """Probe matching checkpoints before spending work on solve forecasts.
+
+    This read-only hint never authorizes reuse: the execution path still
+    verifies availability and the full reader checks integrity before export.
+    A lost or changed checkpoint therefore returns to normal solve admission.
+    """
+    if checkpoint is not None:
+        checkpoint()
+    identity = input_identity(arguments, options, precision, certified, solver_kind)
+    store = FrequencyCheckpoints(directory, identity, certified, create=False)
+    missing = []
+    for frequency in arguments['frequencies_ghz']:
+        if checkpoint is not None:
+            checkpoint()
+        if not store.available(frequency):
+            missing.append(frequency)
+    return missing
+
+
 class FrequencyCheckpoints:
-    def __init__(self, directory, identity, certified):
+    def __init__(self, directory, identity, certified, *, create=True):
         self.directory = Path(directory) / identity
-        self.directory.mkdir(parents=True, exist_ok=True)
+        if create:
+            self.directory.mkdir(parents=True, exist_ok=True)
         self.identity = identity
         self.certified = bool(certified)
 
@@ -224,13 +246,11 @@ def _retained_bytes(value, seen=None):
 
 def run_checkpointed(solve, arguments, directory, options, precision, certified,
                      *, solver_kind='2d', merge=None, frequency_workers=1):
-    from contextlib import ExitStack
     from ghost_backend.twod.preparation import preparation_scope, sweep_mesh_scope
     # Direct API callers need the same run-owned workers, material snapshot,
     # and bounded inverse cache as the desktop's outer preparation scope.
     # Nested scopes share ownership; the outermost scope alone closes resources.
-    scope = preparation_scope() if solver_kind == '2d' else ExitStack()
-    with scope, sweep_mesh_scope(arguments['frequencies_ghz']):
+    with preparation_scope(), sweep_mesh_scope(arguments['frequencies_ghz']):
         return _run_checkpointed(solve, arguments, directory, options, precision,
                                  certified, solver_kind=solver_kind, merge=merge,
                                  frequency_workers=frequency_workers)
