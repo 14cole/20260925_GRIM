@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 
+from GRIM_Backend.ui.classic_theme import classic_qss_overrides, is_classic_palette
+
 
 def _branch_arrow_uri(points: str, fill: str) -> str:
     """Return a base64 SVG data-URI for a small polygon arrow (used in QSS branch rules)."""
@@ -17,6 +19,13 @@ def _branch_arrow_uri(points: str, fill: str) -> str:
 
 
 def build_qss(palette: Mapping[str, object]) -> str:
+    qss = _build_base_qss(palette)
+    if is_classic_palette(palette):
+        qss += classic_qss_overrides(palette)
+    return qss
+
+
+def _build_base_qss(palette: Mapping[str, object]) -> str:
     arrow_right = _branch_arrow_uri(
         "2,1 6,4 2,7", str(palette["text"])
     )

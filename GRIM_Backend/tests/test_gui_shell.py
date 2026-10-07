@@ -173,7 +173,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
         palette_names = list(grim_cut_gui.APPLICATION_PALETTES)
         self.assertEqual(
             palette_names,
-            ["Colorful", "Light", "Dark", "Neutral Dark", "Raytheon"],
+            ["Colorful", "Light", "Dark", "Neutral Dark", "Raytheon", "Windows Classic"],
         )
         view_action = next(
             action

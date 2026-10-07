@@ -113,6 +113,37 @@ APPLICATION_PALETTES: dict[str, dict[str, object]] = {
             "#d9d9d6", "#000000", "#ce1126", "#63666a",
         ),
     },
+    "Windows Classic": {
+        # Early-2000s Windows chrome. "ui_style": "classic" switches
+        # GRIM_Backend/ui/classic_theme.py on; see that module to remove.
+        "ui_style": "classic",
+        "is_dark": False,
+        "win_bg": "#d4d0c8",
+        "panel_bg": "#d4d0c8",
+        "field_bg": "#ffffff",
+        "bevel_light": "#ffffff",
+        "bevel_dark": "#404040",
+        "checked_face": "#e8e6e0",
+        "text": "#000000",
+        "head_bg": "#d4d0c8",
+        "border": "#808080",
+        "hover": "#000080",
+        "checked_bg": "#000080",
+        "checked_border": "#000080",
+        "grid": "#c0c0c0",
+        "muted": "#808080",
+        "fg": "#000000",
+        "success": "#008000",
+        "warning": "#808000",
+        "danger": "#800000",
+        "plot_line_freq": "#000080",
+        "plot_line_angle": "#800000",
+        "plot_worst": "#008080",
+        "layer_colors": (
+            "#000080", "#008080", "#800000", "#808000",
+            "#800080", "#008000", "#000000", "#808080",
+        ),
+    },
 }
 DEFAULT_APPLICATION_PALETTE = "Dark"
 APPLICATION_PALETTE_DESCRIPTIONS = {
@@ -121,6 +152,7 @@ APPLICATION_PALETTE_DESCRIPTIONS = {
     "Dark": "GRIM blue/slate dark application chrome",
     "Neutral Dark": "Neutral slate surfaces, subtle borders, and blue actions",
     "Raytheon": "Official white, black, cool gray, and Red 186 chrome",
+    "Windows Classic": "Early-2000s Windows gray chrome with bevels and navy selection",
 }
 APPLICATION_PALETTE_SETTINGS_KEY = "appearance/application_palette"
 LEGACY_APPLICATION_PALETTE_NAMES = {

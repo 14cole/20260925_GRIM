@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from GRIM_Backend.execution.diagnostics import FREDDY_SENTINELS
+from GRIM_Backend.ui.classic_theme import classic_qss_overrides, is_classic_palette
 
 
 FREDDY_ROOT_ENV = "FREDDY_ROOT_PATH"
@@ -374,6 +375,11 @@ class FreddyIntegrationWidget(QWidget):
         if not callable(apply_host_theme):
             return False
         apply_host_theme(freddy_theme_from_application_palette(palette))
+        if is_classic_palette(palette):
+            # FREDDY's own stylesheet shadows GRIM's; append the classic look.
+            self.workspace.setStyleSheet(
+                self.workspace.styleSheet() + classic_qss_overrides(palette)
+            )
         return True
 
     def focus_workspace(self) -> None:
