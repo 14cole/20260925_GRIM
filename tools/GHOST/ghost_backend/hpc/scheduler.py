@@ -518,6 +518,81 @@ def _resource_records_for_frequency(
     return records
 
 
+def _resource_records_for_degrees(
+    rcs_solver: 'Any',
+    snapshot: 'Dict[str, Any]',
+    materials: 'Any',
+    frequency_ghz: 'float',
+    polarizations: 'Sequence[Tuple[str, str]]',
+    unit_scale: 'float',
+    max_panels: 'int',
+    scopes: 'Dict[int, Dict[str, Any]]',
+) -> 'Dict[int, Dict[str, Dict[str, Any]]]':
+    """``_resource_records_for_frequency`` for several basis degrees of one snapshot.
+
+    ``scopes`` maps each degree to the execution options it is priced under
+    (they differ only in ``basis_order``).  Panels, material coefficients and
+    the interface-aware linear meshes do not depend on the degree (only
+    ``basis.enrich`` reads it), so they are built once, under the first scope
+    at degree 1; each degree then enriches its own copy of every topology
+    mesh and prices the formulation, which reproduces the single-degree
+    records exactly.  The hp certification pair (degrees 2 and 3 on one
+    coarsened snapshot) formerly built its panels and meshes twice.
+    """
+    from ghost_backend.execution.options import execution_scope
+    from ghost_backend.twod.basis import enrich
+    from ghost_backend.twod.geometry import copy_linear_mesh
+
+    degrees = list(scopes)
+    freq_ghz = float(frequency_ghz)
+    k0 = 2.0 * math.pi * freq_ghz * 1.0e9 / rcs_solver.C0
+    with execution_scope(dict(scopes[degrees[0]], basis_order=1)):
+        lambda_min, _, _ = rcs_solver._mesh_wavelength_for_snapshot(
+            snapshot, materials, freq_ghz
+        )
+        panels = rcs_solver._build_panels(
+            snapshot, unit_scale, lambda_min, max_panels=int(max_panels),
+            segment_wavelengths=rcs_solver.segment_wavelengths(snapshot, materials, [freq_ghz], unit_scale, lambda_min),
+            materials=materials, frequencies_ghz=[freq_ghz],
+        )
+        previews = []  # type: List[Tuple[str, str, Any, int]]
+        topology_groups = []  # type: List[Tuple[Any, Any]]
+        for requested_pol, canonical_pol in polarizations:
+            preview = rcs_solver._build_coupled_panel_info(
+                panels, materials, freq_ghz, canonical_pol, k0
+            )
+            index = next((i for i, (representative, _) in enumerate(topology_groups)
+                          if _same_interface_topology(rcs_solver, panels, representative, preview)), None)
+            if index is None:
+                mesh, _stats = rcs_solver._build_linear_mesh_interface_aware(panels, preview)
+                topology_groups.append((preview, mesh))
+                index = len(topology_groups) - 1
+            previews.append((requested_pol, canonical_pol, preview, index))
+    records = {}  # type: Dict[int, Dict[str, Dict[str, Any]]]
+    for degree in degrees:
+        with execution_scope(scopes[degree]):
+            meshes = [enrich(copy_linear_mesh(mesh))[0] for _, mesh in topology_groups]
+            records[degree] = {}
+            for requested_pol, canonical_pol, infos, index in previews:
+                mesh = meshes[index]
+                rcs_solver._assert_no_type1_sheet_for_mixed(infos)
+                rcs_solver._assert_air_exterior(infos)
+                rcs_solver._assert_supported_te_type2_contours(
+                    mesh, infos, canonical_pol
+                )
+                resources = rcs_solver._dense_formulation_resources(
+                    mesh, infos, canonical_pol,
+                    rcs_solver.layer_for_mesh(mesh, materials, freq_ghz)
+                    if any(i.bc_kind == 'thin_layer' for i in infos) else None,
+                    sample_compression=False,
+                )
+                records[degree][requested_pol] = {
+                    "panels": int(len(panels)),
+                    **resources,
+                }
+    return records
+
+
 def predict_2d_resources_many(
     geometry_path: 'str',
     frequencies_ghz: 'Sequence[float]',
@@ -587,13 +662,15 @@ def predict_2d_resources_many(
 
     from ghost_backend.twod.adaptive_geometry import candidate_meshes
     original_snapshot = base_snapshot
-    def resource_record(snapshot, degree, freq):
+    def resource_records(snapshot, degrees, freq):
+        """{degree: records} for one snapshot: panels, coefficients and the
+        linear topology meshes are built once and enriched per degree."""
         if settings is None:
-            return _resource_records_for_frequency(rcs_solver,snapshot,materials,freq,normalized_pols,unit_scale,max_panels)
-        chosen = dict(settings,basis_order=degree,
-            mesh_strategy='local' if '_2d_hp_coarsening' in snapshot else settings['mesh_strategy'])
-        with execution_scope(chosen):
-            return _resource_records_for_frequency(rcs_solver,snapshot,materials,freq,normalized_pols,unit_scale,max_panels)
+            shared = _resource_records_for_frequency(rcs_solver,snapshot,materials,freq,normalized_pols,unit_scale,max_panels)
+            return {degree: shared for degree in degrees}
+        strategy = 'local' if '_2d_hp_coarsening' in snapshot else settings['mesh_strategy']
+        scopes = {degree: dict(settings, basis_order=degree, mesh_strategy=strategy) for degree in degrees}
+        return _resource_records_for_degrees(rcs_solver,snapshot,materials,freq,normalized_pols,unit_scale,max_panels,scopes)
     planned = {}
     for freq_ghz in frequencies:
         candidates = candidate_meshes(original_snapshot, materials, float(fine_factor),
@@ -602,8 +679,15 @@ def predict_2d_resources_many(
         base_degree, fine_degree = candidates[0][2], candidates[-1][2]
         if settings is not None and settings['mesh_strategy']!='adaptive':
             base_degree = fine_degree = settings['basis_order']
-        base_records = resource_record(base_snapshot,base_degree,freq_ghz)
-        fine_records = base_records if len(candidates)==1 else resource_record(fine_snapshot,fine_degree,freq_ghz)
+        if len(candidates) == 1:
+            base_records = fine_records = resource_records(base_snapshot, [base_degree], freq_ghz)[base_degree]
+        elif fine_snapshot is base_snapshot:
+            # The hp pair: one snapshot, two degrees, one panel and mesh build.
+            shared = resource_records(base_snapshot, sorted({base_degree, fine_degree}), freq_ghz)
+            base_records, fine_records = shared[base_degree], shared[fine_degree]
+        else:
+            base_records = resource_records(base_snapshot, [base_degree], freq_ghz)[base_degree]
+            fine_records = resource_records(fine_snapshot, [fine_degree], freq_ghz)[fine_degree]
         for requested_pol in requested_pols:
             base = base_records[requested_pol]
             fine = fine_records[requested_pol]
@@ -713,6 +797,116 @@ def predict_2d_resources(
         floor_gb=floor_gb,
         solver_method=solver_method,
     )[key]
+
+
+# Submit-time planning runs one geometry per task on worker processes once a
+# sweep has this many geometries; below it the process start-up (the backend
+# imports) costs more than it saves.
+PLANNING_WORKERS_MAX = 8
+PLANNING_SERIAL_BELOW = 4
+
+
+def planning_worker_count(requested: 'Any' = None, geometries: 'int' = 1) -> 'int':
+    """Worker processes for resource planning: ``requested`` (a driver's
+    PLANNING_WORKERS), else GHOST_PLANNING_WORKERS, else min(8, usable CPUs);
+    never more than the geometries, and 1 below four geometries."""
+    value = requested
+    if value is None:
+        raw = os.environ.get("GHOST_PLANNING_WORKERS", "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                value = None
+    if value is None:
+        value = min(PLANNING_WORKERS_MAX, detect_cores())
+    geometries = max(1, int(geometries))
+    if geometries < PLANNING_SERIAL_BELOW:
+        return 1
+    return max(1, min(int(value), geometries))
+
+
+def _predict_batch_task(path, frequencies, options=None, **planning):
+    """One geometry's plan under the submitting process's execution options."""
+    from ghost_backend.execution.options import execution_scope
+    if options is None:
+        return predict_2d_resources_many(path, frequencies, **planning)
+    with execution_scope(options):
+        return predict_2d_resources_many(path, frequencies, **planning)
+
+
+def predict_2d_resources_for_geometries(
+    requests: 'Dict[str, Sequence[float]]',
+    polarizations: 'Sequence[str]',
+    geometry_units: 'str',
+    max_panels: 'int',
+    *,
+    fine_factor: 'float' = 1.0,
+    n_angles: 'int' = 1,
+    safety: 'float' = 1.35,
+    floor_gb: 'float' = 0.6,
+    solver_method: 'str' = 'direct',
+    workers: 'Any' = None,
+    progress: 'Optional[Callable[[int, int, str], None]]' = None,
+) -> 'Dict[str, Dict[Tuple[float, str], Dict[str, Any]]]':
+    """``predict_2d_resources_many`` for every geometry of a sweep, on worker
+    processes when the sweep has enough geometries (``planning_worker_count``).
+
+    ``requests`` maps geometry paths to their frequencies; the result maps each
+    path to its batch, in the order of ``requests``.  Each geometry is planned
+    exactly as the serial call would be, under the calling process's execution
+    options (reapplied in the workers), so the records are identical whatever
+    the worker count.  ``progress(done, total, path)`` is called in the calling
+    process as each geometry completes.  A failing geometry is named on stdout
+    and its error re-raised after the other tasks are cancelled; a pool whose
+    workers die (a launcher without an importable main module, a memory kill)
+    is abandoned and the remaining geometries are planned in this process.
+    """
+    from ghost_backend.execution.options import current_options
+    paths = list(requests)
+    workers = planning_worker_count(workers, len(paths))
+    options = current_options()
+    planning = dict(polarizations=list(polarizations), geometry_units=geometry_units,
+                    max_panels=max_panels, fine_factor=fine_factor, n_angles=n_angles,
+                    safety=safety, floor_gb=floor_gb, solver_method=solver_method)
+    results = {}  # type: Dict[str, Any]
+    if workers <= 1:
+        for index, path in enumerate(paths):
+            results[path] = _predict_batch_task(path, list(requests[path]), options=options, **planning)
+            if progress is not None:
+                progress(index + 1, len(paths), path)
+        return results
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures.process import BrokenProcessPool
+    try:
+        with ProcessPoolExecutor(max_workers=workers,
+                                 mp_context=multiprocessing.get_context("spawn")) as pool:
+            futures = {pool.submit(_predict_batch_task, path, list(requests[path]), options=options, **planning): path
+                       for path in paths}
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    results[path] = future.result()
+                except BrokenProcessPool:
+                    raise
+                except BaseException:
+                    for other in futures:
+                        other.cancel()
+                    print(f"  Resource planning failed for {path}", flush=True)
+                    raise
+                if progress is not None:
+                    progress(len(results), len(paths), path)
+    except BrokenProcessPool as exc:
+        print(f"  [warn] planning worker processes failed ({exc}); planning the remaining "
+              f"{len(paths) - len(results)} geometries in this process", flush=True)
+        for path in paths:
+            if path in results:
+                continue
+            results[path] = _predict_batch_task(path, list(requests[path]), options=options, **planning)
+            if progress is not None:
+                progress(len(results), len(paths), path)
+    return {path: results[path] for path in paths}
 
 
 def unit_cost(

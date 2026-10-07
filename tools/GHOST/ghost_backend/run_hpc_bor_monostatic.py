@@ -75,6 +75,7 @@ from ghost_backend.execution.provenance import (
     manifest_solve_spec_fingerprint,
     runtime_environment_fingerprint,
     runtime_environment_payload,
+    verify_runtime_environment,
     stable_json_fingerprint,
     unit_solve_spec_fingerprint,
     embed_output_attestation,
@@ -246,7 +247,6 @@ def _verify_run_provenance(manifest):
             "legacy runs must be regenerated before reuse."
         )
     current_source = _solver_source_fingerprint()
-    current_runtime = runtime_environment_fingerprint()
     if current_source != expected_source:
         # Name the files: "something under ghost_backend/ differs" is not actionable,
         # and the usual cause is a tree that was only partly updated.
@@ -263,11 +263,10 @@ def _verify_run_provenance(manifest):
             f"({detail}). Either restore the recorded source or submit a new "
             "run with the code you actually want to execute."
         )
-    if current_runtime != expected_runtime:
-        raise RuntimeError(
-            "Python/platform/NumPy/SciPy/BLAS runtime differs from the HPC run "
-            "manifest; start a new run in this numerical environment."
-        )
+    verify_runtime_environment(
+        expected_runtime, manifest.get("submission_runtime_environment"),
+        origin="the HPC run manifest",
+    )
 
 
 def _unit_attestation_fields(manifest, unit):

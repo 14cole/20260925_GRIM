@@ -362,15 +362,95 @@ def runtime_environment_payload() -> 'Dict[str, Any]':
     }
 
 
+# Recorded for provenance, never compared: the kernel release and CPU
+# description of the host, and the sections of NumPy's and SciPy's build
+# configuration that describe hardware rather than the build -- the CPU
+# features found at import ("SIMD Extensions", which differ between a login
+# node and a compute node of another generation) and the build host
+# ("Machine Information").  The build dependencies (BLAS/LAPACK name and
+# version), compilers and library versions stay strict.
+_RUNTIME_INFORMATIONAL_FIELDS = frozenset({"platform_release", "platform_processor"})
+_RUNTIME_INFORMATIONAL_CONFIG_SECTIONS = frozenset({"SIMD Extensions", "Machine Information"})
+_RUNTIME_CHECK_SWITCH = "GHOST_RUNTIME_ENVIRONMENT_CHECK"
+_runtime_mismatches_warned = set()
+
+
 def runtime_compatibility_payload(payload: 'Dict[str, Any]' = None) -> 'Dict[str, Any]':
     """Keep numerical dependencies strict without binding a run to one host.
 
-    Kernel releases and CPU descriptions remain informational provenance.
-    OS family, architecture, interpreter and numerical builds stay strict.
+    Kernel releases, CPU descriptions and the CPU features the numerical
+    libraries detect at import remain informational provenance.  OS family,
+    architecture, interpreter and numerical builds stay strict.
     """
     environment = runtime_environment_payload() if payload is None else payload
-    return {key: value for key, value in environment.items()
-            if key not in {"platform_release", "platform_processor"}}
+    compatible = {}
+    for key, value in environment.items():
+        if key in _RUNTIME_INFORMATIONAL_FIELDS:
+            continue
+        if key in ("numpy_config", "scipy_config") and isinstance(value, dict):
+            value = {section: entry for section, entry in value.items()
+                     if section not in _RUNTIME_INFORMATIONAL_CONFIG_SECTIONS}
+        compatible[key] = value
+    return compatible
+
+
+def _runtime_value_summary(value: 'Any') -> 'str':
+    text = json.dumps(value, sort_keys=True, default=str) if isinstance(value, (dict, list)) else str(value)
+    return text if len(text) <= 160 else text[:157] + "..."
+
+
+def describe_runtime_mismatch(expected_payload: 'Any', actual_payload: 'Dict[str, Any]' = None) -> 'str':
+    """Name the compatibility fields of ``expected_payload`` (a recorded
+    ``runtime_environment_payload``) that differ from the current environment;
+    '' when they agree or when no payload was recorded."""
+    if not isinstance(expected_payload, dict) or not expected_payload:
+        return ""
+    expected = runtime_compatibility_payload(expected_payload)
+    actual = runtime_compatibility_payload(actual_payload)
+    parts = []
+    for key in sorted(set(expected) | set(actual)):
+        if expected.get(key) == actual.get(key):
+            continue
+        before, now = expected.get(key), actual.get(key)
+        if isinstance(before, dict) and isinstance(now, dict):
+            sections = [section for section in sorted(set(before) | set(now)) if before.get(section) != now.get(section)]
+            parts.append("%s: %s" % (key, ", ".join(
+                "%s recorded %s, now %s" % (section, _runtime_value_summary(before.get(section)),
+                                             _runtime_value_summary(now.get(section))) for section in sections)))
+        else:
+            parts.append("%s: recorded %s, now %s" % (key, _runtime_value_summary(before), _runtime_value_summary(now)))
+    return "; ".join(parts)
+
+
+def runtime_environment_check_mode() -> 'str':
+    """'strict' (a mismatch refuses the unit) or 'warn' (``GHOST_RUNTIME_ENVIRONMENT_CHECK=warn``)."""
+    raw = os.environ.get(_RUNTIME_CHECK_SWITCH, "").strip().lower()
+    return "warn" if raw in ("warn", "warning", "0", "off", "false", "no") else "strict"
+
+
+def verify_runtime_environment(expected_fingerprint: 'str', expected_payload: 'Any' = None,
+                               origin: 'str' = "the run manifest") -> 'None':
+    """Refuse (strict) or warn once (warn mode) when the current numerical
+    runtime differs from the one a run recorded; name the differing fields
+    when the run recorded its submission environment."""
+    actual = runtime_environment_fingerprint()
+    if actual == str(expected_fingerprint):
+        return
+    detail = describe_runtime_mismatch(expected_payload)
+    if not detail:
+        detail = ("the run does not record its submission environment, so the differing "
+                  "field cannot be named; compare Python, NumPy, SciPy and BLAS versions "
+                  "against the submit host")
+    message = (
+        "Python/NumPy/SciPy/BLAS runtime differs from %s (%s). Start a new run in this "
+        "numerical environment, or set %s=warn to solve here under the recorded runtime "
+        "attestation and accept that difference." % (origin, detail, _RUNTIME_CHECK_SWITCH))
+    if runtime_environment_check_mode() == "warn":
+        if actual not in _runtime_mismatches_warned:
+            _runtime_mismatches_warned.add(actual)
+            print("  [warn] " + message, flush=True)
+        return
+    raise RuntimeError(message)
 
 
 def runtime_environment_fingerprint() -> 'str':

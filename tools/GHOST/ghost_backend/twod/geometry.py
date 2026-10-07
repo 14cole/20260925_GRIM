@@ -2,6 +2,7 @@
 
 import cmath
 import csv
+import copy
 import math
 import os
 from ghost_backend.execution.runtime import dataclass
@@ -75,6 +76,21 @@ class LinearMesh:
 
     nodes: 'List[LinearNode]'
     elements: 'List[LinearElement]'
+
+
+def copy_linear_mesh(mesh: 'LinearMesh') -> 'LinearMesh':
+    """A mesh with its own node list and element records over the same node
+    and element data, so polynomial enrichment of the copy (``basis.enrich``
+    appends nodes and rewrites ``node_ids``) leaves ``mesh`` untouched.  The
+    geometric near-pair memo is shared with the copy: element centres and
+    lengths are the same, so whichever of them counts first serves both."""
+    from ghost_backend.twod.formulations.regions import near_pair_memo
+    clone = LinearMesh(nodes=list(mesh.nodes), elements=[copy.copy(element) for element in mesh.elements])
+    box = near_pair_memo(mesh)
+    if box is not None:
+        clone._near_pair_memo = box
+    return clone
+
 
 @dataclass
 class PanelCoupledInfo:

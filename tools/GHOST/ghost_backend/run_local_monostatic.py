@@ -63,6 +63,8 @@ from ghost_backend.execution.provenance import (
     embed_output_attestation,
     manifest_solve_spec_fingerprint,
     runtime_environment_fingerprint,
+    runtime_environment_payload,
+    verify_runtime_environment,
     stable_json_fingerprint,
     unit_solve_spec_fingerprint,
     verify_embedded_attestation,
@@ -94,6 +96,7 @@ ACCURACY_TARGET = "standard"     # "standard" | "tight"
 # Optional resource caps. The backend, mesh, threads and memory admission are
 # chosen automatically for each solve.
 WORKERS = None                    # max concurrent solves; None = cpu_count() - 1
+PLANNING_WORKERS = None           # processes for the mesh/storage planning; None = min(8, CPUs), 1 = serial
 MAX_SOLVE_GB = None               # per-solve RAM ceiling in GiB; None = from available RAM
 
 # ===============================================================================
@@ -161,12 +164,10 @@ def _verify_run_provenance(context: 'Dict[str, Any]') -> 'None':
             "Local-run solver source/native artifacts changed; no mixed-state "
             f"field will be written or reused. ({detail})"
         )
-    if runtime_environment_fingerprint() != context.get(
-        "runtime_environment_sha256"
-    ):
-        raise RuntimeError(
-            "Local-run Python/platform/NumPy/SciPy/BLAS runtime changed."
-        )
+    verify_runtime_environment(
+        str(context.get("runtime_environment_sha256", "")),
+        context.get("submission_runtime_environment"), origin="the local run manifest",
+    )
 
 
 def _unit_attestation_fields(
@@ -333,11 +334,13 @@ def _plan(units, fine_factor, n_angles, records_out=None):
     for unit in units:
         grouped.setdefault(str(unit['geometry']), []).append(unit)
     costs, peaks = {}, {}
+    batches = hpc_scheduler.predict_2d_resources_for_geometries(
+        {geometry: sorted({float(u['frequency_ghz']) for u in group}) for geometry, group in grouped.items()},
+        ['TM', 'TE'], GEOMETRY_UNITS, _MAX_PANELS, fine_factor=fine_factor,
+        n_angles=n_angles, safety=_MEMORY_SAFETY, solver_method=AUTOMATIC_SOLVER_METHOD,
+        workers=PLANNING_WORKERS)
     for geometry, group in grouped.items():
-        batch = hpc_scheduler.predict_2d_resources_many(geometry,
-            sorted({float(u['frequency_ghz']) for u in group}), ['TM', 'TE'],
-            GEOMETRY_UNITS, _MAX_PANELS, fine_factor=fine_factor,
-            n_angles=n_angles, safety=_MEMORY_SAFETY, solver_method=AUTOMATIC_SOLVER_METHOD)
+        batch = batches[geometry]
         for unit in group:
             name = _unit_name(unit)
             plans = [batch[(float(unit['frequency_ghz']), pol)] for pol in ('TM', 'TE')]
@@ -464,6 +467,7 @@ def main() -> 'None':
         # which file moved instead of only that one did.
         "solver_source_inventory": _solver_source_inventory(),
         "runtime_environment_sha256": runtime_environment_fingerprint(),
+        "submission_runtime_environment": runtime_environment_payload(),
         "solver_config": solver_config,
         "units": units,
     }
@@ -476,6 +480,7 @@ def main() -> 'None':
         "solver_source_sha256": manifest["solver_source_sha256"],
         "solver_source_inventory": manifest["solver_source_inventory"],
         "runtime_environment_sha256": manifest["runtime_environment_sha256"],
+        "submission_runtime_environment": manifest.get("submission_runtime_environment"),
         "run_solve_spec_sha256": manifest_solve_spec_fingerprint(manifest),
         "solver_config_sha256": stable_json_fingerprint(solver_config),
         "geometry_units": GEOMETRY_UNITS,

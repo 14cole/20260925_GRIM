@@ -55,6 +55,8 @@ from ghost_backend.execution.provenance import (
     embed_output_attestation,
     manifest_solve_spec_fingerprint,
     runtime_environment_fingerprint,
+    runtime_environment_payload,
+    verify_runtime_environment,
     stable_json_fingerprint,
     unit_solve_spec_fingerprint,
     verify_embedded_attestation,
@@ -212,12 +214,10 @@ def _verify_run_provenance(context: 'Dict[str, Any]') -> 'None':
             "Local-run solver source/native artifacts changed; no mixed-state "
             f"field will be written or reused. ({detail})"
         )
-    if runtime_environment_fingerprint() != context.get(
-        "runtime_environment_sha256"
-    ):
-        raise RuntimeError(
-            "Local-run Python/platform/NumPy/SciPy/BLAS runtime changed."
-        )
+    verify_runtime_environment(
+        str(context.get("runtime_environment_sha256", "")),
+        context.get("submission_runtime_environment"), origin="the local run manifest",
+    )
 
 
 def _unit_attestation_fields(
@@ -687,6 +687,7 @@ def main() -> 'None':
         # which file moved instead of only that one did.
         "solver_source_inventory": _solver_source_inventory(),
         "runtime_environment_sha256": runtime_environment_fingerprint(),
+        "submission_runtime_environment": runtime_environment_payload(),
         "solver_config": solver_config,
         "units": units,
     }
@@ -700,6 +701,7 @@ def main() -> 'None':
         "solver_source_sha256": manifest["solver_source_sha256"],
         "solver_source_inventory": manifest["solver_source_inventory"],
         "runtime_environment_sha256": manifest["runtime_environment_sha256"],
+        "submission_runtime_environment": manifest.get("submission_runtime_environment"),
         "run_solve_spec_sha256": manifest_solve_spec_fingerprint(manifest),
         "solver_config_sha256": stable_json_fingerprint(solver_config),
         "geometry_units": GEOMETRY_UNITS,

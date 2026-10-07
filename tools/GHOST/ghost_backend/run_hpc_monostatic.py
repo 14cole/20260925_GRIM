@@ -103,6 +103,7 @@ from ghost_backend.execution.provenance import (
     runtime_environment_fingerprint,
     runtime_environment_payload,
     stable_json_fingerprint,
+    verify_runtime_environment,
     embed_output_attestation,
     unit_solve_spec_fingerprint,
     verify_embedded_attestation,
@@ -150,6 +151,11 @@ N_JOBS  = 1
 
 # Cap on array tasks running at once (SLURM's `--array=...%N`). None = no cap.
 ARRAY_THROTTLE = None
+
+# Worker processes for the submit-time mesh/storage planning (one geometry per
+# task; the plan is identical whatever the count). None = GHOST_PLANNING_WORKERS
+# or min(8, usable CPUs); 1 = serial. Sweeps below four geometries plan serially.
+PLANNING_WORKERS = None
 
 # ===============================================================================
 # SLURM allocation and job environment. The backend, mesh, threads and memory
@@ -284,11 +290,10 @@ def _verify_run_provenance(context):
             f"({detail}). Either restore the recorded source or submit a new "
             "run with the code you actually want to execute."
         )
-    if runtime_environment_fingerprint() != expected_runtime:
-        raise RuntimeError(
-            "Python/platform/NumPy/SciPy/BLAS runtime differs from the HPC run "
-            "manifest; start a new run in this numerical environment."
-        )
+    verify_runtime_environment(
+        expected_runtime, context.get("submission_runtime_environment"),
+        origin="the HPC run manifest",
+    )
 
 
 def _unit_attestation_fields(context, unit):
@@ -499,53 +504,48 @@ def _plan_schedule(units, n_slots, fine_factor, n_angles):
         if frequency not in group["frequencies"]:
             group["frequencies"].append(frequency)
 
-    total = sum(
-        len(group["frequencies"]) * 2
-        for group in grouped.values()
-    )
+    total = len(grouped)
+    records_total = sum(len(group["frequencies"]) * 2 for group in grouped.values())
+    workers = hpc_scheduler.planning_worker_count(PLANNING_WORKERS, total)
     started = time.monotonic()
-    completed = 0
     report_step = max(1, total // 20)
-    next_report = report_step
-    last_report = started
+    state = {"next_report": report_step, "last_report": started}
     print(
-        f"  Planning mesh/storage bounds for {total} channel record(s) across "
-        f"{len(grouped)} geometry file(s); no coefficient sampling...",
+        f"  Planning mesh/storage bounds for {records_total} channel record(s) across "
+        f"{total} geometry file(s) on {workers} process(es); no coefficient sampling...",
         flush=True,
     )
 
-    def planning_progress(_frequency, _polarization):
-        # type: (float, str) -> None
-        nonlocal completed, next_report, last_report
-        completed += 1
+    def planning_progress(completed, _total, _geometry):
+        # type: (int, int, str) -> None
         now = time.monotonic()
-        if completed < total and completed < next_report and now - last_report < 10.0:
+        if completed < total and completed < state["next_report"] and now - state["last_report"] < 10.0:
             return
         elapsed = max(now - started, 1.0e-9)
         rate = completed / elapsed
         eta = (total - completed) / rate if rate > 0.0 else 0.0
         print(
-            f"    planned {completed}/{total} ({100.0 * completed / total:.0f}%) "
+            f"    planned {completed}/{total} geometries ({100.0 * completed / total:.0f}%) "
             f"in {elapsed:.1f}s, ETA {eta:.1f}s",
             flush=True,
         )
-        while next_report <= completed:
-            next_report += report_step
-        last_report = now
+        while state["next_report"] <= completed:
+            state["next_report"] += report_step
+        state["last_report"] = now
 
-    for geometry, group in grouped.items():
-        batch = hpc_scheduler.predict_2d_resources_many(
-            geometry,
-            group["frequencies"],
-            ["TM", "TE"],
-            GEOMETRY_UNITS,
-            _MAX_PANELS,
-            fine_factor=fine_factor,
-            n_angles=n_angles,
-            safety=_MEMORY_SAFETY,
-            progress=planning_progress,
-            solver_method=AUTOMATIC_SOLVER_METHOD,
-        )
+    batches = hpc_scheduler.predict_2d_resources_for_geometries(
+        {geometry: list(group["frequencies"]) for geometry, group in grouped.items()},
+        ["TM", "TE"],
+        GEOMETRY_UNITS,
+        _MAX_PANELS,
+        fine_factor=fine_factor,
+        n_angles=n_angles,
+        safety=_MEMORY_SAFETY,
+        solver_method=AUTOMATIC_SOLVER_METHOD,
+        workers=workers,
+        progress=planning_progress,
+    )
+    for geometry, batch in batches.items():
         for (frequency, polarization), planned in batch.items():
             resource_cache[(geometry, frequency, polarization)] = planned
 
@@ -591,6 +591,7 @@ def _plan_schedule(units, n_slots, fine_factor, n_angles):
             "coefficient_sampling": False,
             "elapsed_seconds": float(elapsed),
             "geometry_preflights": int(len(grouped)),
+            "worker_processes": int(workers),
             "frequency_mesh_groups": int(
                 sum(len(group["frequencies"]) for group in grouped.values())
             ),
@@ -965,6 +966,7 @@ def worker(run_dir_str, submission_index, task_index):
         "run_id": manifest["run_id"],
         "solver_source_sha256": manifest["solver_source_sha256"],
         "runtime_environment_sha256": manifest["runtime_environment_sha256"],
+        "submission_runtime_environment": manifest.get("submission_runtime_environment"),
         "solver_source_inventory": manifest.get("solver_source_inventory") or {},
         "run_solve_spec_sha256": manifest_solve_spec_fingerprint(manifest),
         "solver_config_sha256": stable_json_fingerprint(solver_config),

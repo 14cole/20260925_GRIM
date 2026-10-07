@@ -87,9 +87,17 @@ def main():
         str(backend_dir), extra
     ))
     if not any(diff.values()):
-        print("Every recorded file matches. If the worker still fails, the "
-              "runtime fingerprint is the other half of the check -- compare "
-              "Python, NumPy, SciPy, and BLAS versions against the submit host.")
+        recorded_runtime = str(manifest.get("runtime_environment_sha256", ""))
+        if recorded_runtime and wp.runtime_environment_fingerprint() != recorded_runtime:
+            detail = wp.describe_runtime_mismatch(manifest.get("submission_runtime_environment"))
+            print("Every recorded file matches; the runtime fingerprint differs: "
+                  + (detail or "the run does not record its submission environment, "
+                     "so compare Python, NumPy, SciPy and BLAS versions against the "
+                     "submit host")
+                  + ". Setting GHOST_RUNTIME_ENVIRONMENT_CHECK=warn in the job lets a "
+                  "worker proceed and accept that difference.")
+            return 1
+        print("Every recorded file matches and the runtime fingerprint agrees.")
         return 0
 
     labels = {

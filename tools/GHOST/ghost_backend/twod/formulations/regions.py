@@ -30,6 +30,39 @@ def geometric_near_pair_count(centers, lengths):
     return pairs
 
 
+def mesh_near_pair_count(mesh):
+    """``geometric_near_pair_count`` of a mesh's elements, memoized on the mesh.
+
+    Element centres and lengths are fixed at construction (polynomial
+    enrichment only adds nodes), and the storage forecast asks for the same
+    mesh once per polarization and, in the submit-time planner, once per
+    basis degree; the count was 27% of a resource plan."""
+    box = near_pair_memo(mesh)
+    if box is not None and box[0] is not None and box[0][0] == len(mesh.elements):
+        return box[0][1]
+    centers = np.asarray([e.center for e in mesh.elements])
+    lengths = np.asarray([e.length for e in mesh.elements])
+    count = geometric_near_pair_count(centers, lengths)
+    if box is not None:
+        box[0] = (len(mesh.elements), count)
+    return count
+
+
+def near_pair_memo(mesh):
+    """The one-slot memo of ``mesh_near_pair_count`` on ``mesh`` (created on
+    demand; None when the mesh object cannot hold attributes).  A copy made by
+    ``copy_linear_mesh`` shares the slot, so the degrees of one planning mesh
+    count their pairs once."""
+    box = getattr(mesh, '_near_pair_memo', None)
+    if box is None:
+        box = [None]
+        try:
+            mesh._near_pair_memo = box
+        except AttributeError:
+            return None
+    return box
+
+
 def build_layout(mesh, infos, pol):
     elements = mesh.elements
     regions, interface_elements = {}, {}
@@ -167,9 +200,7 @@ def storage_resources(mesh, layout):
     block_bytes = 16 * BLOCK_ROWS * max_interface * 12
 
 
-    centers = np.asarray([e.center for e in mesh.elements])
-    lengths = np.asarray([e.length for e in mesh.elements])
-    near_pairs = geometric_near_pair_count(centers, lengths)
+    near_pairs = mesh_near_pair_count(mesh)
     import ghost_backend.twod.operators as ops
     tile = ops._assembly_tile_size(len(mesh.elements), 312)
     largest_group = max((len(requests) for _, requests in operator_plan(layout)), default=0)

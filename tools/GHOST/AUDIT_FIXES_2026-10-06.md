@@ -169,6 +169,15 @@ in every driver, the single write of the BoR deliverable, the repriced reuse of 
 forecasts") now asserts the new contract: one forecast per run, reused and repriced under a changed
 allocation, equal to a fresh forecast.
 
+### 2.8 Submit-time planning and the runtime-environment check (second round)
+
+| ID | Change | Files | Measured effect |
+|---|---|---|---|
+| R-2D-7 (planning) | The submit-time 2-D resource planner builds the panels, material coefficients and interface-aware linear mesh of a frequency once and enriches a copy per basis degree: the hp certification pair (degrees 2 and 3 on one coarsened snapshot) formerly rebuilt everything for its second degree although only `basis.enrich` reads the degree.  The geometric near-pair count of a mesh is memoized on the mesh (one count per mesh instead of one per polarization and per degree; `copy_linear_mesh` shares the memo).  Geometries are planned on worker processes (`PLANNING_WORKERS` in both 2-D drivers, `GHOST_PLANNING_WORKERS`, default min(8, CPUs); serial below four geometries; a broken pool falls back to in-process planning).  Records are identical: on seven geometries, certified and not, every structural field (panels, nodes, unknowns, dense peaks, costs) matches the previous planner exactly and only the compressed storage fields that follow free memory at the time of the call differ, by the same amount between two runs of the same code | `hpc/scheduler.py` (`_resource_records_for_degrees`, `predict_2d_resources_for_geometries`, `planning_worker_count`), `twod/formulations/regions.py` (`mesh_near_pair_count`), `twod/geometry.py` (`copy_linear_mesh`), `run_hpc_monostatic.py`, `run_local_monostatic.py` | airfoil, five frequencies: certified 1.18 -> 0.41 s, uncertified 2.24 -> 1.75 s; twelve geometries certified: 4.9 s serial, 1.5 s on eight workers |
+| Runtime check | The runtime fingerprint no longer includes the sections of NumPy's and SciPy's build configuration that describe hardware rather than the build: the CPU features detected at import (`SIMD Extensions`, which differ between a login node and a compute node of another CPU generation and refused every unit of a run submitted from the login node) and the build host (`Machine Information`).  Interpreter, OS family, architecture, library versions, BLAS/LAPACK build dependencies and the execution options stay strict.  A real mismatch names its fields (`describe_runtime_mismatch`, from the submission environment the manifests record; the local drivers now record it too) and `GHOST_RUNTIME_ENVIRONMENT_CHECK=warn` turns the refusal into one printed warning; `tests/diagnose_provenance.py` reports the runtime difference after the source check | `execution/provenance.py` (`runtime_compatibility_payload`, `describe_runtime_mismatch`, `verify_runtime_environment`), the four drivers, `tests/diagnose_provenance.py` | no refusal for a CPU difference; a version difference is named |
+
+Tests: `tests/test_submit_planning_2026_10.py` (hp pair records equal per-degree planning from one panel, one mesh and one near-pair count; the memo shared by mesh copies; worker-process planning identical to serial and the broken-pool fallback; worker-count rules; CPU features informational; a real mismatch named and downgraded by the switch; every driver verifies through the shared check).
+
 ## 3. Verification
 
 Reference set (`scripts/audit_2026-10-06/bench.py`, one fresh process per case, production profile, 181 angles
@@ -265,3 +274,7 @@ unmodified pre-fix tree).
 - `GHOST_CPU_RHS_COMPRESSION=on` forces the QR sweep on LU factors.
 - `GHOST_BOR_NEAR_CHECK_STRIDE=0` restores the complete coarse-level check of every BoR near point and
   meridian pair (default 4: every 4th is probed).
+- `GHOST_PLANNING_WORKERS=<n>` sets the worker processes of the submit-time 2-D planning (`PLANNING_WORKERS`
+  in the driver wins; 1 = serial).
+- `GHOST_RUNTIME_ENVIRONMENT_CHECK=warn` lets a worker solve under a numerical runtime that differs from the
+  run's recorded one, with one printed warning naming the difference (default: refuse).
