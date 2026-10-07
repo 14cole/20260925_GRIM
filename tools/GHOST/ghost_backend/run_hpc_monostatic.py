@@ -214,7 +214,7 @@ _MEMORY_SAFETY = 1.35
 _MAX_PANELS = 100_000
 # Pool workers are replaced after this many units so allocator growth from a
 # big solve cannot accumulate across a long sweep.
-_TASKS_PER_CHILD = 4
+_TASKS_PER_CHILD = 8
 # A claim whose heartbeat has been quiet this long is treated as abandoned.
 _CLAIM_STALE_SECONDS = 3600
 _GEOMETRY_EXTS = (".geo",)
@@ -432,6 +432,7 @@ def _solve_and_export(unit, context, run_dir_str):
     # Select precision inside each worker; context variables are process-local.
     from ghost_backend.linalg.refined_lu import linear_precision
     from ghost_backend.twod.samples import compact_samples
+    peak_reset = hpc_scheduler.reset_peak_rss()
     with compact_samples(), linear_precision(context.get("lu_precision", "double")):
         if context["mesh_certification"]:
             from ghost_backend.twod.solver import solve_monostatic_rcs_2d_certified
@@ -444,6 +445,7 @@ def _solve_and_export(unit, context, run_dir_str):
             result = solve_monostatic_rcs_2d_survey(**solve_kwargs)
     _verify_run_provenance(context)
     _verify_unit_input(unit, context)
+    _record_memory_evidence(result, context, unit, peak_reset)
 
     # Bind the result to its run state inside the artifact, before export, so
     # results/ holds one file per unit instead of a .grim and a sidecar.
@@ -463,20 +465,51 @@ def _solve_and_export(unit, context, run_dir_str):
     return ("written", actual_path)
 
 
+def _record_memory_evidence(result, context, unit, peak_reset):
+    """Measured peak resident size of this worker against the planner's
+    forecast, in the artifact metadata and the task log: the evidence for
+    tightening the 1.35x / 0.85 memory factors on a given cluster."""
+    measured = hpc_scheduler.peak_rss_gib()
+    forecast = context.get("forecast_peak_gib")
+    evidence = {
+        "forecast_peak_gib": (float(forecast) if forecast is not None else None),
+        "measured_peak_gib": measured,
+        "scope": ("worker_process_since_unit_start" if peak_reset
+                  else "worker_process_lifetime"),
+        "note": "Compressed tile processes are children of the worker and are not "
+                "included; the forecast covers the whole unit.",
+    }
+    metadata = result.setdefault("metadata", {})
+    if isinstance(metadata, dict):
+        metadata["execution_memory"] = evidence
+    if measured is not None:
+        ratio = ("" if not forecast else f", {measured / float(forecast):.2f} of forecast")
+        print(f"      memory {_unit_name(unit)}: forecast "
+              f"{(float(forecast) if forecast else 0.0):.2f} GiB, measured peak "
+              f"{measured:.2f} GiB ({evidence['scope']}{ratio})", flush=True)
+
+
 def _solve_and_export_star(args):
     # type: (tuple) -> tuple
     """Pool entry point: unpack args and catch exceptions in-band.
 
     The full traceback string is returned (not just str(exc)) so the SLURM log
-    shows where the failure happened, not just the message.
+    shows where the failure happened, not just the message.  The unit's CPU
+    reservation bounds its assembly threads, its CPU allocation and its BLAS
+    team alike (the pool worker's BLAS pool was started at the node's physical
+    core count so the per-unit limit can grow to the reservation).
     """
 
     unit, context, run_dir_str, assembly_threads = args
     try:
         import ghost_backend.twod.solver as rcs_solver
-        rcs_solver.set_assembly_threads(assembly_threads)
-        context = dict(context, execution_assembly_threads=assembly_threads)
-        status, path = _solve_and_export(unit, context, run_dir_str)
+        from ghost_backend.execution.thread_control import threadpool_limits
+        cpus = max(1, int(assembly_threads))
+        rcs_solver.set_assembly_threads(cpus)
+        context = dict(context, execution_assembly_threads=cpus)
+        with hpc_scheduler.cpu_allocation_scope(cpus), \
+                threadpool_limits(limits=cpus, user_api="blas"):
+            status, path = _solve_and_export(unit, context, run_dir_str)
         return ("ok", status, path)
     except Exception:
         return ("err", traceback.format_exc(), "")
@@ -559,6 +592,8 @@ def _plan_schedule(units, n_slots, fine_factor, n_angles):
         }
         records.append({
             "unit": _unit_name(unit),
+            "base_polynomial_degree": max(int(p.get("base_polynomial_degree", 1)) for p in plans.values()),
+            "fine_polynomial_degree": max(int(p.get("fine_polynomial_degree", 1)) for p in plans.values()),
             "nodes": max(int(p["nodes"]) for p in plans.values()),
             "fine_nodes": max(
                 int(p["fine_nodes"]) for p in plans.values()
@@ -811,6 +846,14 @@ def submit():
     if peaks:
         print(f"  Unit peak RAM : {min(peaks):.2f}-{max(peaks):.2f} GB "
               f"estimated (incl. {_MEMORY_SAFETY:g}x safety)")
+    hp_units = sum(int(r.get("fine_polynomial_degree", 1)) > 1 for r in schedule["units"])
+    if MESH_CERTIFICATION:
+        print(f"  Mesh path     : {hp_units} unit(s) on the hp pair (P2/P3, one coarsened "
+              f"mesh), {len(schedule['units']) - hp_units} on the linear pair "
+              f"(P1 and P1 x{float(mesh_policy['fine_factor']):g})")
+    else:
+        print(f"  Mesh path     : {len(schedule['units'])} single linear mesh(es), "
+              "uncertified (MESH_CERTIFICATION = False)")
         import ghost_backend.twod.solver as _solver
         ceiling = (
             float(MAX_SOLVE_GB) if MAX_SOLVE_GB
@@ -1002,6 +1045,7 @@ def worker(run_dir_str, submission_index, task_index):
     cores = hpc_scheduler.detect_cores()
     if blas_threads > cores:
         raise ValueError("BLAS threads per solve exceed the available CPU allocation ({}).".format(cores))
+    blas_cap = hpc_scheduler.blas_thread_cap(cores)
     memory_gb = hpc_scheduler.detect_memory_gb()
     budget_gb = max(1.0, memory_gb * _MEMORY_HEADROOM)
     worker_cap = cores if MAX_WORKERS_PER_NODE is None else max(1, int(MAX_WORKERS_PER_NODE))
@@ -1033,12 +1077,14 @@ def worker(run_dir_str, submission_index, task_index):
         pool_size if heaviest <= 0.0
         else max(1, min(pool_size, int(budget_gb // heaviest)))
     )
-    planned_thread_counts = [
-        _unit_assembly_threads(
-            cores, pool_size, budget_gb, peaks.get(_unit_name(unit), 0.0)
-        )
-        for unit in planned_units
-    ] or [1]
+    # One CPU reservation per unit: the larger of the fill rule and the unit's
+    # cost-proportional share of its phase (planned, then stealable).
+    reservations = {}
+    for share in (planned_units, steal_units):
+        reservations.update(hpc_scheduler.cpu_reservations(
+            [(_unit_name(u), costs.get(_unit_name(u), 1.0), peaks.get(_unit_name(u), 0.0)) for u in share],
+            cores, pool_size, budget_gb, configured=current_options()["assembly_threads"]))
+    planned_thread_counts = [reservations[_unit_name(unit)] for unit in planned_units] or [1]
     min_threads = min(planned_thread_counts)
     max_threads = max(planned_thread_counts)
     thread_label = (
@@ -1052,8 +1098,8 @@ def worker(run_dir_str, submission_index, task_index):
     print(f"  Units in run   : {len(units)}   planned for this slot: {planned}"
           f"   (then {len(steal_units)} stealable)")
     print(f"  Cores detected : {cores}   pool size: {pool_size}   "
-          f"(BLAS threads/worker: {blas_threads}, "
-          f"assembly threads/solve: {thread_label})")
+          f"(CPU reservation per solve, assembly and BLAS alike: "
+          f"{thread_label}; BLAS team at most {blas_cap})")
     if heaviest_concurrency < pool_size:
         print(f"  Heaviest units : {heaviest_concurrency} concurrent at "
               f"{heaviest:.1f} GB each; smaller units expand dynamically")
@@ -1084,13 +1130,14 @@ def worker(run_dir_str, submission_index, task_index):
     def _prepare(unit):
         name = _unit_name(unit)
         peak_gb = peaks.get(name, 0.0)
-        assembly_threads = _unit_assembly_threads(
+        assembly_threads = reservations.get(name) or _unit_assembly_threads(
             cores, pool_size, budget_gb, peak_gb
         )
         dispatch = (
             name, peak_gb,
             (_solve_and_export_star,
-             ((unit, dict(context, batch_backend_selection=batch_selections.get(name)),
+             ((unit, dict(context, batch_backend_selection=batch_selections.get(name),
+                          forecast_peak_gib=peak_gb),
                str(run_dir), assembly_threads),)),
         )
         if _unit_output_path(run_dir, unit).is_file():
@@ -1141,10 +1188,13 @@ def worker(run_dir_str, submission_index, task_index):
               flush=True)
 
     from ghost_backend.hpc.common import ExecutorPool
+    # Workers inherit this BLAS pool size at spawn; each unit then limits its
+    # own BLAS team to its reservation (_solve_and_export_star).
+    hpc_scheduler.pin_blas_threads(blas_cap)
     with ExecutorPool(
         processes=pool_size,
         initializer=_pool_initializer,
-        initargs=(blas_threads,),
+        initargs=(blas_cap,),
         max_tasks_per_child=_TASKS_PER_CHILD,
     ) as pool:
         dispatcher = hpc_scheduler.MemoryAwareDispatcher(
@@ -1153,10 +1203,11 @@ def worker(run_dir_str, submission_index, task_index):
         )
 
         def _resources(unit):
-            peak_gb = peaks.get(_unit_name(unit), 0.0)
+            name = _unit_name(unit)
+            peak_gb = peaks.get(name, 0.0)
             return (
                 peak_gb,
-                max(blas_threads, _unit_assembly_threads(
+                reservations.get(name) or max(blas_threads, _unit_assembly_threads(
                     cores, pool_size, budget_gb, peak_gb
                 )),
             )

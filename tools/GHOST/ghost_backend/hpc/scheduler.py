@@ -1030,6 +1030,92 @@ def assembly_threads_for_unit(
     return max(1, cores // concurrency)
 
 
+# Thread-efficiency margin of the cost-proportional CPU share: a unit that
+# would take the balanced per-core work of its share on one thread gets this
+# many times the threads that perfect scaling would need.
+CPU_RESERVATION_MARGIN = 1.5
+
+
+def cpu_reservations(units, cores, max_concurrent, budget_gb, configured='auto',
+                     margin=CPU_RESERVATION_MARGIN, cap=None):
+    """CPU reservation (assembly and BLAS threads) of every unit of one task's share.
+
+    ``units`` are ``(name, cost, peak_gb)`` records.  Each unit gets the larger
+    of the fill rule (``assembly_threads_for_unit``: the cores divided among as
+    many copies of the unit as memory and the pool admit, which alone left a
+    15 GHz unit on two threads while a 96-core node idled) and its
+    cost-proportional share, ``ceil(margin * cost / total * cores)``, so that
+    the heaviest units of a long sweep finish within the balanced per-core
+    work of the share.  ``cap`` (default: the host's physical cores, where
+    BLAS stops scaling) bounds both.  An explicit ``configured`` thread count
+    wins for every unit, as before.  Returns ``{name: cpus}``.
+    """
+    from ghost_backend.execution.options import physical_core_count
+    units = list(units)
+    cores = max(1, int(cores))
+    cap = max(1, min(cores, int(cap) if cap else physical_core_count()))
+    total = sum(max(0.0, float(cost)) for _, cost, _ in units)
+    explicit = str(configured).strip().lower() != "auto"
+    reservations = {}
+    for name, cost, peak in units:
+        fill = assembly_threads_for_unit(cores, max_concurrent, budget_gb, peak, configured)
+        if explicit:
+            reservations[name] = fill
+            continue
+        share = (int(math.ceil(float(margin) * max(0.0, float(cost)) / total * cores))
+                 if total > 0.0 else 1)
+        reservations[name] = max(1, min(cap, max(fill, share)))
+    return reservations
+
+
+def blas_thread_cap(cores=None) -> 'int':
+    """Largest BLAS team a unit may be granted: the physical cores of this host,
+    bounded by the CPU allocation.  Pool workers are started with this as their
+    BLAS pool size so a unit's per-unit limit can grow to its reservation."""
+    from ghost_backend.execution.options import physical_core_count
+    cores = detect_cores() if cores is None else max(1, int(cores))
+    return max(1, min(cores, physical_core_count()))
+
+
+def reset_peak_rss() -> 'bool':
+    """Reset this process's peak resident-size counter (Linux); False elsewhere,
+    where ``peak_rss_gib`` then reports the process lifetime peak."""
+    try:
+        with open("/proc/self/clear_refs", "w") as handle:
+            handle.write("5")
+        return True
+    except OSError:
+        return False
+
+
+def peak_rss_gib() -> 'Optional[float]':
+    """Peak resident size of this process in GiB (since the last reset on
+    Linux), or None when no probe is available."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return float(line.split()[1]) * 1024.0 / BYTES_PER_GIB
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import psutil  # type: ignore
+        info = psutil.Process().memory_info()
+        peak = getattr(info, "peak_wset", None)
+        if peak:
+            return float(peak) / BYTES_PER_GIB
+    except Exception:
+        pass
+    try:
+        import resource  # type: ignore
+        peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if peak > 0:
+            scale = 1.0 if sys.platform == "darwin" else 1024.0
+            return peak * scale / BYTES_PER_GIB
+    except Exception:
+        pass
+    return None
+
+
 def predict_bor_extent(
     geometry_path: 'str',
     geometry_units: 'str',

@@ -178,6 +178,23 @@ allocation, equal to a fresh forecast.
 
 Tests: `tests/test_submit_planning_2026_10.py` (hp pair records equal per-degree planning from one panel, one mesh and one near-pair count; the memo shared by mesh copies; worker-process planning identical to serial and the broken-pool fallback; worker-count rules; CPU features informational; a real mismatch named and downgraded by the switch; every driver verifies through the shared check).
 
+### 2.9 Node utilization on the HPC and local 2-D drivers (third round)
+
+| ID | Change | Files | Measured effect |
+|---|---|---|---|
+| CPU reservation | Each unit's CPU reservation is the larger of the former fill rule (the cores divided among as many copies of the unit as memory and the pool admit) and its cost-proportional share of the task's work, `ceil(1.5 x cost / total x cores)`, capped at the node's physical cores (`cpu_reservations`).  The reservation now bounds the unit's assembly threads, its CPU allocation (`cpu_allocation_scope`) and its BLAS team (`threadpool_limits` in the pool worker, whose BLAS pool is started at the node's physical core count instead of the former fixed two threads).  The fill rule alone put every unit of a 71-frequency airfoil sweep on two threads, including the 15 GHz unit that is twice the balanced per-core work, and lost the remainder of `cores // pool` to idle cores | `hpc/scheduler.py` (`cpu_reservations`, `blas_thread_cap`), `run_hpc_monostatic.py`, `run_local_monostatic.py` | airfoil 1-15 GHz, 71 units, 96-CPU / 700 GB node model, first admission wave: 1 node 48 units on 96 CPUs with the heaviest unit on 2 threads -> 20 units on 96 CPUs, heaviest on 6; 2 nodes 36 units on 72 CPUs, heaviest on 2 -> 11 units on 96 CPUs, heaviest on 12; 4 nodes 85 -> 95 CPUs, heaviest 5 -> 23 threads; 8 nodes 90 -> 91 CPUs, heaviest 10 -> 45 threads |
+| Memory evidence | Every unit records the planner's forecast and the worker's measured peak resident size (`execution_memory` in the artifact metadata, one line in the task log; the Linux peak counter is reset per unit, elsewhere the process lifetime is reported).  The 1.35x safety and 0.85 headroom factors are unchanged until such evidence from a cluster shows the forecast conservative | both 2-D drivers, `hpc/scheduler.py` (`reset_peak_rss`, `peak_rss_gib`) | evidence only |
+| Mesh path report | The submit summary and `schedule.json` say which mesh path each unit takes: the hp pair (P2/P3 on one coarsened mesh), the linear pair, or a single uncertified linear mesh | `run_hpc_monostatic.py` | none (information) |
+| Worker recycling | HPC 2-D pool workers are recycled every 8 units, as the local driver already does | `run_hpc_monostatic.py` | one spawn and backend import fewer per 8 units |
+
+Measured and not changed:
+
+- **Native per-tile-group far build (F-BoR-4).** On a 480-element cylinder at 10 GHz the far build is 2.5 s of a 27.4 s solve (9%) and on an 800-element sphere at ka = 63 it is 16.3 s of 126.3 s (13%), single worker; the near contraction is 78-82% and already runs inside the native near rule.  A fused native far build would recover 20-30% of the far build, 2-4% of the solve, which does not pay for native code.
+- **Vectorized node welding in the 2-D mesh builder.** 0.2-0.3 s per mesh at 5,666 panels; the welder's tolerance semantics fix the node numbering, and an exact vectorized replica was not worth that saving.
+- The batch backend chooser's internal schedule model keeps the fill rule for its relative comparison of dense and compressed schedules.
+
+Tests: `tests/test_hpc_allocation_2026_10.py` (uniform shares fill the cores, heavy units get their cost share and light ones one CPU, memory-bound units keep the fill rule, explicit settings win, the BLAS cap and memory probes, the drivers apply reservation and evidence, the schedule records carry the mesh path).
+
 ## 3. Verification
 
 Reference set (`scripts/audit_2026-10-06/bench.py`, one fresh process per case, production profile, 181 angles
