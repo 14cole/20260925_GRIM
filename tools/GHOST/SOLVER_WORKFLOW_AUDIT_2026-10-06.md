@@ -8,7 +8,13 @@ The three earlier audits (22 and 24 September, 2 October) are the baseline; noth
 
 Implementation status (6 October, later the same day): the recommendations were implemented under a 1e-8
 accuracy rule; `AUDIT_FIXES_2026-10-06.md` lists each change, its measured equivalence and effect, and the
-items deliberately left out (accuracy-policy trade-offs, native-code work, dead-code deletion).
+items deliberately left out of that first pass. Those items (dead code, the check-only and coarse-level
+sampling, finer far-rule grading rows, the compressed TM partner in RAM, admission sampling on threads, the
+far-tile 2 pi glue, grouped dense-table contractions, a far-ratio split, the HODLR threshold) were then
+measured as overlays in `experiments/solver_upgrades_20261006/` at the repository root; the dead code was
+removed, the BoR sampled coarse-level checks (no field change, 8-21% of BoR wall) and the drivers' overhead
+items were ported, and every rejected candidate is recorded there with its measurement
+(`AUDIT_FIXES_2026-10-06.md` sections 2.5-2.7 and 4).
 
 Method: full read of the production call chains; five subsystem reviews with their own measurements (2-D assembly,
 2-D dense/compressed stack, BoR far-block pipeline, BoR solver core, drivers/planning/provenance/IO); a profiling

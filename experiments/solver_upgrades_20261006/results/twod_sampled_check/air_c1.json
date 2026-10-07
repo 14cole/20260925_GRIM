@@ -1,0 +1,90 @@
+{
+ "case": "air_c1",
+ "spec": {
+  "kind": "2d",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\airfoil.geo",
+  "units": "inches",
+  "ghz": 1.0,
+  "set": "quick"
+ },
+ "import_seconds": 0.0312980000016978,
+ "wall": 2.3265557999984594,
+ "stage_seconds": {
+  "operators": 1.3929591000051005,
+  "condition_scaling": 0.021236200002022088,
+  "factorization": 0.10186669998802245,
+  "condition_estimation": 0.040277600011904724,
+  "excitation": 0.049078199997893535,
+  "rhs_solve": 0.013284200002090074,
+  "linear_solve": 0.021829400007845834,
+  "rhs_compression": 0.16812289999506902,
+  "far_field": 0.006815699991420843,
+  "mesh_certification": 0.002406400002655573
+ },
+ "backend": "dense",
+ "planning_seconds": 0.1721720999921672,
+ "adaptive_used": true,
+ "adaptive_fallback": false,
+ "steps": [
+  {
+   "polynomial_degree": 2,
+   "panels": 414,
+   "nodes": 834,
+   "seconds": 1.2339710999949602,
+   "backend": "dense"
+  },
+  {
+   "polynomial_degree": 3,
+   "panels": 414,
+   "nodes": 1248,
+   "seconds": 0.7884716999978991,
+   "backend": "dense"
+  }
+ ],
+ "panel_count": 414,
+ "nodes": 1248,
+ "degree": 3,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": true,
+ "warnings": [
+  "Geometry contains 4 high-degree node(s) (>2 connected primitives)."
+ ],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 1294,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.03226610001001973
+  },
+  {
+   "label": null,
+   "unknowns": 1294,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.031941299996105954
+  },
+  {
+   "label": null,
+   "unknowns": 1936,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.07453359999635722
+  },
+  {
+   "label": null,
+   "unknowns": 1936,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.08598680001159664
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

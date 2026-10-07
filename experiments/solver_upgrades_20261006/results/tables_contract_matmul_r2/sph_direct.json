@@ -1,0 +1,41 @@
+{
+ "case": "sph_direct",
+ "spec": {
+  "kind": "bor_direct",
+  "fn": "solve_bor",
+  "a": 0.1,
+  "n": 100,
+  "ghz": 4.77,
+  "angles": 37,
+  "workers": 4,
+  "set": "quick"
+ },
+ "import_seconds": 9.849999332800508e-05,
+ "wall": 1.581990799997584,
+ "stage_seconds": {
+  "operators": 1.368503999998211,
+  "modal_assembly": 0.045916199960629456,
+  "factorization": 0.011833999946247786,
+  "condition_estimate": 0.001852999979746528,
+  "excitation": 0.1297393999993801,
+  "rhs_solve": 0.006957900070119649,
+  "rhs_compression": 0.023345399982645176,
+  "far_field": 0.03440249996492639
+ },
+ "modes_used": 19,
+ "mode_cap": 22,
+ "mode_tasks_started": 21,
+ "unknowns": 202,
+ "assembly": "streaming",
+ "near_preparation": {
+  "workers": 8,
+  "scratch_gb": 3.683483648,
+  "scratch_bytes_per_worker": 192000000,
+  "process_overhead_bytes_per_worker": 268435456,
+  "process_workers": 8,
+  "memory_limit_gb": 16.320043008,
+  "backend": "processes",
+  "process_pair_jobs": 688
+ },
+ "stream_sampling_backend": "banded_native_pairs"
+}

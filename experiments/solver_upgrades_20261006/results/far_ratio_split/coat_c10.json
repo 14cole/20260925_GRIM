@@ -1,0 +1,109 @@
+{
+ "case": "coat_c10",
+ "spec": {
+  "kind": "2d",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\tools\\GHOST\\ghost_backend\\validation\\material_examples\\type4_pec_backed_coating.geo",
+  "units": "meters",
+  "ghz": 10.0,
+  "set": "full"
+ },
+ "import_seconds": 0.004682699989643879,
+ "wall": 1.3649966999946628,
+ "stage_seconds": {
+  "operators": 0.8418823999963934,
+  "condition_scaling": 0.004651399998692796,
+  "factorization": 0.021946699998807162,
+  "condition_estimation": 0.008653299999423325,
+  "excitation": 0.030639299991889857,
+  "rhs_solve": 0.012344800008577295,
+  "linear_solve": 0.046990399991045706,
+  "rhs_compression": 0.04878799997095484,
+  "far_field": 0.004458000010345131,
+  "mesh_certification": 0.0032012000010581687
+ },
+ "backend": "dense",
+ "planning_seconds": 0.12046780000673607,
+ "adaptive_used": true,
+ "adaptive_fallback": false,
+ "steps": [
+  {
+   "polynomial_degree": 2,
+   "panels": 104,
+   "nodes": 208,
+   "seconds": 0.3380743000016082,
+   "backend": "dense"
+  },
+  {
+   "polynomial_degree": 3,
+   "panels": 104,
+   "nodes": 312,
+   "seconds": 0.22126550000393763,
+   "backend": "dense"
+  },
+  {
+   "polynomial_degree": 3,
+   "panels": 185,
+   "nodes": 555,
+   "seconds": 0.5515229000011459,
+   "backend": "dense"
+  }
+ ],
+ "panel_count": 185,
+ "nodes": 555,
+ "degree": 3,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": true,
+ "warnings": [],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 320,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.005959299989626743
+  },
+  {
+   "label": null,
+   "unknowns": 320,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.005563300015637651
+  },
+  {
+   "label": null,
+   "unknowns": 480,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.008402600011322647
+  },
+  {
+   "label": null,
+   "unknowns": 480,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.018572700006188825
+  },
+  {
+   "label": null,
+   "unknowns": 906,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.028695399989373982
+  },
+  {
+   "label": null,
+   "unknowns": 906,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.023797600006219
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

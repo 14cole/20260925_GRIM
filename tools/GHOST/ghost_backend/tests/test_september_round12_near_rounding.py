@@ -7,6 +7,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ghost_backend.bor import kernels, solver as bor
+import legacy_near_rules as legacy
 
 # The pair on which a graded 240-element sphere stopped: 2.3e-7 m apart at rho = 0.1 m, same element.
 POINT = (0.0999995129968009, 0.00030750568258239226, 0.002454366796437894, -0.9999969880372783,
@@ -38,7 +39,7 @@ class StableBracketTests(unittest.TestCase):
         skew = angle+rng.normal(0, .3, count)
         points = (rho_p, z_p, np.cos(angle), np.sin(angle), rho_p+gap*np.cos(direction), z_p+gap*np.sin(direction),
                   np.cos(skew), np.sin(skew))
-        for rule in (kernels._mfie_kernels_near_rule, kernels._ibc_kernels_near_rule):
+        for rule in (legacy._mfie_kernels_near_rule, legacy._ibc_kernels_near_rule):
             for wavenumber in (33., 33.-4j):
                 with self.subTest(rule=rule.__name__, k=wavenumber):
                     sampled = rule(*points, wavenumber, 6, order=64, tail_order=96)
@@ -49,7 +50,7 @@ class StableBracketTests(unittest.TestCase):
 
     def test_sampled_brackets_have_a_rounding_floor_the_closed_forms_do_not(self):
         point = _separated(1e-6)
-        for rule in (kernels._mfie_kernels_near_rule, kernels._ibc_kernels_near_rule):
+        for rule in (legacy._mfie_kernels_near_rule, legacy._ibc_kernels_near_rule):
             with self.subTest(rule=rule.__name__):
                 sampled = rule(*point, K, M_MAX, order=3000, tail_order=3000)
                 stable = rule(*point, K, M_MAX, order=3000, tail_order=3000, stable=True)
@@ -59,8 +60,8 @@ class StableBracketTests(unittest.TestCase):
 
     def test_checked_rules_recover_instead_of_raising(self):
         # "BoR near angular quadrature did not converge at the maximum order ... relative change=4.83e-08"
-        for checked, rule in ((kernels.mfie_kernels_near, kernels._mfie_kernels_near_rule),
-                              (kernels.ibc_kernels_near, kernels._ibc_kernels_near_rule)):
+        for checked, rule in ((kernels.mfie_kernels_near, legacy._mfie_kernels_near_rule),
+                              (kernels.ibc_kernels_near, legacy._ibc_kernels_near_rule)):
             with self.subTest(rule=rule.__name__):
                 values = checked(*POINT, 3.3/.1, M_MAX)
                 reference = rule(*[np.array([value]) for value in POINT], 3.3/.1, M_MAX, order=3000, tail_order=3000,

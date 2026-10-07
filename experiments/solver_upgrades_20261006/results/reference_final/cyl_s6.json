@@ -1,0 +1,43 @@
+{
+ "case": "cyl_s6",
+ "spec": {
+  "kind": "bor",
+  "mode": "survey",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\tools\\GHOST\\ghost_backend\\geometry\\geometries\\BOR\\pec_cylinder_r4_h10_in.geo",
+  "units": "inches",
+  "ghz": 6.0,
+  "workers": 4,
+  "set": "full"
+ },
+ "import_seconds": 0.2588953000085894,
+ "wall": 2.2009241999912774,
+ "stage_seconds": {
+  "operators": 1.6800928000011481,
+  "modal_assembly": 0.10590160002175253,
+  "factorization": 0.0355931000522105,
+  "condition_estimate": 0.005411100020864978,
+  "excitation": 0.8812225999572547,
+  "rhs_solve": 0.08322159998351708,
+  "rhs_compression": 0.1953752999252174,
+  "far_field": 0.3256267000979278
+ },
+ "modes_used": 23,
+ "mode_cap": 25,
+ "mode_tasks_started": null,
+ "unknowns": 370,
+ "assembly": "streaming",
+ "near_preparation": {
+  "workers": 8,
+  "scratch_gb": 3.683483648,
+  "scratch_bytes_per_worker": 192000000,
+  "process_overhead_bytes_per_worker": 268435456,
+  "process_workers": 8,
+  "memory_limit_gb": 16.3385892864,
+  "backend": "processes",
+  "process_pair_jobs": 1236
+ },
+ "certified": false,
+ "warnings": [
+  "SURVEY MODE: solved on the base BoR mesh only. No mesh-convergence certificate exists for this field."
+ ]
+}

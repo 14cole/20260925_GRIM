@@ -1,0 +1,17 @@
+[experiment] bor_sampled_meridian {'batches': 4, 'pairs': 73, 'probed': 20, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 107, 'points': 72664, 'probed': 18195, 'fallbacks': 0}
+[experiment] bor_sampled_meridian {'batches': 5, 'pairs': 91, 'probed': 25, 'fallbacks': 0}
+[experiment] bor_sampled_meridian {'batches': 5, 'pairs': 80, 'probed': 23, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 133, 'points': 88560, 'probed': 22173, 'fallbacks': 0}
+[experiment] bor_sampled_meridian {'batches': 5, 'pairs': 85, 'probed': 23, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 128, 'points': 93672, 'probed': 23451, 'fallbacks': 0}
+[experiment] bor_sampled_meridian {'batches': 5, 'pairs': 93, 'probed': 25, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 140, 'points': 84788, 'probed': 21238, 'fallbacks': 0}
+[experiment] bor_sampled_meridian {'batches': 5, 'pairs': 89, 'probed': 25, 'fallbacks': 0}
+[experiment] bor_sampled_meridian {'batches': 5, 'pairs': 88, 'probed': 24, 'fallbacks': 0}
+[experiment] bor_sampled_meridian {'batches': 5, 'pairs': 87, 'probed': 24, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 139, 'points': 90036, 'probed': 22548, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 139, 'points': 89456, 'probed': 22397, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 122, 'points': 86920, 'probed': 21754, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 149, 'points': 92668, 'probed': 23217, 'fallbacks': 0}
+[cyl_s6] wall 2.453 s

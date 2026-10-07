@@ -10,6 +10,7 @@ from scipy.special import hankel2
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[2]), str(Path(__file__).resolve().parent)]
 from ghost_backend.bor import kernels, streaming, solver as bor
+import legacy_near_rules as legacy
 from ghost_backend.execution import cpu, options
 from ghost_backend.execution.thread_control import threadpool_info, threadpool_limits
 from ghost_backend.twod import solver as td, operators as ops
@@ -44,7 +45,7 @@ class BorSamplingTests(unittest.TestCase):
                             return [np.concatenate([r[j] for r in rows]) for j in range(4)]
                     positive, negative = numpy_grid(xi), numpy_grid(-xi)
                     projected = kernels._project_parity_brackets(positive,weights,xi,modes)
-                    reference = kernels._project_pm_brackets(positive,negative,weights,xi,modes)
+                    reference = legacy._project_pm_brackets(positive,negative,weights,xi,modes)
                     for actual, expected in zip(projected,reference):
                         np.testing.assert_allclose(actual,expected,rtol=5e-13,atol=2e-14)
                     if native is not None and hasattr(native,'near_brackets'):

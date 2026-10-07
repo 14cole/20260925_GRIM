@@ -1,0 +1,41 @@
+{
+ "case": "cyl_c2",
+ "spec": {
+  "kind": "bor",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\tools\\GHOST\\ghost_backend\\geometry\\geometries\\BOR\\pec_cylinder_r4_h10_in.geo",
+  "units": "inches",
+  "ghz": 2.0,
+  "workers": 4,
+  "set": "quick"
+ },
+ "import_seconds": 0.25349990000540856,
+ "wall": 2.2979459000052884,
+ "stage_seconds": {
+  "operators": 1.941470699995989,
+  "modal_assembly": 0.05415859998902306,
+  "factorization": 0.011167800024850294,
+  "condition_estimate": 0.002373799987253733,
+  "excitation": 0.5190917000145419,
+  "rhs_solve": 0.03017950001230929,
+  "rhs_compression": 0.09232319999136962,
+  "far_field": 0.150056299942662
+ },
+ "modes_used": 12,
+ "mode_cap": 17,
+ "mode_tasks_started": null,
+ "unknowns": 188,
+ "assembly": "streaming",
+ "near_preparation": {
+  "workers": 8,
+  "scratch_gb": 3.683483648,
+  "scratch_bytes_per_worker": 192000000,
+  "process_overhead_bytes_per_worker": 268435456,
+  "process_workers": 8,
+  "memory_limit_gb": 16.2937294848,
+  "backend": "processes",
+  "process_pair_jobs": 615
+ },
+ "certified": true,
+ "warnings": []
+}

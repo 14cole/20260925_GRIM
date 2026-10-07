@@ -75,14 +75,6 @@ def _contract_test_side(kernel, left, re: 'int', go: 'int') -> 'np.ndarray':
     return product.reshape(re, left.shape[0], P, no)
 
 
-def _contract_source_side(values, right) -> 'np.ndarray':
-    """``values [P, no]`` x ``right [ne, go, 2]`` -> ``[ne, no, 2]``."""
-    ne, go = right.shape[0], right.shape[1]
-    no = values.shape[1]
-    arranged = np.ascontiguousarray(values.reshape(ne, go, no).transpose(0, 2, 1))
-    return np.matmul(arranged, right)
-
-
 def _contract_source_group(values, stacked) -> 'np.ndarray':
     """``values [re, fc*go, no]`` x ``stacked [fc, w, go]`` -> ``[fc, re, w, no]``.
 

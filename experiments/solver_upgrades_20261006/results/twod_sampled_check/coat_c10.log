@@ -1,0 +1,2 @@
+[coat_c10] wall 1.343 s
+[experiment] twod_sampled_check {'batches': 8, 'tasks': 2026, 'probed': 524, 'fallbacks': 7}

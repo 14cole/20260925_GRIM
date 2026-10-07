@@ -454,20 +454,6 @@ def _residual_norm(a_mat: 'np.ndarray', x: 'np.ndarray', b: 'np.ndarray') -> 'fl
         denom = 1.0
     return float(np.linalg.norm(a_mat @ x - b) / denom)
 
-def _residual_norm_many(a_mat: 'np.ndarray', x_mat: 'np.ndarray', b_mat: 'np.ndarray') -> 'np.ndarray':
-    """Vectorized residual norms for matrix right-hand-sides."""
-
-    x_eval = np.asarray(x_mat)
-    b_eval = np.asarray(b_mat)
-    if x_eval.ndim == 1:
-        return np.asarray([_residual_norm(a_mat, x_eval, b_eval)], dtype=float)
-
-    residual = a_mat @ x_eval - b_eval
-    num = np.linalg.norm(residual, axis=0)
-    den = np.linalg.norm(b_eval, axis=0)
-    den = np.where(den <= EPS, 1.0, den)
-    return np.asarray(num / den, dtype=float)
-
 def _summarize_residuals(values: 'List[float]') -> 'Tuple[float, float, int]':
     """Return finite max/mean and the number of non-finite residuals."""
 
@@ -1568,20 +1554,6 @@ def _estimate_memory_gb(
             + recycling_capacity_bytes()) / 1024**3
 
 
-def _solve_te_robin_mfie(mesh, infos, pol, k0, elevations_deg, obs_order=8, src_order=8,
-                         solver_method="auto", condition_diagnostics=None, operator_cache=None):
-    """Guarded private alias for the TE limit of the Robin single-layer route.
-
-    The monostatic dispatch calls ``_solve_robin_bie`` for both polarizations --
-    TE is the MFIE limit of the same equation, so there is one code path. This
-    wrapper only survives for the retired-``solver_method`` contract that
-    ``test_direct_solver_methods`` pins on the private formulations; delete both
-    together if that contract is not wanted.
-    """
-    _normalize_public_2d_solver_method(solver_method)
-    return _solve_robin_bie(mesh, infos, pol, k0, elevations_deg, obs_order, src_order,
-                            condition_diagnostics, operator_cache)
-
 def _has_sheet(infos: 'List[PanelCoupledInfo]') -> 'bool':
     """True if any element is a TYPE 1 free-floating resistive/reactive sheet.
 
@@ -1867,11 +1839,6 @@ def _solve_robin_bie(mesh, infos, pol, k0, elevations_deg, obs_order=8, src_orde
         lambda angles: _robin_bie_rhs_many(mesh, alpha, pec, pol, k0, angles),
         condition_diagnostics, 'Robin-BIE IBC system', order=obs_order)[:3]
 
-
-def _make_elem_mask(elem_ids, n_total):
-    mask = np.zeros(n_total, dtype=bool)
-    for eidx in elem_ids: mask[eidx] = True
-    return mask
 
 def _count_distinct_regions(infos):
     regions = set()

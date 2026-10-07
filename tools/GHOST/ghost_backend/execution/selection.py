@@ -60,16 +60,14 @@ def _select_backend(arguments, options, certified=False, checkpoint=None):
     if arguments.get('mesh_reference_ghz') is not None:
         inputs['mesh_frequencies_ghz'] = mesh_frequencies(arguments['frequencies_ghz'])
     normalized = validate_options(options)
-    from ghost_backend.execution.options import (
-        effective_assembly_threads, blas_thread_reservation, allocated_memory_budget,
-    )
     from ghost_backend.linalg.refined_lu import requested_precision
-    with execution_scope(dict(normalized, factorization='dense')):
-        allocation = (effective_assembly_threads(), blas_thread_reservation(),
-                      allocated_memory_budget(), requested_precision())
     # Retain only a digest: large geometry snapshots and angle grids must not be
-    # repeated in every frequency's cache key.
-    key = hashlib.sha256(json.dumps([inputs, normalized, allocation], sort_keys=True).encode('utf-8')).digest() if cache is not None else None
+    # repeated in every frequency's cache key.  The CPU/RAM allocation is not
+    # part of the key: a reused forecast is repriced under the current
+    # allocation (_refresh_memory_forecast), so the sweep planner, which
+    # selects under each worker's share, reuses the preview's records instead
+    # of building every candidate mesh again (October 2026 audit, R-2D-7).
+    key = hashlib.sha256(json.dumps([inputs, normalized, requested_precision()], sort_keys=True).encode('utf-8')).digest() if cache is not None else None
     if cache is not None and key in cache:
         cached, resource_records = cache[key]
         result = copy.deepcopy(cached)
@@ -106,16 +104,20 @@ def _select_backend(arguments, options, certified=False, checkpoint=None):
 
 
 def _refresh_memory_forecast(result, resource_records, arguments, options, checkpoint=None):
-    """Reprice saved geometry resources with current RAM and storage limits.
+    """Reprice saved geometry resources with current RAM, storage and CPU limits.
 
     Automatic compressed storage and dense residual storage depend on live
-    memory, so retaining the old peak and merely re-ranking is insufficient.
+    memory, so retaining the old peak and merely re-ranking is insufficient;
+    the work prior depends on the thread allocation, so the cost is summed
+    again under the current one (same records, same formula as the forecast).
     Only small geometry resource counts are cached; no meshes or operators.
     """
     from ghost_backend.twod import solver as s
     for candidate in result['candidates'].values():
         candidate['peak_gb'] = 0.
+        candidate['cost'] = 0.
     dense = dict(options, factorization='dense')
+    n_rhs = len(arguments['elevations_deg'])
     with execution_scope(dense):
         budget = s._solve_memory_limit_gb()
         for record, (resources, mesh_options) in zip(result['meshes'], resource_records):
@@ -132,6 +134,10 @@ def _refresh_memory_forecast(result, resource_records, arguments, options, check
                         operator_matrices=resources['operator_matrices'], dense_resources=dict(resources),
                         n_rhs=len(arguments['elevations_deg']), solver_method='experimental_cpu')
                 result['candidates'][mode]['peak_gb'] = max(result['candidates'][mode]['peak_gb'], peaks[mode])
+            with execution_scope(mesh_options):
+                threads = work_threads(resources['system_dofs'], mesh_options)
+            for mode in result['candidates']:
+                result['candidates'][mode]['cost'] += relative_cost(resources, n_rhs, mode, *threads)
             record.update(dense_peak_gib=peaks['dense'], backend_peak_gib=peaks)
     ranked = rank_candidates(result['candidates'], budget)
     result.update(selected=ranked[0], retry_order=ranked[1:], admission_budget_gib=budget,

@@ -1,0 +1,43 @@
+{
+ "case": "sph_coated",
+ "spec": {
+  "kind": "bor_direct",
+  "fn": "solve_bor_coated_pec",
+  "a": 0.1,
+  "n": 60,
+  "ghz": 2.0,
+  "angles": 19,
+  "workers": 4,
+  "eps_r": "(3-0.1j)",
+  "mu_r": "(1-0.02j)",
+  "set": "quick"
+ },
+ "import_seconds": 0.23611820000223815,
+ "wall": 2.7395067000034032,
+ "stage_seconds": {
+  "operators": 2.4715031999949133,
+  "modal_assembly": 0.4385053000005428,
+  "factorization": 0.02012770005967468,
+  "condition_estimate": 0.004721800025436096,
+  "excitation": 0.03485850001743529,
+  "rhs_solve": 0.006172699955641292,
+  "rhs_compression": 0.019328700014739297,
+  "far_field": 0.022050299958209507
+ },
+ "modes_used": 13,
+ "mode_cap": 18,
+ "mode_tasks_started": 15,
+ "unknowns": 342,
+ "assembly": "tables",
+ "near_preparation": {
+  "workers": 8,
+  "scratch_gb": 1.536,
+  "scratch_bytes_per_worker": 192000000,
+  "process_overhead_bytes_per_worker": 0,
+  "process_workers": 8,
+  "memory_limit_gb": 16.9380016128,
+  "backend": "threads",
+  "process_pair_jobs": 0
+ },
+ "stream_sampling_backend": null
+}

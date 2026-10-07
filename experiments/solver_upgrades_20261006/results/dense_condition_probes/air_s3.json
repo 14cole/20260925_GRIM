@@ -1,0 +1,61 @@
+{
+ "case": "air_s3",
+ "spec": {
+  "kind": "2d",
+  "mode": "survey",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\airfoil.geo",
+  "units": "inches",
+  "ghz": 3.0,
+  "set": "quick"
+ },
+ "import_seconds": 0.0009079000010387972,
+ "wall": 12.320307000001776,
+ "stage_seconds": {
+  "operators": 4.25130709997029,
+  "condition_scaling": 0.2908432999975048,
+  "factorization": 4.755460000000312,
+  "condition_estimation": 0.4986230000067735,
+  "excitation": 0.09069659998931456,
+  "rhs_solve": 0.38953710001078434,
+  "linear_solve": 0.7600140000140527,
+  "rhs_compression": 0.7646078999969177,
+  "far_field": 0.1792696999909822
+ },
+ "backend": "dense",
+ "planning_seconds": 0.39269200000853743,
+ "adaptive_used": null,
+ "adaptive_fallback": null,
+ "steps": [],
+ "panel_count": 5666,
+ "nodes": 5672,
+ "degree": 1,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": false,
+ "warnings": [
+  "Geometry contains 4 high-degree node(s) (>2 connected primitives).",
+  "SURVEY MODE: VV and HH were solved on the base mesh only; no mesh-convergence certificate exists for either channel."
+ ],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 8608,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 3.4004505000048084
+  },
+  {
+   "label": null,
+   "unknowns": 8608,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 3.332623500013142
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

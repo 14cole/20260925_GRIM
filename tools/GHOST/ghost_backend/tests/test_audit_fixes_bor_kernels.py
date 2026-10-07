@@ -20,6 +20,7 @@ from scipy.special import roots_legendre
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ghost_backend.bor import kernels
 from ghost_backend.bor import streaming
+import legacy_near_rules as legacy
 
 
 # --------------------------------------------------------------------------
@@ -135,7 +136,7 @@ class SpuriousConvergenceTests(unittest.TestCase):
         point = _pair(1e-8)
         args = tuple(np.array([point[i]]) for i in (0, 1, 4, 5))
         try:
-            got = kernels._checked_near_kernels(kernels._modal_kernels_near_rule, args,
+            got = kernels._checked_near_kernels(legacy._modal_kernels_near_rule, args,
                                                 self.K, self.M_MAX, 48, 0, False)[0]
         except ValueError as exc:
             self.assertIn('did not converge', str(exc))

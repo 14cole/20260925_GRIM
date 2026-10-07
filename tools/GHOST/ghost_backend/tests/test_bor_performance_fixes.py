@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ghost_backend.bor import kernels
 from ghost_backend.bor import solver as bor
+import legacy_near_rules as legacy
 
 C0 = bor.C0
 FREQUENCY_HZ = 1.0e9
@@ -83,7 +84,7 @@ class NearKernelRefinementTests(unittest.TestCase):
         args = (rp, zp, np.full(n, trp), np.full(n, tzp),
                 rq, zq, np.full(n, trq), np.full(n, tzq))
         sizes = []
-        rule = kernels._mfie_kernels_near_rule
+        rule = legacy._mfie_kernels_near_rule
 
         def spy(*a, **kw):
             sizes.append(len(np.atleast_1d(a[0])))
@@ -120,7 +121,7 @@ class ParallelNearPreparationTests(unittest.TestCase):
                          serial.near_quadrature_order_max)
 
     def test_map_preserves_order_and_propagates_failures(self):
-        self.assertEqual(bor._map_near_pairs(lambda p: p * 2, range(40), 4),
+        self.assertEqual(list(bor._iter_near_pairs(lambda p: p * 2, range(40), 4)),
                          [2 * p for p in range(40)])
 
         def failing(pair):
@@ -129,7 +130,7 @@ class ParallelNearPreparationTests(unittest.TestCase):
             return pair
 
         with self.assertRaisesRegex(RuntimeError, "abort requested"):
-            bor._map_near_pairs(failing, range(40), 4)
+            list(bor._iter_near_pairs(failing, range(40), 4))
 
     def test_near_worker_count_is_bounded_by_scratch_budget(self):
         self.assertEqual(bor._near_preparation_workers(1), 1)
@@ -263,9 +264,9 @@ class NativeNearBracketTests(unittest.TestCase):
 
     def test_per_pair_grid_near_rule_matches_numpy(self):
         points = _pair_points(48, seed=23)
-        native = kernels._mfie_kernels_near_rule(*points, self.K, 6)
+        native = legacy._mfie_kernels_near_rule(*points, self.K, 6)
         with _numpy_brackets():
-            reference = kernels._mfie_kernels_near_rule(*points, self.K, 6)
+            reference = legacy._mfie_kernels_near_rule(*points, self.K, 6)
         for got, want in zip(native, reference):
             np.testing.assert_allclose(got, want, rtol=1e-11, atol=0.0)
 
@@ -322,7 +323,7 @@ class ModalProjectionTests(unittest.TestCase):
                 weights = rng.standard_normal((pairs, samples))
                 xi = rng.standard_normal((pairs, samples))
                 modes = np.arange(-m_max, m_max + 1)
-                got = kernels._project_pm_brackets(Fp, Fm, weights, xi, modes)
+                got = legacy._project_pm_brackets(Fp, Fm, weights, xi, modes)
                 want = self._signed_reference(Fp, Fm, weights, xi, modes)
                 self.assertEqual(len(got), len(want))
                 for a, b in zip(got, want):
@@ -336,7 +337,7 @@ class ModalProjectionTests(unittest.TestCase):
         weights = rng.standard_normal((6, 16))
         xi = rng.standard_normal((6, 16))
         m_max = 3
-        projected = kernels._project_pm_brackets(
+        projected = legacy._project_pm_brackets(
             shared, list(shared), weights, xi, np.arange(-m_max, m_max + 1)
         )
         for bracket in projected:
@@ -354,7 +355,7 @@ class ModalProjectionTests(unittest.TestCase):
         weights = rng.standard_normal((5, 12))
         xi = rng.standard_normal((5, 12))
         m_max = 3
-        projected = kernels._project_pm_brackets(
+        projected = legacy._project_pm_brackets(
             shared, [-value for value in shared], weights, xi,
             np.arange(-m_max, m_max + 1),
         )

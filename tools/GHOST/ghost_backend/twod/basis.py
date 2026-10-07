@@ -64,23 +64,16 @@ def enrich(mesh, stats=None):
 
 def mass_block(element):
     degree = len(element.node_ids) - 1
-    return element.length * _reference_blocks(degree)[0]
-
-
-def stiffness_block(element):
-    degree = len(element.node_ids) - 1
-    return _reference_blocks(degree)[1] / element.length
+    return element.length * _reference_mass(degree)
 
 
 @lru_cache(maxsize=4)
-def _reference_blocks(degree):
+def _reference_mass(degree):
     q, w = np.polynomial.legendre.leggauss(degree + 1)
     phi = values((q + 1) / 2, degree)
-    dphi = values((q + 1) / 2, degree, True)
     mass = (phi.T * (w / 2)) @ phi
-    stiffness = (dphi.T * (w / 2)) @ dphi
-    mass.flags.writeable = stiffness.flags.writeable = False
-    return mass, stiffness
+    mass.flags.writeable = False
+    return mass
 
 
 @lru_cache(maxsize=32)

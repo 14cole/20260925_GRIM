@@ -1,0 +1,43 @@
+{
+ "case": "sph_diel",
+ "spec": {
+  "kind": "bor_direct",
+  "fn": "solve_bor_dielectric",
+  "a": 0.1,
+  "n": 60,
+  "ghz": 2.0,
+  "angles": 19,
+  "workers": 4,
+  "eps_r": "(3-0.1j)",
+  "mu_r": "(1-0.02j)",
+  "set": "quick"
+ },
+ "import_seconds": 9.929999941959977e-05,
+ "wall": 1.4919434999901569,
+ "stage_seconds": {
+  "operators": 1.2944589999970049,
+  "modal_assembly": 0.21324179996736348,
+  "factorization": 0.012072899960912764,
+  "condition_estimate": 0.0028632000176003203,
+  "excitation": 0.03398370000650175,
+  "rhs_solve": 0.003612699976656586,
+  "rhs_compression": 0.01431149999552872,
+  "far_field": 0.02469779997773003
+ },
+ "modes_used": 12,
+ "mode_cap": 17,
+ "mode_tasks_started": 14,
+ "unknowns": 244,
+ "assembly": "tables",
+ "near_preparation": {
+  "workers": 8,
+  "scratch_gb": 1.536,
+  "scratch_bytes_per_worker": 192000000,
+  "process_overhead_bytes_per_worker": 0,
+  "process_workers": 8,
+  "memory_limit_gb": 16.6965682176,
+  "backend": "threads",
+  "process_pair_jobs": 0
+ },
+ "stream_sampling_backend": null
+}

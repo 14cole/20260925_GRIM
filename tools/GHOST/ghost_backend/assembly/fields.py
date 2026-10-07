@@ -4025,6 +4025,7 @@ def export_radar_grim(out_path: 'str', *,
                       cancel_check: 'Optional[Callable[[], bool]]' = None,
                       progress_callback: 'Optional[ProgressCallback]' = None,
                       _return_payload: 'bool' = False,
+                      _save: 'bool' = True,
                       ) -> 'str':
     """Monostatic radar-frame RCS -> ONE .grim with axes
     (azimuth, elevation, frequency, polarization=[VV,HH,VH]).
@@ -4277,9 +4278,9 @@ def export_radar_grim(out_path: 'str', *,
         payload["feature_provenance_json"] = np.asarray(
             str(feature_provenance_json)
         )
-    saved = os.path.abspath(_save_grim_npz(payload, out))
-
-
+    # ``_save=False`` (with ``_return_payload``) hands the completed payload to
+    # a caller that embeds more arrays before writing it once itself.
+    saved = os.path.abspath(_save_grim_npz(payload, out)) if _save else None
     if _return_payload:
         payload["_amp"] = amp
         return saved, payload
@@ -4414,58 +4415,52 @@ def save_monostatic_grim(
         else str(out_path) + ".grim"
     )
     os.makedirs(os.path.dirname(destination), exist_ok=True)
-    temporary = os.path.join(
-        os.path.dirname(destination),
-        f".{os.path.basename(destination)}.tmp.{os.getpid()}.grim",
+    # The radar-frame payload is completed in memory (body model, diagnostics,
+    # metadata) and written once; ``_save_grim_npz`` writes a temporary beside
+    # the destination and renames it into place.  (Formerly written, read back,
+    # completed and written again: October 2026 audit, R-D-4.)
+    _, payload = export_radar_grim(
+        destination,
+        bor_result=bodies,
+        placements=[],
+        generatrix=generatrix,
+        frequencies_ghz=frequencies,
+        azimuths_deg=azimuths_deg,
+        elevations_deg=elevations_deg,
+        axis_az_deg=axis_az_deg,
+        axis_el_deg=axis_el_deg,
+        roll_deg=roll_deg,
+        source_path=source_path,
+        history=(history or "BoR monostatic response"),
+        _return_payload=True,
+        _save=False,
     )
-    try:
-        export_radar_grim(
-            temporary,
-            bor_result=bodies,
-            placements=[],
-            generatrix=generatrix,
-            frequencies_ghz=frequencies,
-            azimuths_deg=azimuths_deg,
-            elevations_deg=elevations_deg,
-            axis_az_deg=axis_az_deg,
-            axis_el_deg=axis_el_deg,
-            roll_deg=roll_deg,
-            source_path=source_path,
-            history=(history or "BoR monostatic response"),
-        )
-        with np.load(temporary, allow_pickle=False) as stored:
-            payload = {
-                key: np.array(stored[key], copy=True) for key in stored.files
-            }
-        _attach_body_model_payload(
-            payload,
-            bodies,
-            generatrix,
-            azimuths_deg=azimuths_deg,
-            elevations_deg=elevations_deg,
-            axis_az_deg=axis_az_deg,
-            axis_el_deg=axis_el_deg,
-            roll_deg=roll_deg,
-        )
-        if solver_diagnostics is not None:
-            payload["solver_metadata_json"] = np.asarray(
-                _body_solver_metadata_json(
-                    solver_diagnostics, frequencies
-                )
+    payload.pop("_amp", None)
+    _attach_body_model_payload(
+        payload,
+        bodies,
+        generatrix,
+        azimuths_deg=azimuths_deg,
+        elevations_deg=elevations_deg,
+        axis_az_deg=axis_az_deg,
+        axis_el_deg=axis_el_deg,
+        roll_deg=roll_deg,
+    )
+    if solver_diagnostics is not None:
+        payload["solver_metadata_json"] = np.asarray(
+            _body_solver_metadata_json(
+                solver_diagnostics, frequencies
             )
-        for key, value in dict(artifact_metadata or {}).items():
-            if str(key) == "solver_metadata_json":
-                raise ValueError(
-                    "solver_metadata_json is generated from "
-                    "solver_diagnostics and cannot be injected or overridden."
-                )
-            payload[str(key)] = np.asarray(value)
-        from ghost_backend.io.grim import _save_grim_npz
-        _save_grim_npz(payload, temporary)
-        os.replace(temporary, destination)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        )
+    for key, value in dict(artifact_metadata or {}).items():
+        if str(key) == "solver_metadata_json":
+            raise ValueError(
+                "solver_metadata_json is generated from "
+                "solver_diagnostics and cannot be injected or overridden."
+            )
+        payload[str(key)] = np.asarray(value)
+    from ghost_backend.io.grim import _save_grim_npz
+    _save_grim_npz(payload, destination)
     return destination
 
 

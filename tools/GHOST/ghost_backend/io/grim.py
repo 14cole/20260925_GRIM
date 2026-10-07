@@ -201,15 +201,6 @@ def compute_dbke_from_linear(
         raise ValueError('frequency_value must be a positive finite frequency.')
     return 10.0 * math.log10(((2.0 * math.pi * freq_hz) / C0) * lin)
 
-def compute_linear_from_dbke(dbke_value: 'float', frequency_value: 'float', frequency_unit: 'str' = 'GHz') -> 'float':
-    """Convert absolute dBke to linear 2D scattering width sigma_2d."""
-
-    dbke = float(dbke_value)
-    freq_hz = _freq_value_to_hz(frequency_value, unit=frequency_unit)
-    if (not math.isfinite(freq_hz)) or freq_hz <= 0.0:
-        raise ValueError('frequency_value must be a positive finite frequency.')
-    return (C0 / (2.0 * math.pi * freq_hz)) * (10.0 ** (dbke / 10.0))
-
 def _build_grid_for_samples(
     samples: 'List[Dict[str, Any]]',
     polarization: 'str',

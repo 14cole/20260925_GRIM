@@ -48,9 +48,9 @@ def verify_local_unit_input(
 def load_geometry_snapshot(geometry_path: 'str', cache: 'Dict[str, Any]') -> 'Tuple[Dict[str, Any], str]':
     """Parsed snapshot for one geometry, built at most once per process.
 
-    The parent fills this before forking the pool, so on a fork start method
-    every worker inherits the snapshots copy-on-write. The fallback parse keeps
-    the worker correct under a spawn start method, at the cost of one parse.
+    ``cache`` belongs to the caller (one per driver module).  The drivers'
+    pools use the spawn start method, so every worker parses its own copy of a
+    geometry on its first unit; nothing is inherited from the parent.
     """
 
     cached = cache.get(geometry_path)

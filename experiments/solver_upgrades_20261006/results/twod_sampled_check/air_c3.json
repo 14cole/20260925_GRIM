@@ -1,0 +1,90 @@
+{
+ "case": "air_c3",
+ "spec": {
+  "kind": "2d",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\airfoil.geo",
+  "units": "inches",
+  "ghz": 3.0,
+  "set": "quick"
+ },
+ "import_seconds": 0.03383940001367591,
+ "wall": 4.850119700000505,
+ "stage_seconds": {
+  "operators": 2.2176016999874264,
+  "condition_scaling": 0.09947980001743417,
+  "factorization": 0.8817516999988584,
+  "condition_estimation": 0.18188210000516847,
+  "excitation": 0.11343779998423997,
+  "rhs_solve": 0.06600669999897946,
+  "linear_solve": 0.10889890001271851,
+  "rhs_compression": 0.4317158999911044,
+  "far_field": 0.011560500017367303,
+  "mesh_certification": 0.0024440999986836687
+ },
+ "backend": "dense",
+ "planning_seconds": 0.24002669999026693,
+ "adaptive_used": true,
+ "adaptive_fallback": false,
+ "steps": [
+  {
+   "polynomial_degree": 2,
+   "panels": 864,
+   "nodes": 1734,
+   "seconds": 2.256087200003094,
+   "backend": "dense"
+  },
+  {
+   "polynomial_degree": 3,
+   "panels": 864,
+   "nodes": 2598,
+   "seconds": 2.2211362999951234,
+   "backend": "dense"
+  }
+ ],
+ "panel_count": 864,
+ "nodes": 2598,
+ "degree": 3,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": true,
+ "warnings": [
+  "Geometry contains 4 high-degree node(s) (>2 connected primitives)."
+ ],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 2646,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.16717050000443123
+  },
+  {
+   "label": null,
+   "unknowns": 2646,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.15381129999877885
+  },
+  {
+   "label": null,
+   "unknowns": 3964,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.550713500007987
+  },
+  {
+   "label": null,
+   "unknowns": 3964,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.5493241999938618
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

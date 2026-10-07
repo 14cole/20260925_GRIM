@@ -110,16 +110,6 @@ def parse_base(name: 'str') -> 'Tuple[str, Dict[str, float], Dict[str, int]]':
     return study, vals, decs
 
 
-def format_base(study: 'str', params: 'Dict[str, float]',
-                decimals: 'Dict[str, int]') -> 'str':
-    """Canonical base name: study id first, then parameter tokens sorted by key."""
-    missing = [k for k in params if k not in decimals]
-    if missing:
-        raise ValueError(f"no decimal width declared for {missing!r}.")
-    toks = [f"{params[k]:.{decimals[k]}f}{k}" for k in sorted(params)]
-    return "_".join([str(study)] + toks)
-
-
 def variation_name(base: 'str', role: 'Optional[str]' = None) -> 'str':
     """base (+ optional OPN/FRD) -> a .grim filename."""
     if role is None:
@@ -132,23 +122,6 @@ def variation_name(base: 'str', role: 'Optional[str]' = None) -> 'str':
 def _stem(path: 'str') -> 'str':
     b = os.path.basename(str(path))
     return b[: -len(".grim")] if b.lower().endswith(".grim") else b
-
-
-def group_solver_files(paths: 'Sequence[str]'
-                       ) -> 'Tuple[Dict[str, List[Dict[str, Any]]], List[Tuple[str, str]]]':
-    """Group ``<POL>_<FREQ>GHz_<variation>.grim`` paths by variation.
-    Returns (groups, unparsed) -- unparsed files are REPORTED, never skipped
-    silently."""
-    groups: 'Dict[str, List[Dict[str, Any]]]' = {}
-    unparsed: 'List[Tuple[str, str]]' = []
-    for p in sorted(paths):
-        try:
-            rec = parse_solver_name(p)
-        except ValueError as exc:
-            unparsed.append((str(p), str(exc)))
-            continue
-        groups.setdefault(rec["variation"], []).append(rec)
-    return groups, unparsed
 
 
 def join_grims(paths: 'Sequence[str]', out_path: 'str', *, history: 'str' = "") -> 'str':

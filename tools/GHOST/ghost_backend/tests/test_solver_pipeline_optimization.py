@@ -117,20 +117,35 @@ class ForecastReuseTests(unittest.TestCase):
                 selection.select_backend(arguments, options)
             self.assertEqual(forecast.call_count, 6)
 
-    def test_effective_allocation_changes_invalidate_forecasts(self):
+    def test_effective_allocation_changes_reprice_the_reused_forecast(self):
+        # The forecast records are built once per run; a different CPU/RAM
+        # allocation reuses them and reprices cost and peaks under the current
+        # one, equal to a fresh forecast (October 2026 audit, R-2D-7: the
+        # sweep planner selects under each worker's share).
         options = validate_options(dict(factorization='adaptive', assembly_threads='auto'))
-        with preparation_scope(), mock.patch.object(solver, '_solve_memory_limit_gb', return_value=10.), \
-                mock.patch('ghost_backend.execution.options.host_assembly_threads', return_value=8), \
-                mock.patch.object(selection, '_forecast_backend', wraps=selection._forecast_backend) as forecast:
+        patches = (mock.patch.object(solver, '_solve_memory_limit_gb', return_value=10.),
+                   mock.patch('ghost_backend.execution.options.host_assembly_threads', return_value=8))
+        with preparation_scope(), patches[0], patches[1],                 mock.patch.object(selection, '_forecast_backend', wraps=selection._forecast_backend) as forecast:
             with execution_scope(options, assembly_threads=1, memory_budget_gib=8.):
-                selection.select_backend(self.arguments(), options)
+                first = selection.select_backend(self.arguments(), options)
                 selection.select_backend(self.arguments(), options)
             self.assertEqual(forecast.call_count, 1)
             with execution_scope(options, assembly_threads=2, memory_budget_gib=8.):
-                selection.select_backend(self.arguments(), options)
+                threads = selection.select_backend(self.arguments(), options)
             with execution_scope(options, assembly_threads=2, memory_budget_gib=4.):
-                selection.select_backend(self.arguments(), options)
-            self.assertEqual(forecast.call_count, 3)
+                budget = selection.select_backend(self.arguments(), options)
+            self.assertEqual(forecast.call_count, 1)
+            self.assertFalse(first.get('forecast_reused', False))
+            self.assertTrue(threads['forecast_reused'] and budget['forecast_reused'])
+            self.assertNotEqual([c['cost'] for c in first['candidates'].values()],
+                                [c['cost'] for c in threads['candidates'].values()])
+        with preparation_scope(), patches[0], patches[1]:
+            with execution_scope(options, assembly_threads=2, memory_budget_gib=4.):
+                fresh = selection.select_backend(self.arguments(), options)
+        self.assertEqual(budget['selected'], fresh['selected'])
+        for mode, candidate in fresh['candidates'].items():
+            self.assertAlmostEqual(budget['candidates'][mode]['cost'], candidate['cost'], places=12)
+            self.assertAlmostEqual(budget['candidates'][mode]['peak_gb'], candidate['peak_gb'], places=12)
 
     def test_cached_plan_honors_event_and_checkpoint_cancellation(self):
         options = validate_options(dict(factorization='adaptive'))

@@ -1,0 +1,73 @@
+{
+ "case": "two_c3",
+ "spec": {
+  "kind": "2d",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\tools\\GHOST\\ghost_backend\\validation\\material_examples\\type5_two_dielectrics.geo",
+  "units": "meters",
+  "ghz": 3.0,
+  "set": "quick"
+ },
+ "import_seconds": 0.2294533000094816,
+ "wall": 0.9016589000093518,
+ "stage_seconds": {
+  "operators": 0.47039339995535556,
+  "condition_scaling": 0.003258500015363097,
+  "factorization": 0.015112699999008328,
+  "condition_estimation": 0.008970800001407042,
+  "excitation": 0.011793400000897236,
+  "rhs_solve": 0.009386999998241663,
+  "linear_solve": 0.022712700010742992,
+  "rhs_compression": 0.023934199984068982,
+  "far_field": 0.029555799992522225,
+  "mesh_certification": 0.0023843999952077866
+ },
+ "backend": "dense",
+ "planning_seconds": 0.1280107000056887,
+ "adaptive_used": false,
+ "adaptive_fallback": null,
+ "steps": [],
+ "panel_count": 380,
+ "nodes": 380,
+ "degree": 1,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": true,
+ "warnings": [],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 504,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.015864699977100827
+  },
+  {
+   "label": null,
+   "unknowns": 504,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.009393700005603023
+  },
+  {
+   "label": null,
+   "unknowns": 760,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.018578399991383776
+  },
+  {
+   "label": null,
+   "unknowns": 760,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 0.018066300006466918
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

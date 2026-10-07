@@ -1,0 +1,2 @@
+[air_c3] wall 4.703 s
+[experiment] far_grading_extension {'tiles row 0.15: 5->5': 6, 'tiles row 0.15: 6->6': 6, 'tiles row 0.15: 7->7': 14, 'tiles row 0.50: 6->6': 18, 'tiles row 0.50: 7->7': 34, 'tiles(kl>3 or ungraded)': 446}

@@ -1,0 +1,1 @@
+{"experiments": ["bor_sampled_check", "bor_sampled_meridian"], "cases": ["cyl_s2", "cyl_c2", "cyl_s6", "sph_direct", "sph_diel", "sph_coated"]}

@@ -66,7 +66,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import ghost_backend.hpc.scheduler as hpc_scheduler
-import ghost_backend.execution.provenance as _workflow_provenance
 from ghost_backend.geometry.io import material_sidecar_paths
 from ghost_backend.runs.quality import accuracy_target_policy, validate_mesh_convergence_policy
 from ghost_backend.execution.provenance import (
@@ -710,10 +709,9 @@ def _solve_and_export(pair, snapshot, material_base, run_dir_str):
                      f"freq={unit['frequency_ghz']}GHz"),
         )
         actual_paths.append(str(written[0]) if written else str(out_path))
-    _verify_run_provenance(manifest)
-    for unit in channel_units:
-        _verify_unit_input(unit, manifest)
-
+    # The run state was verified before the solve and again before the
+    # export; a third check after the artifact is published could only
+    # report a change it can no longer prevent (October 2026 audit, R-D-1).
     return ("written", ", ".join(actual_paths))
 
 

@@ -48,7 +48,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import ghost_backend.hpc.scheduler as hpc_scheduler
 from ghost_backend.runs.quality import accuracy_target_policy, validate_mesh_convergence_policy
-import ghost_backend.execution.provenance as _workflow_provenance
 from ghost_backend.execution.provenance import (
     backend_source_fingerprint,
     backend_source_inventory,
@@ -127,7 +126,6 @@ TASKS_PER_CHILD = 4
 from ghost_backend.runs.config import (
     load_driver_configuration,
     configuration_source_records,
-    copy_configuration,
 )
 from ghost_backend.bor.options import validate_options as validate_bor_options
 BOR_EXECUTION_OPTIONS = validate_bor_options({})
@@ -165,8 +163,9 @@ BOR_EXECUTION_OPTIONS = validate_bor_options(BOR_EXECUTION_OPTIONS)
 
 MANIFEST_SCHEMA = "ghost.local.bor-run.v2"
 
-# Parsed geometry snapshots, filled in the parent before the pool forks so
-# workers inherit them instead of unpickling one per unit.
+# Parsed geometry snapshots, one per geometry per process: the parent's are
+# built by the planner and reused by the final merge; the pool's workers are
+# spawned (not forked) and parse their own copy on first use.
 _SNAPSHOT_CACHE = {}  # type: Dict[str, Tuple[Dict[str, Any], str]]
 
 
@@ -413,8 +412,9 @@ def _solve_and_export(
                      f"freq={unit['frequency_ghz']}GHz"),
         )
         actual_paths.append(str(written[0]) if written else str(out_path))
-    _verify_run_provenance(context)
-    _verify_channel_inputs(channel_units, context)
+    # The run state was verified before the solve and again before the
+    # export; a third check after the artifact is published could only
+    # report a change it can no longer prevent (October 2026 audit, R-D-1).
     return ("written", ", ".join(actual_paths))
 
 
@@ -804,12 +804,9 @@ def main() -> 'None':
               "admitted against that space")
     print("=" * 70, flush=True)
 
-    # Parse each distinct geometry once, and import the solver, before the pool
-    # forks: workers then inherit both instead of repeating the work per unit.
-    for unit in ordered:
-        _load_snapshot(str(unit["geometry"]))
-    import ghost_backend.bor.dispatch as bor_dispatch
-    import ghost_backend.io.grim as grim_io
+    # Every snapshot is already parsed by the planner above (the final merge
+    # reuses them); the spawned workers import the solver and parse their own
+    # snapshots on their first unit.
 
     counters = {"written": 0, "skipped": 0, "failed": 0}
     started = time.time()

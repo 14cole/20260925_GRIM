@@ -1,0 +1,90 @@
+{
+ "case": "air_c10",
+ "spec": {
+  "kind": "2d",
+  "mode": "certified",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\airfoil.geo",
+  "units": "inches",
+  "ghz": 10.0,
+  "set": "full"
+ },
+ "import_seconds": 0.22637289999693166,
+ "wall": 27.71772050000436,
+ "stage_seconds": {
+  "operators": 5.806441600012477,
+  "condition_scaling": 0.7600296999880811,
+  "factorization": 14.384298500008299,
+  "condition_estimation": 1.2336407999973744,
+  "excitation": 0.31248320001759566,
+  "rhs_solve": 0.7919028000032995,
+  "linear_solve": 1.3414918000053149,
+  "rhs_compression": 2.1601684000052046,
+  "far_field": 0.029765099985525012,
+  "mesh_certification": 0.0023616000107722357
+ },
+ "backend": "dense",
+ "planning_seconds": 0.4109489999973448,
+ "adaptive_used": true,
+ "adaptive_fallback": false,
+ "steps": [
+  {
+   "polynomial_degree": 2,
+   "panels": 2472,
+   "nodes": 4950,
+   "seconds": 10.036300199994002,
+   "backend": "dense"
+  },
+  {
+   "polynomial_degree": 3,
+   "panels": 2472,
+   "nodes": 7422,
+   "seconds": 17.136415800006944,
+   "backend": "dense"
+  }
+ ],
+ "panel_count": 2472,
+ "nodes": 7422,
+ "degree": 3,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": true,
+ "warnings": [
+  "Geometry contains 4 high-degree node(s) (>2 connected primitives)."
+ ],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 7526,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 2.778548400005093
+  },
+  {
+   "label": null,
+   "unknowns": 7526,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 2.4626837999967393
+  },
+  {
+   "label": null,
+   "unknowns": 11284,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 6.88007369999832
+  },
+  {
+   "label": null,
+   "unknowns": 11284,
+   "factor_variant": "lu",
+   "condition_est": null,
+   "factor_work_seconds": 6.795194799997262
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

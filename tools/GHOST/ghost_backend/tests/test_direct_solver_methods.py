@@ -53,7 +53,7 @@ class DirectSolverMethodTests(unittest.TestCase):
                     build.assert_not_called()
 
     def test_private_formulations_also_reject_retired_method(self):
-        for solver in (rcs._solve_te_robin_mfie, rcs._solve_multi_region_indirect):
+        for solver in (rcs._solve_multi_region_indirect,):
             with self.subTest(solver=solver.__name__):
                 with self.assertRaisesRegex(ValueError, "auto.*direct"):
                     solver(None, [], "TE", 1.0, [0.0], solver_method="fmm")

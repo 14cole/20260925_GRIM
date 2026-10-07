@@ -1,0 +1,3 @@
+[sph_diel] wall 1.492 s
+[experiment] bor_sampled_meridian {'batches': 34, 'pairs': 460, 'probed': 132, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 760, 'points': 485504, 'probed': 121604, 'fallbacks': 0}

@@ -1,0 +1,2 @@
+[air_c1] wall 2.327 s
+[experiment] twod_sampled_check {'batches': 42, 'tasks': 10480, 'probed': 2694, 'fallbacks': 27}

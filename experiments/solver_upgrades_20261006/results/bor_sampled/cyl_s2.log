@@ -1,0 +1,3 @@
+[cyl_s2] wall 0.838 s
+[experiment] bor_sampled_meridian {'batches': 16, 'pairs': 232, 'probed': 63, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 322, 'points': 235624, 'probed': 58984, 'fallbacks': 0}

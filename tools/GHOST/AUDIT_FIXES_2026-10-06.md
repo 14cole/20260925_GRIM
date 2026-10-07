@@ -103,6 +103,72 @@ coefficients or fields the change touches; "bitwise" means byte-identical.
   cases of `test_runtime_allocation_updates.py` (a fake executor whose futures return a tuple of two where the
   current window reader unpacks three).
 
+### 2.5 Dead-code sweep (second pass)
+
+Every top-level definition of the production package with no production reference (AST scan of
+`ghost_backend`, references in tests, documentation, `GRIM_Backend` and `data_tools` checked by hand;
+`scripts/audit_2026-10-06/dead_code_references.py` lists the candidates and their referrers,
+`dead_code_sweep.py` is the applied edit) was removed or moved; the bench fields are bitwise identical
+before and after.
+
+| Removed | Kept where tests still need it |
+|---|---|
+| modules `bor/polynomial.py`, `compressed/analytic_far.py`, `twod/nystrom.py` (with their tests `test_bor_polynomial_meridian.py`, `test_analytic_far_prototype.py`, `test_nystrom.py`; `scripts/check_headless.py` no longer lists `nystrom`) | the legacy BoR near rules `_modal_kernels_near_rule`, `_project_pm_brackets`, `_mfie_kernels_near_rule`, `_ibc_kernels_near_rule` now live in `tests/legacy_near_rules.py` (four test modules import it) |
+| `bor/solver.py`: `_map_near_pairs`, `bor_basis_bytes`, `_efie_near_asymmetry` (now a helper of `test_bor_compute_reuse.py`) | |
+| `bor/streaming.py`: `_contract_source_side` | |
+| `execution/provenance.py`: `write_output_attestation`, `verify_output_attestation`, `_artifact_path`, `write_artifact_manifest`, `write_artifact_in_progress`, `verify_artifact_manifest`, `verify_component_output_manifest` (the four drivers lose their unused `_workflow_provenance` import) | |
+| `twod/solver.py`: `_residual_norm_many`, `_make_elem_mask`, `_solve_te_robin_mfie`; `twod/basis.py`: `stiffness_block` (`_reference_blocks` becomes `_reference_mass`) | |
+| `io/naming.py`: `format_base`, `group_solver_files`; `io/grim.py`: `compute_linear_from_dbke`; `run_local_bor.py`: the unused `copy_configuration` import | |
+
+Kept deliberately: public entry points without an internal caller (`cylinder_generatrix`, the
+`*_certified_single_polarization` solvers, `save_snapshot_geo`, `closest_primitive_points`,
+`latest_run_dir`, `stage_geometry`, `predict_2d_resources`, `unit_peak_gb`, the factorization
+resolvers), the test oracle `_assemble_system_fresh`, option-gated features (polynomial pairs,
+projection/retained storage, `fast_far` verified CUR, recycling, refined LU), the NumPy fallbacks of
+the native tiles and pair integrators, `io/viewer_bridge` (`to_grid` is used by `GRIM_Backend`),
+`io/naming.pair_variants` (`data_tools`) and the assembly feature workflow.
+
+### 2.6 Experiments (`experiments/solver_upgrades_20261006/`, repository root)
+
+The items section 4 of the first pass left open were implemented as overlays over the package and
+measured against the project in fresh processes (that folder's `README.md` has every number).  One
+passed both tests, no field change and a measured saving, and was ported:
+
+| ID | Change | Files | Measured effect |
+|---|---|---|---|
+| BoR sampled coarse-level checks | The graded near rules evaluate their fine level for every point of a layout chunk first and the coarse level for every `NEAR_CHECK_STRIDE`-th point (the first included); the chunk is accepted at the fine level when every probed point passes, otherwise the complete check of every point runs as before.  The disjoint meridian pairs do the same per batch (`NEAR_MERIDIAN_CHECK_STRIDE`, coarse order 6 on every 4th pair).  The fine level is the published value either way, so a chunk whose probes pass yields the complete check's values bitwise; on every reference body no probe failed (0 of 46 chunks and 2-3 batches per case) and the coarse level was 25% of the points instead of 100%.  `GHOST_BOR_NEAR_CHECK_STRIDE=0` restores the complete check. | `bor/kernels.py` (`NEAR_CHECK_STRIDE`, `_near_check_stride`, `_refine_near_chunk`), `bor/solver.py` (`NEAR_MERIDIAN_CHECK_STRIDE`, `_converged_disjoint_batch`) | BoR walls 0.79-0.92 of the reference in the experiment, section 3b after the port; fields bitwise identical |
+
+Rejected after measurement (kept as overlays with their results): the 2-D check-only 20-point rule on
+every 4th task (7.5e-15 but slower, 1.00-1.09: a failed probe re-runs the complete check and 7-70
+batches per case fail), four-column condition probes (no gain), grouped dense-table contractions and
+the far-tile 2 pi glue (both bitwise, both within noise on the minimum of three runs), finer far-rule
+grading rows at |k| L = 1.0, 2.0 and 2.5 (bitwise identical because every production tile has
+|k| L <= 0.5 or is capped by its own order; the calibration and a denser verification script remain in
+`calibration/`), a far-ratio split of the far tiles (7.4e-13 but 1.06-1.13 slower), the TM partner kept
+in RAM and the admission samples on threads (compressed backend, no gain).  The HODLR threshold was
+confirmed (LU forced on the 10 GHz P3 system: 27.7 s against 21.1 s), and lazy near bands were not built
+(the initial horizon already equals the cap for bandwidths >= 12).
+
+### 2.7 Drivers and overhead (second round)
+
+| ID | Change | Files | Measured effect |
+|---|---|---|---|
+| R-D-1 | A unit is verified before its solve and again before its export; the third verification after the artifact was published is gone (it could only report a change it can no longer prevent) | the four drivers (`_solve_and_export`) | 25 ms per unit cached, 150-210 ms uncached |
+| R-D-4 | `save_monostatic_grim` builds the radar-frame payload in memory (`export_radar_grim(..., _return_payload=True, _save=False)`), embeds the body model and the metadata and writes once through `_save_grim_npz` (itself atomic), instead of writing, reading back, completing and writing again; the local BoR driver no longer re-parses every geometry before the pool (the planner already did; the spawned workers parse their own) and the fork-era comments are corrected | `assembly/fields.py`, `run_local_bor.py`, `runs/inputs.py` | one write and no read-back per geometry at the merge |
+| R-2D-7 | The forecast cache key no longer contains the CPU/RAM allocation; a reused forecast is repriced under the current allocation (cost from the saved resource records with the forecast's own formula, peaks as before), so the sweep planner's per-worker selection reuses the preview's records instead of rebuilding every candidate mesh | `execution/selection.py` (`select_backend`, `_refresh_memory_forecast`) | ~100 ms per GUI frequency; a reused forecast equals a fresh one (test) |
+
+Not changed: the HPC BoR array task still prices every candidate unit on its node (R-D-5; a
+submission-time cache would need the HPC path, which this host cannot run), and the local pools are
+`ProcessPoolExecutor`s whose workers spawn on the first submission, so starting them before planning
+would overlap nothing.
+
+Tests: `tests/test_audit_experiments_2026_10.py` (stride semantics and fallback with fake levels, the
+sampled near rules and meridian batch against the complete check bitwise, two verifications per unit
+in every driver, the single write of the BoR deliverable, the repriced reuse of a forecast);
+`test_solver_pipeline_optimization.py`'s allocation test (formerly "allocation changes invalidate
+forecasts") now asserts the new contract: one forecast per run, reused and repriced under a changed
+allocation, equal to a fresh forecast.
+
 ## 3. Verification
 
 Reference set (`scripts/audit_2026-10-06/bench.py`, one fresh process per case, production profile, 181 angles
@@ -134,13 +200,50 @@ Worst peak-relative change over the set: 3.5e-11 (rule: 1e-8).
 Peak-relative change = max |new - old| / max |old| over the complex co-polarized amplitudes of both
 channels. Timings are wall seconds of the solve call (imports excluded), single runs, +-5-10%.
 
+### 3b. After the dead-code sweep, the ported experiment and the second driver round
+
+Reference = the project after section 2 (the fields of the table above); after = sections 2.5-2.7.
+Minimum wall over the recorded runs of each state (`experiments/solver_upgrades_20261006/results/`);
+the peak-relative change is against the reference fields over the three post-port runs.
+
+| Case | Before (s, min of runs) | After (s, min of 3) | Change | Peak-relative change |
+|---|---:|---:|---:|---:|
+| Airfoil certified 1 GHz | 2.32 (1) | 2.25 | -3% | 0.0e+00 |
+| Airfoil certified 3 GHz | 4.44 (1) | 4.58 | +3% | 0.0e+00 |
+| Airfoil certified 10 GHz | 21.11 (1) | 23.24 | +10% | 0.0e+00 |
+| Airfoil survey 3 GHz (dense) | 12.64 (1) | 12.40 | -2% | 2.0e-12 |
+| Airfoil survey 3 GHz (compressed) | 11.56 (1) | 11.92 | +3% | 0.0e+00 |
+| TYPE 2 IBC certified 1 GHz | 0.33 (1) | 0.32 | -2% | 0.0e+00 |
+| TYPE 5 two dielectrics certified 3 GHz | 0.92 (1) | 0.89 | -3% | 0.0e+00 |
+| TYPE 1 thin dielectric certified 1 GHz | 0.53 (1) | 0.50 | -5% | 0.0e+00 |
+| TYPE 4 coating certified 10 GHz | 1.35 (1) | 1.29 | -4% | 0.0e+00 |
+| BoR cylinder survey 2 GHz | 0.96 (3) | 0.79 | -18% | 0.0e+00 |
+| BoR cylinder certified 2 GHz | 2.30 (3) | 1.94 | -16% | 0.0e+00 |
+| BoR cylinder survey 6 GHz | 2.68 (3) | 2.20 | -18% | 0.0e+00 |
+| BoR PEC sphere, direct API | 1.57 (3) | 1.32 | -16% | 0.0e+00 |
+| BoR dielectric sphere, direct API | 1.80 (3) | 1.40 | -22% | 0.0e+00 |
+| BoR coated sphere, direct API | 2.63 (3) | 2.08 | -21% | 0.0e+00 |
+
+No 2-D numerical path changed: two of the three post-port runs are bitwise identical to the reference
+in every 2-D case and the third differs by 2.0e-12 in the dense 3 GHz survey, the run-to-run variation
+of the threaded LU (the 2-D timing differences are run noise; the 10 GHz case ran 21.1 s in the
+reference and 23.2-23.8 s in every later run).  The BoR cases are bitwise identical in all three runs
+(the fine level is the published value in both checks, and no probe failed).  The full suite was run
+again after these changes: 1,610 passed, 11 pre-existing failures on this host unchanged (the seven of
+section 2.4 plus the three `BorMemoryGateTests` of `test_memory_safety.py`, whose expected message
+predates the gate's GiB wording, and `test_review_followups.py::NearPairCleanupTests::
+test_same_surface_consumer_closes_iterator_when_contraction_fails`; all four fail identically on the
+unmodified pre-fix tree).
+
 ## 4. Not implemented, and why
 
-- **F-2D-9 (check-only 20-point rule)** and the **BoR coarse-level sampling** (agent finding 2): both
-  change which quadrature points are verified; on bodies where a point would have been refined the
-  result moves by more than the 2e-8 rule tolerance. Accuracy-policy decisions, left to the maintainers.
-- **F-2D-5/6 (far-order grading beyond |k| L = 3, W floor per ratio bin)**: a quadrature-order change
-  calibrated only to 1e-12; not attempted under the 1e-8 rule without a new calibration.
+- **F-2D-9 (check-only 20-point rule)**: measured as an experiment (section 2.6): 7.5e-15 but slower,
+  because a failed probe re-runs the complete check and 7-70 batches per case fail.  The **BoR
+  coarse-level sampling** passed the same measurement with no field change and was ported.
+- **F-2D-5/6 (far-order grading beyond |k| L = 3, W floor per ratio bin)**: finer rows up to |k| L = 3
+  were calibrated and measured (section 2.6) and proved unreachable on production meshes (every tile at
+  |k| L <= 0.5 or capped by its own order); rows beyond 3 would be reachable only by elements longer
+  than half a wavelength, which the mesh rules do not produce.
 - **F-BoR-1 (near bands prepared lazily to the sweep horizon)**: the BoR core audit measured the saving
   at 5-7% of wall after the band defect fix, with the far tables (now streamed) the larger linear-in-modes
   cost; the concurrency between band extension and running mode workers was not worth that saving.
@@ -151,8 +254,7 @@ channels. Timings are wall seconds of the solve call (imports excluded), single 
   one contended measurement; the prior was not changed.
 - **F-BoR-4 (native per-tile-group sampling and transform)**: native code work; the tile planner and
   the table cache above recover part of the GIL loss.
-- **Dead code (X-1)**: every candidate is referenced from tests, documentation or the GUI; deletion is a
-  maintenance change with no runtime effect and was not made.
+- **Dead code (X-1)**: swept in the second pass (section 2.5).
 
 ## 5. Switches
 
@@ -161,3 +263,5 @@ channels. Timings are wall seconds of the solve call (imports excluded), single 
 - `assembly='tables'` keeps the dense-tables BoR path; `bor_options=dict(near_backend='threads')` keeps near
   preparation on threads.
 - `GHOST_CPU_RHS_COMPRESSION=on` forces the QR sweep on LU factors.
+- `GHOST_BOR_NEAR_CHECK_STRIDE=0` restores the complete coarse-level check of every BoR near point and
+  meridian pair (default 4: every 4th is probed).

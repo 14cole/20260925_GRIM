@@ -219,13 +219,42 @@ class MaterialAssemblyReuseTests(unittest.TestCase):
             self.assertGreater(parts['near'], 0.)
 
 
+def _efie_near_asymmetry(pairs, values) -> 'float':
+    """Largest relative violation of EFIE reciprocity over retained near blocks.
+
+    ``values`` is the ``[4, modes, 4 * len(pairs)]`` retained storage of
+    ``_prepare_near_contractions`` (2x2 blocks flattened row-major).
+    """
+    if not len(pairs):
+        return 0.0
+    modes = values.shape[1]
+    blocks = values.reshape(4, modes, len(pairs), 2, 2)
+    scale = np.max(np.abs(values), axis=(0, 2))
+    scale = np.where(scale > 0.0, scale, 1.0)
+    index = {tuple(pair): i for i, pair in enumerate(pairs)}
+    worst = 0.0
+    for (e, f), i in index.items():
+        j = index.get((f, e))
+        if j is None or j < i:
+            continue
+        own, mirror = blocks[:, :, i], blocks[:, :, j].transpose(0, 1, 3, 2)
+        violation = np.max(np.abs(np.stack([
+            own[0] - mirror[0],
+            own[3] - mirror[3],
+            own[1] + mirror[2],
+            own[2] + mirror[1],
+        ])), axis=(0, 2, 3))
+        worst = max(worst, float(np.max(violation / scale)))
+    return worst
+
+
 class CompactModalStorageTests(unittest.TestCase):
     def test_raw_reciprocity_diagnostic_survives_coalescing(self):
         from ghost_backend.bor.near_storage import EfieReciprocity, reciprocal_pair_order
         rng = np.random.default_rng(733)
         pairs = [(0,0), (0,1), (0,2), (1,0), (1,1), (2,0)]
         raw = rng.normal(size=(4,5,len(pairs),2,2)) + 1j*rng.normal(size=(4,5,len(pairs),2,2))
-        expected = bor._efie_near_asymmetry(pairs, raw.reshape(4,5,-1))
+        expected = _efie_near_asymmetry(pairs, raw.reshape(4,5,-1))
         diagnostic = EfieReciprocity(5)
         for pair in reciprocal_pair_order(pairs):
             diagnostic.add(pair, raw[:,:,pairs.index(pair)])

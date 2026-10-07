@@ -1,0 +1,3 @@
+[sph_coated] wall 2.161 s
+[experiment] bor_sampled_meridian {'batches': 50, 'pairs': 642, 'probed': 180, 'fallbacks': 0}
+[experiment] bor_sampled_check {'chunks': 1157, 'points': 678576, 'probed': 170027, 'fallbacks': 0}

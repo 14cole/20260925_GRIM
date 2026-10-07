@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "C:\Users\14col\Documents\20261005_GRIM_claude\tools\GHOST\scripts\audit_2026-10-06\bench.py", line 270, in <module>
+    main()
+  File "C:\Users\14col\Documents\20261005_GRIM_claude\tools\GHOST\scripts\audit_2026-10-06\bench.py", line 266, in main
+    run_case(a.name, a.outdir, a.root)
+  File "C:\Users\14col\Documents\20261005_GRIM_claude\tools\GHOST\scripts\audit_2026-10-06\bench.py", line 86, in run_case
+    c = CASES[name]
+        ~~~~~^^^^^^
+KeyError: 'experiments'

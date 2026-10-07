@@ -1,0 +1,67 @@
+{
+ "case": "air_s3c",
+ "spec": {
+  "kind": "2d",
+  "mode": "survey",
+  "geo": "C:\\Users\\14col\\Documents\\20261005_GRIM_claude\\airfoil.geo",
+  "units": "inches",
+  "ghz": 3.0,
+  "set": "full",
+  "options": {
+   "factorization": "compressed"
+  }
+ },
+ "import_seconds": 0.23644490000151563,
+ "wall": 12.1038966000051,
+ "stage_seconds": {
+  "operators": 0.4409674000053201,
+  "compressed_tile_compression": 0.09336920001078397,
+  "compressed_memory_sampling": 0.8384612999943784,
+  "compressed_spool_write": 0.2441073002992198,
+  "compressed_assembly": 5.999917200009804,
+  "factorization": 2.587812200014014,
+  "condition_estimation": 0.9601195000141161,
+  "excitation": 0.0729917000135174,
+  "linear_solve": 0.5144883999892045,
+  "rhs_compression": 0.9645461999898544,
+  "far_field": 0.1794101999985287,
+  "compressed_spool_read": 0.15183750000142027
+ },
+ "backend": null,
+ "planning_seconds": null,
+ "adaptive_used": null,
+ "adaptive_fallback": null,
+ "steps": [],
+ "panel_count": 5666,
+ "nodes": 5672,
+ "degree": 1,
+ "threads": {
+  "assembly": 8,
+  "blas": "auto"
+ },
+ "certified": false,
+ "warnings": [
+  "Geometry contains 4 high-degree node(s) (>2 connected primitives).",
+  "SURVEY MODE: VV and HH were solved on the base mesh only; no mesh-convergence certificate exists for either channel."
+ ],
+ "systems": [
+  {
+   "label": null,
+   "unknowns": 8608,
+   "factor_variant": null,
+   "condition_est": null,
+   "factor_work_seconds": null
+  },
+  {
+   "label": null,
+   "unknowns": 8608,
+   "factor_variant": null,
+   "condition_est": null,
+   "factor_work_seconds": null
+  }
+ ],
+ "channel_condition": {
+  "VV": null,
+  "HH": null
+ }
+}

@@ -275,7 +275,7 @@ far-field projection of one aspect batch share their Bessel functions and
 axial phases (`_angular_batch`), halving that stage. The streamed-block
 contraction is a test-side GEMM over the tile's Gauss rows followed by a
 batched source-side product (`_contract_test_side`,
-`_contract_source_side`): 209 ms to 46 ms per element on the 3,055-element,
+`_contract_source_group`): 209 ms to 46 ms per element on the 3,055-element,
 27-mode tile of the certified 10 GHz ogive, with no per-term copies of the
 sampled tile.
 
